@@ -216,3 +216,24 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.cortexkit/magic-context/
+
+# === cold-manifest 项目补充 ===
+# 运行数据（快照库、catalog、diff 结果）与测试样本
+data/
+Legacy/backupStatus260505/TOSHIBA_*/
+Legacy/*.zip
+*.db
+*.db-wal
+*.db-shm
+
+# WSL 开发虚拟环境（Windows 侧 .venv 供 PyCharm 使用，勿动）
+.venv-wsl/
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+
+# 编辑器 / 工具输出
+.idea/
+.playwright-mcp/

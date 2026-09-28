@@ -1,0 +1,20 @@
+{
+  "mcp": {
+    "servers": {
+      "playwright": {
+        "type": "local",
+        "command": [
+          "npx",
+          "-y",
+          "@playwright/mcp@latest",
+          "--headless",
+          "--browser",
+          "chromium",
+          "--isolated",
+          "--output-dir",
+          "/tmp/opencode/playwright-mcp"
+        ]
+      }
+    }
+  }
+}
