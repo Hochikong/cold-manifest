@@ -12,6 +12,7 @@ from ..catalog import find_snapshot
 from ..exporter import export_v1_csv_zip, iter_snapshot_csv
 from ..hash import ALLOWED_ALGOS, ALLOWED_POLICIES, run_hash_task
 from ..seal import fts_available, fts_match_query
+from ..stats_cache import compute_stats, load_precomputed_stats
 from ..tasks import TaskRunner, register_task_fn
 from .pagination import decode_cursor, encode_cursor
 from .state import AppState, get_state
@@ -103,82 +104,20 @@ def list_snapshots(
 # ---------------------------------------------------------------- stats
 
 
-# 大小直方图桶边界（累计计数后差分）
-_SIZE_BUCKETS: "list[tuple[int, str]]" = [
-    (1024, "<=1KB"), (1048576, "1KB-1MB"), (10485760, "1MB-10MB"),
-    (104857600, "10MB-100MB"), (1073741824, "100MB-1GB"),
-    (10737418240, "1GB-10GB"), (107374182400, "10GB-100GB"),
-    (1099511627776, "100GB-1TB"), (9223372036854775807, ">=1TB"),
-]
-
-
-
 @router.get("/{snapshot_id:path}/stats")
 def snapshot_stats(snapshot_id: str, request: Request) -> dict:
     """扩展名分布（按大小/数量）、大小直方图、top 50 大文件、零字节计数、深度直方图。
 
-    各聚合分别走覆盖索引（idx_entries_ext_size / idx_entries_size），
-    避免对 3M 宽表行（path 文本）做全表扫描与临时排序（3M 行实测 <1s）。
+    优先直读封库期预计算的 stats_precomputed（P2-A，10M 库实时聚合 6–9.6s →
+    毫秒级）；旧快照无该表（或 key 残缺）→ 回退实时聚合，接口形状不变。
+    两种路径共用 stats_cache.compute_stats，结果严格一致；响应多带
+    precomputed=true|false 标注来源。
     """
     conn = _snap_db(request, snapshot_id)
-
-    # 扩展名分布：一次覆盖索引扫描同时取 count 与 sum，Python 侧排两个榜
-    ext_rows = conn.execute(
-        "SELECT ext, COUNT(*) AS n, SUM(size_bytes) AS sz FROM entries"
-        " WHERE ext <> '' GROUP BY ext"
-    ).fetchall()
-    ext_top_by_bytes = sorted(
-        ({"ext": r["ext"], "total_bytes": r["sz"] or 0} for r in ext_rows),
-        key=lambda x: -x["total_bytes"])[:20]
-    ext_top_by_count = sorted(
-        ({"ext": r["ext"], "count": r["n"]} for r in ext_rows),
-        key=lambda x: -x["count"])[:20]
-
-    # 大小直方图：按桶边界做累计范围计数（idx_entries_size 覆盖），差分得各桶
-    edges = [edge for edge, _ in _SIZE_BUCKETS]
-    cum: "list[int]" = []
-    cum_bytes: "list[int]" = []
-    for edge in edges:
-        r = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(size_bytes), 0) FROM entries WHERE size_bytes <= ?",
-            (edge,),
-        ).fetchone()
-        cum.append(r[0])
-        cum_bytes.append(r[1])
-    buckets = []
-    prev_n = prev_b = 0
-    for i, (_, label) in enumerate(_SIZE_BUCKETS):
-        buckets.append({"label": label, "count": cum[i] - prev_n,
-                        "total_bytes": cum_bytes[i] - prev_b})
-        prev_n, prev_b = cum[i], cum_bytes[i]
-
-    # 深度直方图（仅文件行）：无 depth 索引，一趟分组；3M 行实测 ~0.5s
-    depth_hist = conn.execute(
-        "SELECT depth, COUNT(*) AS n FROM entries WHERE type = 'file' GROUP BY depth"
-    ).fetchall()
-
-    # 零字节与 top 50：idx_entries_size 范围扫描
-    zero_count = conn.execute(
-        "SELECT COUNT(*) FROM entries WHERE size_bytes = 0").fetchone()[0]
-    top_files = [
-        {
-            "entry_id": r["entry_id"], "path": r["path"], "name": r["name"],
-            "size_bytes": r["size_bytes"], "mtime_ns": str(r["mtime_ns"]) if r["mtime_ns"] is not None else None,
-        }
-        for r in conn.execute(
-            "SELECT entry_id, path, name, size_bytes, mtime_ns FROM entries"
-            " WHERE type='file' ORDER BY size_bytes DESC LIMIT 50"
-        )
-    ]
-    return {
-        "snapshot_id": snapshot_id,
-        "ext_top_by_bytes": ext_top_by_bytes,
-        "ext_top_by_count": ext_top_by_count,
-        "size_histogram": buckets,
-        "depth_histogram": [{"depth": d["depth"], "count": d["n"]} for d in depth_hist],
-        "zero_byte_count": zero_count,
-        "top_files": top_files,
-    }
+    pre = load_precomputed_stats(conn)
+    if pre is not None:
+        return {"snapshot_id": snapshot_id, **pre, "precomputed": True}
+    return {"snapshot_id": snapshot_id, **compute_stats(conn), "precomputed": False}
 
 
 # ---------------------------------------------------------------- entries

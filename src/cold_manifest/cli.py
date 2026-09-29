@@ -71,6 +71,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fts.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
     p_fts.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
 
+    p_stats = sub.add_parser("build-stats",
+                             help="为已有封库快照就地补建 stats 预计算表（显式升级动作）")
+    p_stats.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_stats.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+
     p_hash = sub.add_parser("hash",
                             help="为快照补算文件哈希（按需，可续算，跨快照缓存复用；"
                                  "缓存键不含 volume_id，跨盘同名同大小同 mtime 可能复用旧哈希）")
@@ -323,6 +328,46 @@ def _cmd_build_fts(args: argparse.Namespace) -> int:
         conn.close()
 
 
+# ---- build-stats ------------------------------------------------------------
+
+def _cmd_build_stats(args: argparse.Namespace) -> int:
+    """为已有封库快照就地补建 stats_precomputed（快照是不可变制品，显式升级动作）。
+
+    幂等：整体重建（DROP 后重算重写），保证与 entries 严格一致。
+    写入须绕过只读打开（open_snapshot 是 mode=ro&immutable），此处显式以读写打开。
+    """
+    from .catalog import snapshot_path
+    from .stats_cache import build_stats_cache, stats_precomputed_available
+
+    db = Path(args.snapshot_id)
+    if not db.is_file():
+        db = snapshot_path(args.data_root, args.snapshot_id)
+        if not db.is_file():
+            print(f"错误：快照不存在：{args.snapshot_id}（{db}）", file=sys.stderr)
+            return 2
+
+    conn = sqlite3.connect(db.as_posix())
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
+        if not row or row[0] != "sealed":
+            print("警告：该快照未封库（meta.status != sealed），建议先完成封库再预计算",
+                  file=sys.stderr)
+        existed = stats_precomputed_available(conn)
+        t0 = time.monotonic()
+        n_keys = build_stats_cache(conn)
+        conn.commit()
+        elapsed = time.monotonic() - t0
+        print(f"{'重建' if existed else '构建'}完成：stats_precomputed（{n_keys} 个聚合段）")
+        print(f"  库：{db}  耗时：{elapsed:.1f}s")
+        return 0
+    except sqlite3.Error as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+
 # ---- hash -------------------------------------------------------------------
 
 def _cmd_hash(args: argparse.Namespace) -> int:
@@ -434,6 +479,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "build-fts":
         return _cmd_build_fts(args)
+
+    if args.command == "build-stats":
+        return _cmd_build_stats(args)
 
     if args.command == "hash":
         return _cmd_hash(args)

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from .schema import SNAPSHOT_INDEXES_DDL
+from .stats_cache import build_stats_cache
 
 
 # FTS5 全文索引（contentless：只存分词后的倒排索引，原文以 entries 为准，rowid=entry_id）。
@@ -130,16 +131,18 @@ def build_dir_rollup(conn: sqlite3.Connection, step_done: "Callable[[], None] | 
 
 def seal_snapshot(conn: sqlite3.Connection,
                   progress: "Callable[[int, int], None] | None" = None) -> None:
-    """封库收尾：建索引 → dir_rollup → PRAGMA optimize → FTS5 → commit。
+    """封库收尾：建索引 → dir_rollup → PRAGMA optimize → FTS5 → stats 预计算 → commit。
 
     progress(done, total)：细粒度步骤——建索引 1 步、dir_rollup 按 depth
-    多步（max_depth+1）、optimize 1 步、FTS5 1 步，total = max_depth + 4。
+    多步（max_depth+1）、optimize 1 步、FTS5 1 步、stats 预计算 1 步，
+    total = max_depth + 5。
     FTS 放在 PRAGMA optimize 之后：optimize 面向普通索引/统计信息，
     全文索引是封库末尾的一次性批量构建，无需（也不宜）参与 optimize。
+    stats 预计算（P2-A）最后执行：复用已建好的覆盖索引，结果落 stats_precomputed。
     """
     max_depth = conn.execute(
         "SELECT COALESCE(MAX(depth), 0) FROM entries WHERE type='dir'").fetchone()[0]
-    total = max_depth + 4
+    total = max_depth + 5
     done = 0
 
     def tick() -> None:
@@ -154,6 +157,8 @@ def seal_snapshot(conn: sqlite3.Connection,
     conn.execute("PRAGMA optimize")
     tick()
     build_fts(conn)
+    tick()
+    build_stats_cache(conn)
     tick()
     conn.commit()
 

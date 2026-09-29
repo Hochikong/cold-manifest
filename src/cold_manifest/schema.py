@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS dir_rollup(
   total_allocated INTEGER NOT NULL,
   max_mtime_ns    INTEGER                  -- 目录树下最新 mtime
 );
+
+-- stats 预计算（P2-A）：封库期把 /api/snapshots/{sid}/stats 的聚合算好落表，
+-- 查询直读（10M 库实时聚合 6–9.6s → 直读毫秒级）。key ∈ stats_cache.STATS_KEYS，
+-- value_json 为该聚合段的 JSON 文本；旧库无此表 → 查询端回退实时聚合。
+CREATE TABLE IF NOT EXISTS stats_precomputed(
+  key        TEXT PRIMARY KEY,             -- 聚合段名（ext_top_by_bytes 等）
+  value_json TEXT NOT NULL                 -- 该段结果的 JSON 序列化
+);
 """
 
 SNAPSHOT_INDEXES_DDL = """
