@@ -149,9 +149,11 @@ def scan_tree(
     父目录完成，因此"帧弹出"即"子树完成"。skip_subtrees：续采时 journal 中
     已完成的目录集合，命中即整棵跳过（行已在库中，不重插、不记账）。
 
-    one_filesystem：进入子目录前比较其 st_dev 与扫描根的 st_dev，不同则整棵
-    剪枝并记 skipped('other_filesystem')——挂载点（/proc、/sys、网络盘等）
-    不属于本卷，不应进快照。跨文件系统采集（跨盘比对挂载结构）传 False。
+    one_filesystem：进入子目录前比较其 st_dev 与扫描根的 st_dev，**两侧都
+    有效（非 0）且不同**才整棵剪枝并记 skipped('other_filesystem')——挂载点
+    （/proc、/sys、网络盘等）不属于本卷，不应进快照。Windows 上子目录的
+    非 follow st_dev 恒为 0，视为未知放行（见 _is_cross_fs 注释）。跨文件
+    系统采集（跨盘比对挂载结构）传 False。
     """
     stats = ScanStats()
     t0 = time.monotonic()
@@ -284,7 +286,7 @@ def scan_tree(
         if is_dir and rel in skip:
             # 断点续采：该子树上次已完成且已入库，整棵跳过
             continue
-        if is_dir and one_filesystem and st.st_dev != root_st.st_dev:
+        if is_dir and one_filesystem and _is_cross_fs(st, root_st):
             # 挂载点剪枝：子目录在另一文件系统上（/proc、/sys、网络盘等），
             # 不属于本卷 → 整棵剪枝并留痕。注意：与 scan_error 不同，
             # 该目录不产出任何条目（目录行也不入库），仅记 skipped。
@@ -348,6 +350,20 @@ def scan_tree(
         progress_cb(done, stats.total_bytes)
     stats.elapsed_s = time.monotonic() - t0
     return stats
+
+
+def _is_cross_fs(child_st: os.stat_result, root_st: os.stat_result) -> bool:
+    """跨文件系统判定（稳健口径）：仅当**两侧 st_dev 都有效（非 0）且不同**才剪枝。
+
+    平台差异：Windows 上 scandir 的 DirEntry.stat(follow_symlinks=False).st_dev
+    恒为 0（CPython 不填），而根 os.stat().st_dev 是卷序列号——若直接比较
+    会把每个子目录都误判为跨文件系统、整棵剪枝（Windows 真盘验证 F: 实测
+    丢全部子树，2026-09-30 修复）。0 值视为"未知"自然放行；Windows 的
+    junction/挂载点是 reparse point，已由上方既有逻辑跳过，不依赖 st_dev。
+    """
+    child_dev = child_st.st_dev
+    root_dev = root_st.st_dev
+    return bool(child_dev) and bool(root_dev) and child_dev != root_dev
 
 
 def _is_hidden(name: str, entry: os.DirEntry) -> bool:

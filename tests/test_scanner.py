@@ -162,3 +162,135 @@ def test_small_tree_frequents_callback(tmp_path):
     calls = []
     scan_tree(tmp_path, w, progress_cb=lambda n, b: calls.append(n))
     assert calls[-1] == 2  # root + only.txt
+
+
+# ---- one_filesystem / st_dev 平台差异（Windows 真盘验证 P0 修复回归）--------
+
+import stat as _stat_mod
+from types import SimpleNamespace
+
+from cold_manifest.scanner import _is_cross_fs
+
+
+class _FakeStat:
+    def __init__(self, dev: int, is_dir: bool) -> None:
+        self.st_dev = dev
+        self.st_mode = 0o040000 if is_dir else 0o100644
+        self.st_mtime_ns = 0
+        self.st_size = 0
+
+
+class _FakeEntry:
+    def __init__(self, path: str, name: str, dev: int, is_dir: bool) -> None:
+        self.path = path
+        self.name = name
+        self._dev = dev
+        self._is_dir = is_dir
+
+    def is_symlink(self) -> bool:
+        return False
+
+    def stat(self, follow_symlinks: bool = False) -> _FakeStat:
+        return _FakeStat(self._dev, self._is_dir)
+
+
+def _build_fake_os(tmp_path, root_dev: int, dev_of):
+    """从真实临时树构造假 os.scandir/os.stat：dev_of(abs_path) 决定每项 st_dev。"""
+    children_map: dict = {}
+
+    def walk(d):
+        entries = []
+        for child in sorted(d.iterdir(), key=lambda p: p.name):
+            is_dir = child.is_dir()
+            entries.append(_FakeEntry(str(child), child.name,
+                                      dev_of(str(child)) if not is_dir else dev_of(str(child)),
+                                      is_dir))
+            if is_dir:
+                walk(child)
+        children_map[str(d)] = entries
+
+    walk(tmp_path)
+
+    class _FakeOS:
+        path = os.path
+        fspath = staticmethod(os.fspath)
+
+        @staticmethod
+        def stat(p):
+            return _FakeStat(root_dev, True)
+
+        @staticmethod
+        def scandir(p):
+            class _Iter:
+                def __init__(self, items):
+                    self._it = iter(items)
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    return next(self._it)
+
+                def close(self):
+                    pass
+
+            return _Iter(children_map.get(str(p), []))
+
+    return _FakeOS
+
+
+def test_is_cross_fs_semantics():
+    root = SimpleNamespace(st_dev=12345)
+    # a) Windows 模拟：子目录非 follow st_dev 恒 0 → 不剪
+    assert not _is_cross_fs(SimpleNamespace(st_dev=0), root)
+    # 一侧为 0（未知）一律放行
+    assert not _is_cross_fs(SimpleNamespace(st_dev=0), SimpleNamespace(st_dev=0))
+    # b) POSIX 语义：两侧非 0 且不同 → 剪
+    assert _is_cross_fs(SimpleNamespace(st_dev=999), root)
+    assert not _is_cross_fs(SimpleNamespace(st_dev=12345), root)
+
+
+def test_windows_zero_dev_children_not_pruned(tmp_path, monkeypatch):
+    # 复现 Windows 真盘场景：root st_dev=12345，所有子项 st_dev=0 → 全部入库
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "deep").mkdir()
+    (tmp_path / "r1.txt").write_text("1")
+    (tmp_path / "sub" / "s1.txt").write_text("2")
+    (tmp_path / "sub" / "deep" / "d1.txt").write_text("3")
+    monkeypatch.setattr("cold_manifest.scanner.os",
+                        _build_fake_os(tmp_path, 12345, lambda p: 0))
+    w = MemWriter()
+    st = scan_tree(tmp_path, w)
+    paths = {x["path"] for x in w.entries}
+    assert {"r1.txt", "sub", "sub/s1.txt", "sub/deep", "sub/deep/d1.txt"} <= paths
+    assert st.files == 3
+    assert not [s for s in w.skipped if s[1] == "other_filesystem"]
+
+
+def test_posix_cross_fs_still_pruned(tmp_path, monkeypatch):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "s1.txt").write_text("2")
+    (tmp_path / "r1.txt").write_text("1")
+    monkeypatch.setattr("cold_manifest.scanner.os",
+                        _build_fake_os(tmp_path, 12345,
+                                       lambda p: 999 if p.endswith("sub") else 12345))
+    w = MemWriter()
+    st = scan_tree(tmp_path, w)
+    paths = {x["path"] for x in w.entries}
+    assert "r1.txt" in paths
+    assert "sub" not in paths and "sub/s1.txt" not in paths
+    assert ("sub", "other_filesystem", "scan", None) in w.skipped
+    assert st.files == 1
+
+
+def test_cross_filesystems_flag_disables_prune(tmp_path, monkeypatch):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "s1.txt").write_text("2")
+    monkeypatch.setattr("cold_manifest.scanner.os",
+                        _build_fake_os(tmp_path, 12345,
+                                       lambda p: 999 if p.endswith("sub") else 12345))
+    w = MemWriter()
+    scan_tree(tmp_path, w, one_filesystem=False)
+    paths = {x["path"] for x in w.entries}
+    assert "sub" in paths and "sub/s1.txt" in paths
+    assert not [s for s in w.skipped if s[1] == "other_filesystem"]

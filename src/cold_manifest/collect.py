@@ -158,7 +158,9 @@ def _copy_with_hash(src: Path, dst: Path, cancel_event: "threading.Event | None"
 def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
                 vol: VolumeInfo, disk: DiskInfo, ts: str,
                 exclude_globs: list[str] | None, exclude_hidden: bool,
-                include_system: bool, cross_filesystems: bool = False) -> None:
+                include_system: bool, cross_filesystems: bool = False,
+                serial_fallback: bool = False,
+                probe_serial_raw: str = "") -> None:
     """§4.1 盘/卷/采集口径全量 meta；拿不到的字段写 NULL。"""
 
     def s(v) -> str | None:
@@ -202,6 +204,9 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
     }
     if smart_raw:
         meta["smart_raw_json"] = smart_raw if isinstance(smart_raw, str) else json.dumps(smart_raw)
+    if serial_fallback:
+        # 序列号回退时的原始探测值（诊断用：说明为何 volume_id 用了卷序列号）
+        meta["probe_serial_raw"] = probe_serial_raw
     conn.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                      list(meta.items()))
 
@@ -377,6 +382,25 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
     return batch_id
 
 
+def _usable_serial(serial: "str | None") -> bool:
+    """探测序列号是否可用。
+
+    视为不可用：空串、全 0 / 全占位符、清洗为 volume_id 字符集后不合法
+    （首字符非字母数字）的值——廉价 USB 桥常返回 "0"、"0000000" 甚至带
+    控制字节的残串（真盘 F: 实测 '\\x030'），这些值直接拼 volume_id 必然
+    被 validate_volume_id 拒绝，应走卷序列号回退或显式 --serial。
+    """
+    s = (serial or "").strip()
+    if not s:
+        return False
+    # 按 volume_id 的清洗口径检查（控制字符/空格等替换为 _ 后再判）：
+    # 首字符须为字母数字（validate_volume_id 同口径），且不能是全 0 占位
+    sanitized = re.sub(r"[^A-Za-z0-9_.\-]", "_", s)
+    if not re.match(r"[A-Za-z0-9]", sanitized):
+        return False
+    return any(c != "0" for c in sanitized)
+
+
 def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
                    volume_id: str | None = None, manual_serial: str | None = None,
                    exclude_globs: list[str] | None = None, exclude_hidden: bool = False,
@@ -426,14 +450,31 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
     if progress_cb is not None:
         progress_cb("probe", 1, 1)
 
+    serial_fallback = False
+    probe_serial_raw = ""
     if volume_id is None:
         serial = (disk.disk_serial or "").strip()
-        if not serial:
-            raise CollectError("无法确定磁盘序列号（可用 --serial 手动指定或 --volume-id 跳过 probe 命名）")
         index = vol.partition_index if vol.partition_index is not None else 0
-        # 怪异序列号（空格/斜杠/Unicode 等）清洗为合法 volume_id 字符，再统一校验
-        serial = re.sub(r"[^A-Za-z0-9_.\-]", "_", serial)
-        volume_id = f"{serial}_P{index}"
+        if not _usable_serial(serial):
+            # 占位序列号（空/"0"/全 0，USB 桥常见）→ 回退卷序列号 hex 命名
+            vhex = (vol.volume_serial_hex or "").strip()
+            if _usable_serial(vhex):
+                volume_id = f"VOL-{vhex.upper()}_P{index}"
+                probe_serial_raw = serial
+                serial_fallback = True
+                disk.serial_source = "volume_serial_fallback"
+                disk.disk_serial = ""  # 保持真实：占位值不伪造为盘序列号
+                warnings.append(
+                    f"未能读取盘序列号（探测值={serial!r}，USB 桥常见），"
+                    f"已回退用卷序列号命名 volume_id：{volume_id}（建议显式 --serial 固定命名）")
+            else:
+                raise CollectError(
+                    "未能读取盘序列号（USB 桥常见），请显式指定 `--serial <值>`"
+                    "（或用 --volume-id 手动命名该卷）")
+        else:
+            # 怪异序列号（空格/斜杠/Unicode 等）清洗为合法 volume_id 字符，再统一校验
+            serial = re.sub(r"[^A-Za-z0-9_.\-]", "_", serial)
+            volume_id = f"{serial}_P{index}"
     try:
         validate_volume_id(volume_id)
     except Exception as e:
@@ -509,7 +550,9 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
 
                 _write_meta(conn, scan_root, volume_id, vol, disk, ts,
                             exclude_globs, exclude_hidden, include_system,
-                            cross_filesystems=cross_filesystems)
+                            cross_filesystems=cross_filesystems,
+                            serial_fallback=serial_fallback,
+                            probe_serial_raw=probe_serial_raw)
                 # 断点续采标记：创建即 'incomplete'，封库成功后置 'complete'
                 conn.execute("INSERT OR REPLACE INTO meta(key, value)"
                              " VALUES('resume_state', 'incomplete')")

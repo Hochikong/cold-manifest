@@ -343,3 +343,90 @@ def test_collect_weird_serial_sanitized(tmp_path: Path, monkeypatch) -> None:
     _make_tree(scan_root)
     result = collect_volume(scan_root, data_root=tmp_path / "data")
     assert result.volume_id == "WD-40E__ZR_Z__x__P1"
+
+
+# ---- 序列号占位值回退（Windows 真盘验证 P1 修复回归）------------------------
+
+def _fake_probe_serial(disk_serial: str, volume_serial_hex: str):
+    vol = VolumeInfo(
+        filesystem="ntfs", label="", volume_serial_hex=volume_serial_hex,
+        partition_uuid="", partition_index=1, partition_table_type="MBR",
+        capacity_bytes=1_000, free_bytes=500,
+        mount_point="/mnt/fake", device_path="/dev/sdb1",
+    )
+    disk = DiskInfo(
+        physical_model="", physical_serial="", disk_serial=disk_serial,
+        serial_source="probe" if disk_serial else "",
+        bridge_model="KIOXIA TransMemory", interface_type="USB",
+        capacity_bytes=1_000, firmware="", smart_status="unavailable",
+    )
+
+    def probe(path, *, manual_serial=None, smartctl=True):
+        if manual_serial is not None:
+            disk.disk_serial = manual_serial
+            disk.serial_source = "manual"
+        return vol, disk
+
+    return probe
+
+
+def _collect_min(tmp_path, probe) -> object:
+    scan_root = tmp_path / "vol"
+    scan_root.mkdir()
+    (scan_root / "a.txt").write_text("x")
+    return collect_volume(scan_root, data_root=tmp_path / "data",
+                          on_disk_copy=False, smartctl=False,
+                          progress_cb=lambda ph, d, t: None)
+
+
+def _meta(db: Path, key: str) -> str | None:
+    conn = _open(db.parent / "snapshot.db")
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return None if row is None else row[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("placeholder", ["", "0", "0000000"])
+def test_placeholder_serial_falls_back_to_volume_serial(tmp_path, monkeypatch, placeholder):
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _fake_probe_serial(placeholder, "c4a2126f"))
+    result = _collect_min(tmp_path, _fake_probe_serial)
+    assert result.volume_id == "VOL-C4A2126F_P1"
+    db = Path(result.db_path)
+    assert _meta(db, "serial_source") == "volume_serial_fallback"
+    assert _meta(db, "probe_serial_raw") == placeholder
+    assert _meta(db, "volume_serial_hex") == "c4a2126f"
+    assert any("卷序列号" in w for w in result.warnings)
+
+
+def test_serial_missing_entirely_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _fake_probe_serial("0", ""))
+    with pytest.raises(CollectError) as ei:
+        _collect_min(tmp_path, _fake_probe_serial)
+    assert "--serial" in str(ei.value)
+
+
+def test_explicit_serial_still_wins_over_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _fake_probe_serial("0", "C4A2126F"))
+    scan_root = tmp_path / "vol"
+    scan_root.mkdir()
+    (scan_root / "a.txt").write_text("x")
+    result = collect_volume(scan_root, data_root=tmp_path / "data",
+                            manual_serial="MYDISK123",
+                            on_disk_copy=False, smartctl=False,
+                            progress_cb=lambda ph, d, t: None)
+    assert result.volume_id == "MYDISK123_P1"
+    assert _meta(Path(result.db_path), "serial_source") == "manual"
+
+
+def test_control_byte_serial_falls_back(tmp_path, monkeypatch):
+    # 廉价 USB 桥实测（KIOXIA TransMemory, F: 盘）：SerialNumber = '\x030'
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _fake_probe_serial("\x030", "C4A2126F"))
+    result = _collect_min(tmp_path, _fake_probe_serial)
+    assert result.volume_id == "VOL-C4A2126F_P1"
+    assert _meta(Path(result.db_path), "probe_serial_raw") == "\x030"
