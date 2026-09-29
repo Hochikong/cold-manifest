@@ -671,6 +671,7 @@ _KIND_HASH = "hash"
 class HashBody(BaseModel):
     algo: str = "sha256"
     policy: str = "full"
+    root: str | None = None
 
 
 def _run_hash(payload: dict, progress_cb: Any, cancel_event: Any = None) -> dict:
@@ -683,7 +684,7 @@ register_task_fn(_KIND_HASH, _run_hash)
 
 @router.post("/{snapshot_id:path}/hash", status_code=201)
 def submit_hash(snapshot_id: str, body: HashBody, request: Request) -> dict:
-    """提交按需哈希任务：body {algo?: "sha256", policy?: "full"|"sampled"}。
+    """提交按需哈希任务：body {algo?: "sha256", policy?: "full"|"sampled", root?: 源目录覆盖}。
 
     404=快照不存在；400=algo/policy 非法；409=同快照已有 pending/running 哈希任务。
     """
@@ -698,7 +699,7 @@ def submit_hash(snapshot_id: str, body: HashBody, request: Request) -> dict:
 
     runner: TaskRunner = request.app.state.task_runner
     payload = {"snapshot_id": snapshot_id, "algo": body.algo, "policy": body.policy,
-               "data_root": str(state.data_root)}
+               "data_root": str(state.data_root), "root": body.root}
     task_id = runner.submit_dedup(_KIND_HASH, payload, field="snapshot_id")
     if task_id is None:
         raise HTTPException(status_code=409, detail="同快照已有 pending/running 的哈希任务")

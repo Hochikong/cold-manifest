@@ -186,7 +186,9 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
         "free_bytes": s(vol.free_bytes),
         "source_mount": s(vol.mount_point),
         "os_platform": sys.platform,
-        "scan_root": str(Path(scan_root).resolve()),
+        "scan_root": str(scan_root),
+        # 与 scan_root 同值：host_path 语义修复（§4.5）后冗余一份，便于诊断/迁移
+        "root_path": str(scan_root),
         "exclude_rules_json": json.dumps({
             "exclude_globs": list(exclude_globs or []),
             "exclude_hidden": exclude_hidden,
@@ -319,6 +321,7 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
                       on_disk_copy: bool,
                       on_disk_path: Path | None, on_disk_sha256: str | None,
                       collected_at: str, warnings: list[str],
+                      root_path: Path,
                       cross_filesystems: bool = False) -> str:
     """catalog 注册：disk/volume/batch/snapshot + on_disk_copies。返回 batch_id。"""
     serial = (disk.disk_serial or "").strip()
@@ -343,7 +346,7 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
                           batch_id=batch_id,
                           collected_at=collected_at,
                           collector_version=__version__,
-                          host_path=str(snapshot_path(data_root, snapshot_id)),
+                          host_path=str(root_path),
                           status="sealed", hash_policy="none",
                           exclude_rules_json=json.dumps({
                               "exclude_globs": list(exclude_globs or []),
@@ -403,7 +406,9 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
     """
     t0 = time.monotonic()
     warnings: list[str] = []
-    scan_root = Path(scan_root)
+    # resolve：host_path/root_path 存被扫描根的绝对路径（多分区=该卷挂载根），
+    # 供按需哈希定位源文件（此前误存 snapshot.db 路径，哈希必失败）
+    scan_root = Path(scan_root).resolve()
     if not scan_root.is_dir():
         raise CollectError(f"扫描根不存在或不是目录：{scan_root}")
     data_root = Path(data_root)
@@ -595,6 +600,7 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         _register_catalog(data_root, sid, volume_id, vol, disk, stats,
                           exclude_globs, exclude_hidden, on_disk_copy,
                           on_disk_path, on_disk_sha, collected_at, warnings,
+                          root_path=scan_root,
                           cross_filesystems=cross_filesystems)
         if progress_cb is not None:
             progress_cb("register", 1, 1)

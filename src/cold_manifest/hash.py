@@ -100,15 +100,45 @@ def hash_file(path: "str | Path", algo: str = "sha256", policy: str = "full",
 # ---------------------------------------------------------------- 快照级
 
 
-def _resolve_host_path(data_root: "str | Path", snapshot_id: str,
-                       catalog_conn: sqlite3.Connection) -> Path:
+def _resolve_host_path(snapshot_conn: sqlite3.Connection,
+                       catalog_conn: sqlite3.Connection, snapshot_id: str,
+                       root: "str | Path | None" = None) -> Path:
+    """定位快照源目录。
+
+    优先级：显式 root 覆盖 > catalog.snapshots.host_path（须为目录）>
+    host_path 指向 snapshot.db 文件（旧版采集的脏数据）时回退快照库 meta
+    的 root_path / scan_root > 报错。
+    """
+    def _meta_path(key: str) -> "Path | None":
+        try:
+            r = snapshot_conn.execute(
+                "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        except sqlite3.Error:
+            return None
+        return Path(r[0]) if r and r[0] else None
+
+    if root is not None:
+        p = Path(root)
+        if not p.is_dir():
+            raise HashError(f"指定的源目录不存在或不是目录：{root}")
+        return p
+
     row = find_snapshot(catalog_conn, snapshot_id)
     if row is None:
         raise HashError(f"快照未注册：{snapshot_id}")
     host_path = Path(row["host_path"]) if row["host_path"] else None
-    if host_path is None or not host_path.is_dir():
-        raise HashError(f"快照源目录不可用（盘未挂载？）：{row['host_path']}")
-    return host_path
+    if host_path is not None and host_path.is_dir():
+        return host_path
+    # 脏数据回退：旧版采集把 host_path 写成 snapshot.db 文件路径
+    for key in ("root_path", "scan_root"):
+        mp = _meta_path(key)
+        if mp is not None and mp.is_dir():
+            return mp
+    hint = "（可用 `--root <盘挂载根>` 或 API body 的 root 指定源目录）"
+    if host_path is not None and host_path.is_file() and host_path.suffix == ".db":
+        raise HashError(f"快照源目录不可用（host_path 指向快照库而非源目录，"
+                        f"盘未挂载或已换机？）：{host_path} {hint}")
+    raise HashError(f"快照源目录不可用（盘未挂载？）：{row['host_path']} {hint}")
 
 
 def _entry_fs_path(host_path: Path, rel_path: str) -> Path:
@@ -121,7 +151,8 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
                   progress_cb: "ProgressCb | None" = None,
                   cancel_event: "Event | None" = None,
                   catalog_conn: "sqlite3.Connection | None" = None,
-                  limit: "int | None" = None) -> dict:
+                  limit: "int | None" = None,
+                  root: "str | Path | None" = None) -> dict:
     """为快照补算文件哈希（可续算）。
 
     conn：**可写**打开的快照库连接（immutable 只读连接无法回写）。
@@ -143,7 +174,7 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
     own_catalog = catalog_conn is None
     cat = catalog_conn if own_catalog is False else connect_catalog(data_root)
     try:
-        host_path = _resolve_host_path(data_root, snapshot_id, cat)
+        host_path = _resolve_host_path(conn, cat, snapshot_id, root=root)
 
         total = conn.execute(
             "SELECT COUNT(*) FROM entries WHERE type='file' AND hash_hex IS NULL"
@@ -306,6 +337,7 @@ def run_hash_task(payload: dict, progress_cb: "ProgressCb | None" = None,
                 algo=payload.get("algo") or "sha256",
                 policy=payload.get("policy") or "full",
                 progress_cb=progress_cb, cancel_event=cancel_event,
+                root=payload.get("root"),
             )
         finally:
             conn.close()

@@ -339,3 +339,183 @@ def test_cli_hash_unknown_snapshot(env, capsys) -> None:
     data_root, _, _ = env
     rc = main(["hash", "nope/123", "--data-root", str(data_root)])
     assert rc == 2
+
+
+# ---------------------------------------------------------------- host_path 语义修复
+
+def _fake_probe():
+    from cold_manifest.probe import DiskInfo, VolumeInfo
+    vol = VolumeInfo(
+        filesystem="ext4", label="FAKELBL", volume_serial_hex="abcd-1234",
+        partition_uuid="1111-2222", partition_index=1, partition_table_type="GPT",
+        capacity_bytes=10_000_000_000, free_bytes=9_000_000_000,
+        mount_point="/mnt/fake", device_path="/dev/sdb1",
+    )
+    disk = DiskInfo(
+        physical_model="Fake Disk 5000", physical_serial="SERFAKE123",
+        disk_serial="SERFAKE123", serial_source="probe",
+        bridge_model="", interface_type="USB", capacity_bytes=20_000_000_000,
+        firmware="fw1", smart_status="unavailable",
+    )
+
+    def probe(path, *, manual_serial=None, smartctl=True):
+        return vol, disk
+
+    return probe
+
+
+def test_collect_host_path_is_source_dir_and_hash_works(tmp_path, monkeypatch, capsys) -> None:
+    """回归：采集快照的 host_path 必须是被扫描根目录，cldm hash 直接可用。
+
+    修复前 host_path 存 snapshot.db 路径 → hash 必报"源目录不可用"。
+    """
+    from cold_manifest.catalog import connect_catalog
+    from cold_manifest.cli import main
+    from cold_manifest.collect import collect_volume
+
+    monkeypatch.setattr("cold_manifest.collect.probe_path", _fake_probe())
+    scan_root = tmp_path / "vol"
+    scan_root.mkdir()
+    payload = {"f1.txt": b"alpha\n", "sub/f2.bin": bytes(range(256))}
+    for rel, data in payload.items():
+        p = scan_root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+    data_root = tmp_path / "data"
+
+    result = collect_volume(scan_root, data_root=data_root, on_disk_copy=False)
+    sid = result.snapshot_id
+
+    # host_path 是目录（绝对路径 = 被扫描根）
+    cat = connect_catalog(data_root)
+    host_path = Path(cat.execute(
+        "SELECT host_path FROM snapshots WHERE snapshot_id=?", (sid,)).fetchone()[0])
+    cat.close()
+    assert host_path.is_dir()
+    assert host_path == scan_root.resolve()
+
+    # 快照库 meta 也写了 root_path
+    conn = _open_rw(_snap_db(data_root, sid))
+    meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
+    assert Path(meta["root_path"]) == scan_root.resolve()
+    conn.close()
+
+    # cldm hash 全链路成功且与 hashlib 一致
+    rc = main(["hash", sid, "--data-root", str(data_root)])
+    assert rc == 0
+    assert "错误" not in capsys.readouterr().err
+    conn = _open_rw(_snap_db(data_root, sid))
+    rows = {r["path"]: r["hash_hex"] for r in conn.execute(
+        "SELECT path, hash_hex FROM entries WHERE type='file'")}
+    conn.close()
+    assert rows["f1.txt"] == hashlib.sha256(payload["f1.txt"]).hexdigest()
+    assert rows["sub/f2.bin"] == hashlib.sha256(payload["sub/f2.bin"]).hexdigest()
+
+
+def _register_dirty_snapshot(data_root: Path, host: Path, meta_root: "Path | None") -> str:
+    """脏数据快照：host_path 指向 snapshot.db 文件（旧版采集的写法）。"""
+    sid = "dirtvol/20260201T000000Z"
+    db_dir = data_root / "dirtvol" / "20260201T000000Z"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_dir / "snapshot.db")
+    init_snapshot(conn)
+    conn.executemany(
+        "INSERT INTO entries(entry_id, parent_id, path, name, depth, type, size_bytes,"
+        " mtime_ns, path_norm) VALUES(?,?,?,?,?,?,?,?,?)",
+        _std_rows(),
+    )
+    meta = {"status": "sealed"}
+    if meta_root is not None:
+        meta["root_path"] = str(meta_root)
+    conn.executemany("INSERT INTO meta(key, value) VALUES(?,?)", list(meta.items()))
+    conn.commit()
+    conn.close()
+    cat = sqlite3.connect(catalog_path(data_root))
+    init_catalog(cat)
+    ensure_disk(cat, "DISK1", physical_model="TEST")
+    ensure_volume(cat, "dirtvol", "DISK1")
+    register_snapshot(cat, sid, "dirtvol", status="sealed",
+                      host_path=str(db_dir / "snapshot.db"))
+    cat.commit()
+    cat.close()
+    return sid
+
+
+def test_hash_dirty_host_path_falls_back_to_meta(env) -> None:
+    """host_path=snapshot.db 时回退 meta.root_path；--root 显式覆盖优先。"""
+    data_root, host, _ = env
+    sid = _register_dirty_snapshot(data_root, host, meta_root=host)
+    conn = _open_rw(_snap_db(data_root, sid))
+    r = hash_snapshot(conn, data_root, sid)
+    assert r["computed"] == 2 and r["host_path"] == str(host)
+    conn.close()
+
+
+def test_hash_dirty_host_path_explicit_root_overrides(env) -> None:
+    data_root, host, _ = env
+    sid = _register_dirty_snapshot(data_root, host, meta_root=None)
+    # meta 也没有 → 显式 --root 成功
+    conn = _open_rw(_snap_db(data_root, sid))
+    r = hash_snapshot(conn, data_root, sid, root=host)
+    assert r["computed"] == 2
+    # 显式 root 不是目录 → 报错
+    with pytest.raises(HashError, match="不是目录"):
+        hash_snapshot(conn, data_root, sid, root=host / "nope")
+    conn.close()
+
+
+def test_hash_dirty_host_path_no_fallback_error_has_hint(env) -> None:
+    """无任何可用源目录：报错信息提示 --root。"""
+    data_root, host, _ = env
+    sid = _register_dirty_snapshot(data_root, host, meta_root=None)
+    conn = _open_rw(_snap_db(data_root, sid))
+    with pytest.raises(HashError, match="--root"):
+        hash_snapshot(conn, data_root, sid)
+    conn.close()
+
+
+def test_cli_hash_dirty_snapshot_root_flag(env, capsys) -> None:
+    from cold_manifest.cli import main
+
+    data_root, host, _ = env
+    sid = _register_dirty_snapshot(data_root, host, meta_root=None)
+    # 不带 --root：退出码 2，错误含提示
+    rc = main(["hash", sid, "--data-root", str(data_root)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "不可用" in err and "--root" in err
+    # 带 --root：成功
+    rc = main(["hash", sid, "--data-root", str(data_root), "--root", str(host)])
+    assert rc == 0
+    assert "计算：2" in capsys.readouterr().out
+
+
+def test_api_hash_with_and_without_root(client, env) -> None:
+    data_root, host, _ = env
+    sid = _register_dirty_snapshot(data_root, host, meta_root=None)
+    # 不带 root → 任务 error，错误含提示
+    r = client.post(f"/api/snapshots/{sid}/hash", json={})
+    assert r.status_code == 201
+    task = _wait_task(client, r.json()["task_id"])
+    assert task["status"] == "error"
+    assert "--root" in (task.get("error") or "")
+    # 带 root → done
+    r = client.post(f"/api/snapshots/{sid}/hash", json={"root": str(host)})
+    assert r.status_code == 201
+    task = _wait_task(client, r.json()["task_id"])
+    assert task["status"] == "done"
+    assert task["result"]["computed"] == 2
+    assert task["payload"]["root"] == str(host)
+
+
+def test_api_hash_unmounted_source_clear_error(client, env) -> None:
+    data_root, _, sid = env
+    cat = sqlite3.connect(catalog_path(data_root))
+    cat.execute("UPDATE snapshots SET host_path='/mnt/__unmounted__'")
+    cat.commit()
+    cat.close()
+    r = client.post(f"/api/snapshots/{sid}/hash", json={})
+    assert r.status_code == 201
+    task = _wait_task(client, r.json()["task_id"])
+    assert task["status"] == "error"
+    assert "不可用" in (task.get("error") or "")

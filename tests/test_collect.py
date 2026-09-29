@@ -119,7 +119,7 @@ def test_collect_e2e(tmp_path: Path, probe_env) -> None:
         assert snap["snapshot_id"] == result.snapshot_id
         assert snap["status"] == "sealed"
         assert snap["file_count"] == 5
-        assert snap["host_path"] == str(result.db_path)
+        assert snap["host_path"] == str(scan_root.resolve())
         copy_row = cat.execute("SELECT * FROM on_disk_copies").fetchone()
         assert copy_row["status"] == "ok"
         assert copy_row["sha256"] == result.host_sha256

@@ -78,6 +78,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="哈希策略：full=整文件（默认）；sampled=首尾 64KB 指纹")
     p_hash.add_argument("--limit", type=int, default=None,
                         help="调试：本次最多处理 N 个条目（默认不限）")
+    p_hash.add_argument("--root", default=None,
+                        help="显式指定源目录（覆盖 catalog 记录的 host_path，须为目录）")
 
     return parser
 
@@ -358,6 +360,7 @@ def _cmd_hash(args: argparse.Namespace) -> int:
             result = hash_snapshot(
                 conn, data_root, args.snapshot_id,
                 algo=args.algo, policy=args.policy, limit=args.limit,
+                root=args.root,
                 progress_cb=lambda phase, done, total: (
                     sys.stdout.write(f"\r  {phase}:{done:,}/{total:,}") or sys.stdout.flush()
                 ),
