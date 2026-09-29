@@ -267,6 +267,37 @@ export async function getVolumeTrends(volume_id: string, limit?: number): Promis
   return data
 }
 
+export interface DuplicateItem {
+  hash_hex: string
+  size_bytes: number
+  count: number
+  wasted_bytes: number
+  paths: string[]
+  paths_truncated: boolean
+}
+
+export interface DuplicatesResponse {
+  snapshot_id: string
+  hash_algo: string
+  min_size: number
+  hashed_files: number
+  duplicate_groups: number
+  total_wasted_bytes: number
+  items: DuplicateItem[]
+  has_more: boolean
+  next_cursor: string | null
+}
+
+export async function getDuplicates(
+  snapshot_id: string,
+  params?: { min_size?: number; limit?: number; cursor?: string }
+): Promise<DuplicatesResponse> {
+  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}/duplicates`, {
+    params,
+  })
+  return data
+}
+
 export interface DiffRun {
   diff_id: string
   a: string

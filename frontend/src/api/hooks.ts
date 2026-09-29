@@ -11,6 +11,7 @@ import {
   searchEntries,
   listVolumes,
   getVolumeTrends,
+  getDuplicates,
   listDiffs,
   createDiff,
   getDiff,
@@ -119,6 +120,18 @@ export function useVolumeTrends(volume_id: string | undefined, limit?: number) {
     queryKey: ['volume-trends', volume_id, limit],
     queryFn: () => getVolumeTrends(volume_id!, limit),
     enabled: !!volume_id,
+    staleTime: 60_000,
+  })
+}
+
+export function useDuplicates(
+  snapshot_id: string | undefined,
+  params?: { min_size?: number; limit?: number; cursor?: string }
+) {
+  return useQuery({
+    queryKey: ['duplicates', snapshot_id, params],
+    queryFn: () => getDuplicates(snapshot_id!, params),
+    enabled: !!snapshot_id,
     staleTime: 60_000,
   })
 }

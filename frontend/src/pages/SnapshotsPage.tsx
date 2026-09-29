@@ -42,6 +42,7 @@ import {
   useSearch,
 } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import DuplicateReport from '../components/DuplicateReport'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
 import { exportSnapshotUrl, type Entry, type TreeDir, type SearchItem } from '../api/client'
 
@@ -109,6 +110,7 @@ export default function SnapshotsPage() {
         items={[
           { key: 'overview', label: '概览', children: <SnapshotOverview snapshotId={snapshotId} /> },
           { key: 'browse', label: '浏览', children: <DirectoryBrowser snapshotId={snapshotId} /> },
+          { key: 'duplicates', label: '重复文件', children: <DuplicateReport snapshotId={snapshotId} /> },
           { key: 'search', label: '搜索', children: <SearchPanel snapshotId={snapshotId} /> },
           { key: 'export', label: '导出', children: <ExportPanel snapshotId={snapshotId} /> },
         ]}
