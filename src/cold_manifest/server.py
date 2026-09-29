@@ -21,6 +21,7 @@ from .api.routes_imports import router as imports_router
 from .api.routes_misc import router as misc_router
 from .api.routes_snapshots import router as snapshots_router
 from .api.routes_tasks import router as tasks_router
+from .api.routes_trends import router as trends_router
 from .api.state import AppState
 from .tasks import TaskRunner
 
@@ -54,6 +55,7 @@ def create_app(data_root: "str | None" = None) -> FastAPI:
     app.include_router(collect_router)
     app.include_router(batches_router)
     app.include_router(tasks_router)
+    app.include_router(trends_router)
 
     if _FRONTEND_DIST.is_dir():
         app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="spa")
