@@ -244,3 +244,7 @@ frontend/dist/
 # 本地工具文件
 .ignore
 .cortexkit/
+
+# Windows 运行包
+.venv-win/
+dist-packages/
