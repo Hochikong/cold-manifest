@@ -623,17 +623,55 @@ function updateTreeChildren(nodes: TreeNodeData[], key: React.Key, children: Tre
   })
 }
 
+type SearchMode = 'prefix' | 'fulltext'
+
+const MODE_LABELS: Record<SearchMode, string> = {
+  prefix: '前缀',
+  fulltext: '全文',
+}
+
 function SearchPanel({ snapshotId }: { snapshotId: string }) {
   const [q, setQ] = useState('')
+  const [mode, setMode] = useState<SearchMode>('prefix')
   const [typeFilter, setTypeFilter] = useState<string | undefined>(undefined)
   const [ext, setExt] = useState('')
   const [results, setResults] = useState<SearchItem[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
   const [hasSearched, setHasSearched] = useState(false)
+  const [fulltextAvailable, setFulltextAvailable] = useState<boolean | null>(null)
+
+  // 轻量探测当前快照是否已建全文索引，仅用于禁用/提示
+  useEffect(() => {
+    let cancelled = false
+    setFulltextAvailable(null)
+    fetch(`/api/snapshots/${encodeURIComponent(snapshotId)}/search?q=%20&mode=prefix&limit=1`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!cancelled && data && typeof data.fulltext_available === 'boolean') {
+          setFulltextAvailable(data.fulltext_available)
+        }
+      })
+      .catch(() => {
+        // 探测失败时不阻塞搜索
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [snapshotId])
+
+  // 如果当前选的是全文但快照无索引，自动切回前缀
+  useEffect(() => {
+    if (mode === 'fulltext' && fulltextAvailable === false) {
+      setMode('prefix')
+    }
+  }, [mode, fulltextAvailable])
+
+  const canSearch = !!q && !(mode === 'fulltext' && q.length < 3)
 
   const { data: searchRes, isLoading, error, refetch } = useSearch(snapshotId, {
     q,
+    mode,
     limit: SEARCH_PAGE_SIZE,
     type: typeFilter as any,
     ext: ext || undefined,
@@ -643,6 +681,9 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     if (searchRes) {
       setResults(searchRes.items)
       setCursor(searchRes.next_cursor)
+      if (typeof searchRes.fulltext_available === 'boolean') {
+        setFulltextAvailable(searchRes.fulltext_available)
+      }
     }
   }, [searchRes])
 
@@ -655,7 +696,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     if (!cursor) return
     setLoadingMore(true)
     const res = await fetch(
-      `/api/snapshots/${encodeURIComponent(snapshotId)}/search?q=${encodeURIComponent(q)}&cursor=${encodeURIComponent(cursor)}&limit=${SEARCH_PAGE_SIZE}${typeFilter ? `&type=${typeFilter}` : ''}${ext ? `&ext=${encodeURIComponent(ext)}` : ''}`
+      `/api/snapshots/${encodeURIComponent(snapshotId)}/search?q=${encodeURIComponent(q)}&mode=${mode}&cursor=${encodeURIComponent(cursor)}&limit=${SEARCH_PAGE_SIZE}${typeFilter ? `&type=${typeFilter}` : ''}${ext ? `&ext=${encodeURIComponent(ext)}` : ''}`
     )
     const data = await res.json()
     setResults((prev) => [...prev, ...data.items])
@@ -671,28 +712,63 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     { title: '扩展名', dataIndex: 'ext', width: 100, render: (v: string) => v || '-' },
   ]
 
+  const placeholder = mode === 'fulltext' ? '输入关键词（至少 3 个字符）…' : '输入关键词前缀…'
+  const infoDescription =
+    mode === 'fulltext'
+      ? '当前为全文搜索模式，命中路径或名称中包含关键词的条目。'
+      : '当前为前缀搜索模式，名称以输入关键词开头的条目会被命中。'
+
   return (
     <div>
       {error && <ErrorAlert error={error} />}
       <Card style={{ marginBottom: 16 }}>
-        <Space wrap>
+        <Space wrap align="start">
           <Input
-            placeholder="输入关键词前缀…"
+            placeholder={placeholder}
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onPressEnter={doSearch}
             prefix={<SearchOutlined />}
             style={{ width: 280 }}
           />
+          <Select value={mode} onChange={(v) => setMode(v as SearchMode)} style={{ width: 120 }}>
+            <Option value="prefix">{MODE_LABELS.prefix}</Option>
+            <Option value="fulltext" disabled={fulltextAvailable === false}>
+              {MODE_LABELS.fulltext}
+            </Option>
+          </Select>
           <Select placeholder="类型" allowClear style={{ width: 120 }} value={typeFilter} onChange={setTypeFilter}>
             <Option value="file">文件</Option>
             <Option value="dir">目录</Option>
           </Select>
           <Input placeholder="扩展名，如 txt" value={ext} onChange={(e) => setExt(e.target.value)} style={{ width: 140 }} />
-          <Button type="primary" icon={<SearchOutlined />} onClick={doSearch} loading={isLoading}>
+          <Button
+            type="primary"
+            icon={<SearchOutlined />}
+            onClick={doSearch}
+            loading={isLoading}
+            disabled={!canSearch}
+          >
             搜索
           </Button>
         </Space>
+
+        {fulltextAvailable === false && (
+          <Alert
+            style={{ marginTop: 16, marginBottom: 0 }}
+            type="warning"
+            showIcon
+            title="该快照未构建全文索引，可用 CLDM 命令 build-fts 补建"
+          />
+        )}
+        {mode === 'fulltext' && q.length > 0 && q.length < 3 && (
+          <Alert
+            style={{ marginTop: 16, marginBottom: 0 }}
+            type="warning"
+            showIcon
+            title="全文模式至少 3 个字符"
+          />
+        )}
       </Card>
 
       {hasSearched && !isLoading && (
@@ -717,7 +793,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
           type="info"
           showIcon
           title="输入关键词或选择筛选条件开始搜索"
-          description="当前为前缀搜索模式，名称以输入关键词开头的条目会被命中。"
+          description={infoDescription}
         />
       )}
     </div>

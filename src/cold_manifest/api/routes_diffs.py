@@ -5,15 +5,17 @@ POST 物化为同步执行（FastAPI sync 端点自动跑线程池），幂等�
 """
 
 import itertools
+import io
 import json
 import sqlite3
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..diff_engine import DiffError, diff_db_path, iter_diff_csv, materialize_diff
+from ..report import generate_diff_report
 from .pagination import decode_cursor, encode_cursor
 from .state import AppState, get_state
 
@@ -227,6 +229,52 @@ def diff_entries(
         }
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------- 报告
+
+
+@router.get("/{diff_id}/report")
+def diff_report(
+    diff_id: str,
+    request: Request,
+    format: Literal["html"] = Query(default="html"),
+) -> Response:
+    """自包含 HTML 报告（§6.2 format=html）；未知 diff / 未物化 → 404。"""
+    if format != "html":
+        raise HTTPException(status_code=400,
+                            detail=f"不支持的报告格式：{format!r}（当前仅支持 html）")
+    state = get_state(request)
+    run = _require_diff_run(state, diff_id)          # catalog 未登记 → 404
+    conn = _open_diff_ro(state, diff_id)             # 结果库缺失/未完成 → 404
+    try:
+        meta = {r["key"]: r["value"] for r in
+                conn.execute("SELECT key, value FROM diff_meta")}
+        snap_meta = {}
+        for side in ("a", "b"):
+            sid = meta.get(side)
+            if not sid:
+                continue
+            row = state.catalog.execute(
+                "SELECT collected_at, total_bytes FROM snapshots WHERE snapshot_id=?",
+                (sid,)).fetchone()
+            if row:
+                snap_meta[side] = {"collected_at": row["collected_at"],
+                                   "total_bytes": row["total_bytes"]}
+        buf = io.StringIO()
+        try:
+            generate_diff_report(diff_db_path(state.data_root, diff_id), buf,
+                                 snapshot_meta=snap_meta or None)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404,
+                                detail=f"diff 结果库不存在（未物化或已删除）：{diff_id}") from None
+    finally:
+        conn.close()
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="diff-{diff_id}.html"'},
+    )
 
 
 # ---------------------------------------------------------------- 导出

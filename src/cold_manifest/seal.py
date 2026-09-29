@@ -1,4 +1,4 @@
-"""快照库封库共享逻辑：建索引 → dir_rollup → optimize。
+"""快照库封库共享逻辑：建索引 → dir_rollup → optimize → FTS5。
 
 import_legacy（CSV 导入）与 collect（在线采集）共用；库表结构见 schema.SNAPSHOT_TABLES_DDL，
 封库假设 entries/skipped 已灌完、meta 已写（status=sealed 由调用方在封库前写入）。
@@ -9,6 +9,59 @@ from pathlib import Path
 from typing import Callable
 
 from .schema import SNAPSHOT_INDEXES_DDL
+
+
+# FTS5 全文索引（contentless：只存分词后的倒排索引，原文以 entries 为准，rowid=entry_id）。
+# trigram 分词支持 CJK 与任意子串匹配（需 SQLite ≥3.34）；不支持时回退 unicode61（按词匹配）。
+ENTRIES_FTS_COLUMNS = ("name", "path")
+
+
+def fts_tokenizer(conn: sqlite3.Connection) -> str:
+    """探测当前 SQLite 是否支持 trigram 分词；不支持则回退 unicode61。"""
+    try:
+        conn.execute("CREATE VIRTUAL TABLE temp._fts_probe USING fts5(a, tokenize='trigram')")
+        conn.execute("DROP TABLE temp._fts_probe")
+        return "trigram"
+    except sqlite3.OperationalError:
+        return "unicode61"
+
+
+def fts_available(conn: sqlite3.Connection) -> bool:
+    """快照库是否已建 entries_fts 全文索引。"""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='entries_fts'"
+    ).fetchone() is not None
+
+
+def build_fts(conn: sqlite3.Connection) -> tuple[int, str]:
+    """为快照库构建/重建 entries_fts（幂等：已存在则 DROP 后重建）。
+
+    返回 (条目数, 分词器)。contentless FTS5 只存倒排索引，查询时按 rowid 回
+    JOIN entries 取原文，体积开销约为 path+name 文本的 10–20%。
+    快照库是不可变制品：重建（而非增量）保证索引与 entries 严格一致。
+    """
+    tok = fts_tokenizer(conn)
+    if fts_available(conn):
+        conn.execute("DROP TABLE entries_fts")
+    conn.execute(
+        f"CREATE VIRTUAL TABLE entries_fts USING fts5("
+        f"name, path, content='', tokenize='{tok}')"
+    )
+    conn.execute(
+        "INSERT INTO entries_fts(rowid, name, path) SELECT entry_id, name, path FROM entries"
+    )
+    count = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    return count, tok
+
+
+def fts_match_query(q: str) -> str:
+    """用户输入转为 FTS5 短语查询：内部双引号翻倍后整体外包双引号。
+
+    短词语法下输入被当作字面子串（trigram 分词时即子串匹配），
+    不会把用户的 * ? : 等字符解释为 MATCH 语法。
+    """
+    return '"' + q.replace('"', '""') + '"'
+
 def build_dir_rollup(conn: sqlite3.Connection, step_done: "Callable[[], None] | None" = None) -> None:
     """dir_rollup：每个目录的**后代**统计（不含自身），root 覆盖全库。
 
@@ -77,14 +130,16 @@ def build_dir_rollup(conn: sqlite3.Connection, step_done: "Callable[[], None] | 
 
 def seal_snapshot(conn: sqlite3.Connection,
                   progress: "Callable[[int, int], None] | None" = None) -> None:
-    """封库收尾：建索引 → dir_rollup → PRAGMA optimize → commit。
+    """封库收尾：建索引 → dir_rollup → PRAGMA optimize → FTS5 → commit。
 
     progress(done, total)：细粒度步骤——建索引 1 步、dir_rollup 按 depth
-    多步（max_depth+1）、optimize 1 步，total = max_depth + 3。
+    多步（max_depth+1）、optimize 1 步、FTS5 1 步，total = max_depth + 4。
+    FTS 放在 PRAGMA optimize 之后：optimize 面向普通索引/统计信息，
+    全文索引是封库末尾的一次性批量构建，无需（也不宜）参与 optimize。
     """
     max_depth = conn.execute(
         "SELECT COALESCE(MAX(depth), 0) FROM entries WHERE type='dir'").fetchone()[0]
-    total = max_depth + 3
+    total = max_depth + 4
     done = 0
 
     def tick() -> None:
@@ -97,6 +152,8 @@ def seal_snapshot(conn: sqlite3.Connection,
     tick()
     build_dir_rollup(conn, step_done=tick)
     conn.execute("PRAGMA optimize")
+    tick()
+    build_fts(conn)
     tick()
     conn.commit()
 

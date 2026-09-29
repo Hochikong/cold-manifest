@@ -3,6 +3,7 @@
 import argparse
 import csv
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--output", default=None,
                           help="csv：输出文件路径；v1_csv：输出目录（产出 metadata/tree/warnings 三件套）")
     p_export.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+
+    p_fts = sub.add_parser("build-fts",
+                           help="为已有封库快照就地补建 FTS5 全文索引（显式升级动作）")
+    p_fts.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_fts.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+
+    p_hash = sub.add_parser("hash",
+                            help="为快照补算文件哈希（按需，可续算，跨快照缓存复用）")
+    p_hash.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
+    p_hash.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_hash.add_argument("--algo", default="sha256", help="哈希算法（默认 sha256）")
+    p_hash.add_argument("--policy", choices=["full", "sampled"], default="full",
+                        help="哈希策略：full=整文件（默认）；sampled=首尾 64KB 指纹")
+    p_hash.add_argument("--limit", type=int, default=None,
+                        help="调试：本次最多处理 N 个条目（默认不限）")
 
     return parser
 
@@ -257,6 +273,114 @@ def _cmd_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- build-fts -------------------------------------------------------------
+
+def _cmd_build_fts(args: argparse.Namespace) -> int:
+    """为已有封库快照就地构建 FTS5 全文索引（快照是不可变制品，此为显式升级动作）。
+
+    幂等：entries_fts 已存在时 DROP 后整体重建，保证索引与 entries 严格一致。
+    写入须绕过只读打开（open_snapshot 是 mode=ro&immutable），此处显式以读写打开。
+    """
+    from .catalog import snapshot_path
+    from .seal import build_fts, fts_available
+
+    db = Path(args.snapshot_id)
+    if not db.is_file():
+        db = snapshot_path(args.data_root, args.snapshot_id)
+        if not db.is_file():
+            print(f"错误：快照不存在：{args.snapshot_id}（{db}）", file=sys.stderr)
+            return 2
+
+    conn = sqlite3.connect(db.as_posix())
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
+        if not row or row[0] != "sealed":
+            print("警告：该快照未封库（meta.status != sealed），建议先完成封库再建索引",
+                  file=sys.stderr)
+        existed = fts_available(conn)
+        t0 = time.monotonic()
+        count, tok = build_fts(conn)
+        conn.commit()
+        elapsed = time.monotonic() - t0
+        print(f"{'重建' if existed else '构建'}完成：entries_fts（{tok} 分词）")
+        print(f"  条目数：{count:,}  耗时：{elapsed:.1f}s")
+        print(f"  库：{db}")
+        if tok != "trigram":
+            print("  警告：当前 SQLite 不支持 trigram 分词，已回退 unicode61"
+                  "（中文子串匹配能力受限，建议 SQLite ≥3.34）", file=sys.stderr)
+        return 0
+    except sqlite3.Error as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+
+# ---- hash -------------------------------------------------------------------
+
+def _cmd_hash(args: argparse.Namespace) -> int:
+    """按需哈希（§4.5，同步执行）：持 data_root 写锁，可续算、缓存复用。"""
+    from .catalog import connect_catalog, find_snapshot, snapshot_path
+    from .hash import HashError, hash_snapshot
+    from .lockfile import DataRootLock, LockBusy
+
+    data_root = Path(args.data_root)
+    db = snapshot_path(data_root, args.snapshot_id)
+    cat = connect_catalog(data_root)
+    try:
+        if find_snapshot(cat, args.snapshot_id) is None:
+            print(f"错误：快照未注册：{args.snapshot_id}", file=sys.stderr)
+            return 2
+    finally:
+        cat.close()
+    if not db.is_file():
+        print(f"错误：快照库文件缺失：{db}", file=sys.stderr)
+        return 2
+
+    lock = DataRootLock(data_root)
+    try:
+        lock.acquire()
+    except LockBusy as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    try:
+        conn = sqlite3.connect(str(db))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE type='file' AND hash_hex IS NULL"
+            ).fetchone()[0]
+            if pending == 0:
+                print("所有文件已有哈希，无需补算（如需换算法/策略请先清空 hash 列）")
+                return 0
+            print(f"待哈希条目：{pending:,}  算法：{args.algo}  策略：{args.policy}")
+            result = hash_snapshot(
+                conn, data_root, args.snapshot_id,
+                algo=args.algo, policy=args.policy, limit=args.limit,
+                progress_cb=lambda phase, done, total: (
+                    sys.stdout.write(f"\r  {phase}:{done:,}/{total:,}") or sys.stdout.flush()
+                ),
+            )
+        finally:
+            conn.close()
+    except (HashError, sqlite3.Error) as e:
+        print(f"\n错误：{e}", file=sys.stderr)
+        return 2
+    finally:
+        lock.release()
+
+    print()
+    print(f"哈希完成：{result['snapshot_id']}")
+    print(f"  计算：{result['computed']:,}  缓存命中：{result['cached']:,}  "
+          f"失败：{result['errors']:,}")
+    mb = result["bytes_hashed"] / 2**20
+    thr = (result["bytes_hashed"] / 2**20 / result["elapsed_s"]) if result["elapsed_s"] else 0.0
+    print(f"  读取量：{mb:,.1f} MiB  耗时：{result['elapsed_s']:.1f}s  吞吐：{thr:,.1f} MiB/s")
+    print(f"  源目录：{result['host_path']}")
+    return 0
+
+
 # ---- main -------------------------------------------------------------------
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -299,6 +423,12 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "diff":
         return _cmd_diff(args)
+
+    if args.command == "build-fts":
+        return _cmd_build_fts(args)
+
+    if args.command == "hash":
+        return _cmd_hash(args)
 
     if args.command == "export":
         try:

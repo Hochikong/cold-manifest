@@ -28,7 +28,7 @@ import ReactECharts from 'echarts-for-react'
 import { useSnapshots, useDiffs, useDiff, useDiffSummary, useDiffEntries, useCreateDiff } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import { formatFileSize, formatDateTime, nsToDate } from '../utils/format'
-import { exportDiffUrl, type DiffEntry } from '../api/client'
+import { exportDiffUrl, diffReportUrl, type DiffEntry } from '../api/client'
 
 const { Title, Text } = Typography
 
@@ -298,9 +298,14 @@ function DiffDetail({ diffId }: { diffId: string }) {
           </Space>
         }
         extra={
-          <Button icon={<DownloadOutlined />} href={exportDiffUrl(diffId)}>
-            导出 CSV
-          </Button>
+          <Space>
+            <Button icon={<DownloadOutlined />} href={diffReportUrl(diffId)} disabled={diff?.status !== 'done'}>
+              下载 HTML 报告
+            </Button>
+            <Button icon={<DownloadOutlined />} href={exportDiffUrl(diffId)}>
+              导出 CSV
+            </Button>
+          </Space>
         }
       >
         <DiffEntriesTable diffId={diffId} category={category} onRowClick={setDrawerEntry} />

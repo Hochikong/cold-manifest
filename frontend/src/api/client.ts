@@ -198,6 +198,7 @@ export interface SearchItem {
 export interface SearchResponse {
   snapshot_id: string
   mode: string
+  fulltext_available?: boolean
   items: SearchItem[]
   next_cursor: string | null
   has_more: boolean
@@ -205,7 +206,7 @@ export interface SearchResponse {
 
 export interface SearchParams {
   q: string
-  mode?: 'prefix'
+  mode?: 'prefix' | 'fulltext'
   type?: 'file' | 'dir' | 'symlink' | 'other'
   ext?: string
   min_size?: number
@@ -344,6 +345,10 @@ export function exportSnapshotUrl(snapshot_id: string, format: 'csv' | 'v1_csv' 
 
 export function exportDiffUrl(diff_id: string): string {
   return `/api/diffs/${diff_id}/export?format=csv`
+}
+
+export function diffReportUrl(diff_id: string, format: 'html' = 'html'): string {
+  return `/api/diffs/${diff_id}/report?format=${format}`
 }
 
 export interface ImportCandidate {

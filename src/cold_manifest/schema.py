@@ -122,6 +122,19 @@ CREATE TABLE IF NOT EXISTS tasks (
   status TEXT, created_at TEXT, finished_at TEXT, error TEXT,
   related_id TEXT                        -- batch_id 或 diff_id
 );
+
+-- 跨快照哈希缓存（§4.5）：同 (size, mtime, path_norm, algo) 直接复用哈希值，
+-- 避免跨快照重复读盘。policy 记录产出该哈希的策略（full/sampled），仅作溯源。
+CREATE TABLE IF NOT EXISTS hash_cache (
+  size_bytes INTEGER NOT NULL,
+  mtime_ns   INTEGER NOT NULL,
+  path_norm  TEXT NOT NULL,
+  algo       TEXT NOT NULL,
+  hash_hex   TEXT NOT NULL,
+  policy     TEXT,
+  created_at TEXT,
+  PRIMARY KEY (size_bytes, mtime_ns, path_norm, algo)
+);
 """
 
 # §5.3 diff 物化库

@@ -1,13 +1,18 @@
 """snapshots 相关只读端点（§6.2）：列表/详情/stats/entries/tree/du/search/skipped。"""
 
+import sqlite3
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from ..catalog import find_snapshot
 from ..exporter import export_v1_csv_zip, iter_snapshot_csv
+from ..hash import ALLOWED_ALGOS, ALLOWED_POLICIES, run_hash_task
+from ..seal import fts_available, fts_match_query
+from ..tasks import TaskRunner, register_task_fn
 from .pagination import decode_cursor, encode_cursor
 from .state import AppState, get_state
 
@@ -400,7 +405,7 @@ def search_entries(
     snapshot_id: str,
     request: Request,
     q: str = Query(min_length=1, max_length=200),
-    mode: Literal["prefix"] = Query(default="prefix"),
+    mode: Literal["prefix", "fulltext"] = Query(default="prefix"),
     type: "EntryType | None" = Query(default=None),
     ext: "str | None" = Query(default=None),
     min_size: "int | None" = Query(default=None, ge=0),
@@ -408,11 +413,101 @@ def search_entries(
     cursor: "str | None" = Query(default=None),
     limit: int = Query(default=_LIMIT_DEFAULT, ge=1, le=_LIMIT_MAX),
 ) -> dict:
-    """前缀搜索：走 idx_entries_name（NOCASE），keyset 分页（FTS 模式后续补）。"""
+    """搜索：mode=prefix 走 idx_entries_name（NOCASE）；mode=fulltext 走 entries_fts（FTS5）。
+
+    fulltext 按 path（COLLATE NOCASE）keyset 分页（与契约一致，不用 rank 排序）；
+    查询词安全转义为 FTS 短语（内部引号翻倍外包双引号），MATCH 语法错误 → 400。
+    快照未建 FTS（旧快照可用 `cldm build-fts` 补建）时回退 substring
+    （LIKE %q%），响应带 fulltext_available=false 供前端提示/禁用。
+    """
     conn = _snap_db(request, snapshot_id)
+    has_fts = fts_available(conn)
+
+    if mode == "fulltext" and has_fts:
+        return _search_fulltext(conn, snapshot_id, q, type, ext, min_size, max_size,
+                                cursor, limit, fallback=False)
+
+    if mode == "fulltext":
+        # 无 FTS 表：回退 substring（LIKE 包含匹配）
+        return _search_prefix(conn, snapshot_id, q, mode="substring", substring=True,
+                              type=type, ext=ext, min_size=min_size, max_size=max_size,
+                              cursor=cursor, limit=limit, has_fts=False)
+
+    return _search_prefix(conn, snapshot_id, q, mode="prefix", substring=False,
+                          type=type, ext=ext, min_size=min_size, max_size=max_size,
+                          cursor=cursor, limit=limit, has_fts=has_fts)
+
+
+def _search_fulltext(conn: Any, snapshot_id: str, q: str,
+                     type: "EntryType | None", ext: "str | None",
+                     min_size: "int | None", max_size: "int | None",
+                     cursor: "str | None", limit: int, fallback: bool) -> dict:
+    op = ">"
+    where = ["f.entries_fts MATCH ?"]
+    params: "list[Any]" = [fts_match_query(q)]
+    if type:
+        where.append("e.type = ?")
+        params.append(type)
+    if ext_norm := _normalize_ext(ext):
+        where.append("e.ext = ?")
+        params.append(ext_norm)
+    if min_size is not None:
+        where.append("e.size_bytes >= ?")
+        params.append(min_size)
+    if max_size is not None:
+        where.append("e.size_bytes <= ?")
+        params.append(max_size)
+    if cursor is not None:
+        try:
+            key_val, last_id = decode_cursor(cursor)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from None
+        where.append(_keyset_clause("e.path", True, op, id_col="e.entry_id"))
+        params += [key_val, key_val, last_id]
+
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT e.entry_id, e.name, e.path, e.type, e.size_bytes, e.ext
+            FROM entries_fts f JOIN entries e ON e.entry_id = f.rowid
+            WHERE {' AND '.join(where)}
+            ORDER BY e.path COLLATE NOCASE, e.entry_id
+            LIMIT ?
+            """,
+            [*params, limit + 1],
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if "fts5" in str(e).lower():
+            raise HTTPException(status_code=400, detail=f"搜索语法无效：{q!r}") from None
+        raise
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = (
+        encode_cursor(rows[-1]["path"], rows[-1]["entry_id"]) if has_more and rows else None
+    )
+    return {
+        "snapshot_id": snapshot_id,
+        "mode": "fulltext",
+        "fulltext_available": True,
+        "items": [
+            {"entry_id": r["entry_id"], "name": r["name"], "path": r["path"],
+             "type": r["type"], "size_bytes": r["size_bytes"], "ext": r["ext"]}
+            for r in rows
+        ],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+
+
+def _search_prefix(conn: Any, snapshot_id: str, q: str, mode: str, substring: bool,
+                   type: "EntryType | None", ext: "str | None",
+                   min_size: "int | None", max_size: "int | None",
+                   cursor: "str | None", limit: int, has_fts: bool) -> dict:
+    """前缀搜索（idx_entries_name）或 substring 回退（LIKE %q%），按 name keyset 分页。"""
     op = ">"
     where = [r"name LIKE ? ESCAPE '\'"]
-    prefix = q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
+    escaped = q.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+    prefix = escaped + "%" if not substring else "%" + escaped + "%"
     params: "list[Any]" = [prefix]
     if type:
         where.append("type = ?")
@@ -452,6 +547,7 @@ def search_entries(
     return {
         "snapshot_id": snapshot_id,
         "mode": mode,
+        "fulltext_available": has_fts,
         "items": [
             {"entry_id": r["entry_id"], "name": r["name"], "path": r["path"],
              "type": r["type"], "size_bytes": r["size_bytes"], "ext": r["ext"]}
@@ -565,3 +661,45 @@ def snapshot_detail(snapshot_id: str, request: Request) -> dict:
     conn = _snap_db(request, snapshot_id)
     detail["meta"] = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
     return detail
+
+
+# ---------------------------------------------------------------- 按需哈希（§4.5）
+
+_KIND_HASH = "hash"
+
+
+class HashBody(BaseModel):
+    algo: str = "sha256"
+    policy: str = "full"
+
+
+def _run_hash(payload: dict, progress_cb: Any, cancel_event: Any = None) -> dict:
+    """工作线程执行体（经 tasks._FN_REGISTRY 调用）：持 data_root 锁同步哈希。"""
+    return run_hash_task(payload, progress_cb, cancel_event)
+
+
+register_task_fn(_KIND_HASH, _run_hash)
+
+
+@router.post("/{snapshot_id:path}/hash", status_code=201)
+def submit_hash(snapshot_id: str, body: HashBody, request: Request) -> dict:
+    """提交按需哈希任务：body {algo?: "sha256", policy?: "full"|"sampled"}。
+
+    404=快照不存在；400=algo/policy 非法；409=同快照已有 pending/running 哈希任务。
+    """
+    state = get_state(request)
+    _require_snapshot(state, snapshot_id)
+    if body.algo not in ALLOWED_ALGOS:
+        raise HTTPException(status_code=400,
+                            detail=f"不支持的哈希算法：{body.algo!r}（允许 {'/'.join(ALLOWED_ALGOS)}）")
+    if body.policy not in ALLOWED_POLICIES:
+        raise HTTPException(status_code=400,
+                            detail=f"非法哈希策略：{body.policy!r}（允许 {'/'.join(ALLOWED_POLICIES)}）")
+
+    runner: TaskRunner = request.app.state.task_runner
+    payload = {"snapshot_id": snapshot_id, "algo": body.algo, "policy": body.policy,
+               "data_root": str(state.data_root)}
+    task_id = runner.submit_dedup(_KIND_HASH, payload, field="snapshot_id")
+    if task_id is None:
+        raise HTTPException(status_code=409, detail="同快照已有 pending/running 的哈希任务")
+    return {"task_id": task_id, "status": "pending"}
