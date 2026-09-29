@@ -49,6 +49,38 @@ class ProbeResult:
     disk: DiskInfo
 
 
+@dataclass
+class VolumeTarget:
+    """多分区采集（§4.2）的单卷目标：path 可直接作为扫描根。"""
+
+    path: str  # 挂载点（Linux "/mnt/x"）或盘符根（Windows "E:\\"）
+    device_path: str = ""
+    partition_index: "int | None" = None
+    filesystem: str = ""
+    label: str = ""
+    capacity_bytes: "int | None" = None
+    mount_point: str = ""
+
+
+def enumerate_disk_volumes(
+    path: str, *, smartctl: bool = True
+) -> "tuple[list[VolumeTarget], list[str]]":
+    """枚举 path 所在物理盘的全部可采集卷（多分区采集，§4.2）。
+
+    返回 (targets, warnings)；跳过的分区（swap/无文件系统/无挂载点/无盘符）
+    记入 warnings。按平台分派。
+    """
+    if sys.platform == "win32":
+        from .windows import enumerate_disk_volumes_win
+
+        return enumerate_disk_volumes_win(path)
+    if sys.platform.startswith("linux"):
+        from .linux import enumerate_disk_volumes_linux
+
+        return enumerate_disk_volumes_linux(path)
+    raise ProbeError(f"不支持的平台：{sys.platform}")
+
+
 def probe_path(
     path: str, *, manual_serial: str | None = None, smartctl: bool = True
 ) -> tuple[VolumeInfo, DiskInfo]:

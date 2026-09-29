@@ -7,7 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from . import DiskInfo, ProbeError, VolumeInfo
+from . import DiskInfo, ProbeError, VolumeInfo, VolumeTarget
 
 LSBLK_COLUMNS = "NAME,PATH,TYPE,FSTYPE,LABEL,UUID,SERIAL,MODEL,SIZE,PARTUUID,MOUNTPOINTS"
 
@@ -102,6 +102,62 @@ def select_target(nodes: list[dict], source_dev: str, mount_point: str) -> tuple
             break
         parent = parent.get("parent")
     return part, disk
+
+
+def enumerate_disk_volumes_linux(path: str) -> "tuple[list[VolumeTarget], list[str]]":
+    """枚举 path 所在物理盘的全部可采集分区（lsblk -J 一棵树全搞定）。
+
+    由 path 的挂载点定位分区 → 上溯到 disk → 枚举该盘下所有带文件系统的
+    分区；swap / 无文件系统跳过，无挂载点跳过并记 warning。整盘文件系统
+    （无分区表）时返回单卷。
+    """
+    p = Path(path)
+    if not p.exists():
+        raise ProbeError(f"路径不存在：{path}")
+
+    mount_point, source_dev = find_mount_point(p)
+    nodes = parse_lsblk(_run(["lsblk", "-J", "-b", "-o", LSBLK_COLUMNS]).stdout)
+    part, disk = select_target(nodes, source_dev, mount_point)
+
+    if disk is None or disk is part:
+        # 整盘文件系统：单卷
+        parts = [part]
+    else:
+        parts = [n for n in nodes if n.get("parent") is disk and n.get("type") == "part"]
+
+    targets: list[VolumeTarget] = []
+    warnings: list[str] = []
+    seen_devices: set[str] = set()
+    for n in parts:
+        fstype = n.get("fstype") or ""
+        if not fstype:
+            continue  # 无文件系统（扩展分区/空分区）：静默跳过
+        if fstype == "swap":
+            continue
+        mps = _mounts_of(n)
+        if not mps:
+            warnings.append(f"分区 {n.get('path') or n.get('name')} 无挂载点，跳过")
+            continue
+        dev = n.get("path") or n.get("name") or ""
+        if dev in seen_devices:
+            continue  # 同设备的多次挂载（bind mount，如 /mnt/wslg/distro）只取一个
+        seen_devices.add(dev)
+        # 请求路径所在的挂载点优先（该分区是定位起点时取真实挂载点，而非任意一个）
+        mp = mount_point if mount_point in mps else mps[0]
+        targets.append(
+            VolumeTarget(
+                path=mp,
+                device_path=dev,
+                partition_index=_partition_index(nodes, disk, n),
+                filesystem=fstype,
+                label=n.get("label") or "",
+                capacity_bytes=n.get("size"),
+                mount_point=mp,
+            )
+        )
+    if not targets:
+        raise ProbeError(f"{path} 所在盘没有可采集的已挂载卷")
+    return targets, warnings
 
 
 def parse_smartctl(text: str) -> dict:

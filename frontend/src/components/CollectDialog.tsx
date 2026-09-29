@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Modal,
@@ -11,6 +11,8 @@ import {
   Typography,
   Tag,
   Form,
+  Collapse,
+  Divider,
 } from 'antd'
 import {
   FolderOpenOutlined,
@@ -19,12 +21,14 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   CloudSyncOutlined,
+  PartitionOutlined,
+  ReloadOutlined,
 } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
-import { useCreateCollect, useCancelTask, useTaskEvents } from '../api/hooks'
+import { useCreateCollect, useCancelTask, useTaskEvents, useBatch } from '../api/hooks'
+import { isBatchCollectResponse, type BatchCollectCreateResponse, type Task, type Batch } from '../api/client'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatFileSize, formatNumber } from '../utils/format'
-import type { Task } from '../api/client'
 
 const { Text } = Typography
 const { TextArea } = Input
@@ -47,6 +51,7 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
 
   const [mode, setMode] = useState<Mode>('form')
   const [taskId, setTaskId] = useState<string | null>(null)
+  const [batchResponse, setBatchResponse] = useState<BatchCollectCreateResponse | null>(null)
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [cancelRequested, setCancelRequested] = useState(false)
 
@@ -57,20 +62,21 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
   const [excludeHidden, setExcludeHidden] = useState(false)
   const [smartctl, setSmartctl] = useState(true)
   const [onDiskCopy, setOnDiskCopy] = useState(true)
+  const [allPartitions, setAllPartitions] = useState(false)
+  const [resume, setResume] = useState(false)
+  const [crossFilesystems, setCrossFilesystems] = useState(false)
 
   const { task } = useTaskEvents(taskId ?? undefined, mode === 'progress' || mode === 'done')
-  const taskRef = useRef<Task | null>(null)
-  taskRef.current = task
+  const { data: batch } = useBatch(batchResponse?.batch_id ?? undefined, mode === 'progress' || mode === 'done')
 
   useEffect(() => {
     if (!open) return
-    // 每次打开时，如果之前的任务已经结束，就回到表单
-    if (taskRef.current && isTerminal(taskRef.current.status)) {
-      setMode('form')
-      setTaskId(null)
-      setSubmitError(null)
-      setCancelRequested(false)
-    }
+    // 每次打开对话框时回到干净表单；不能依赖 task/batchResponse（否则批次刚提交就被重置回表单）
+    setMode('form')
+    setTaskId(null)
+    setBatchResponse(null)
+    setSubmitError(null)
+    setCancelRequested(false)
   }, [open])
 
   useEffect(() => {
@@ -82,6 +88,16 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
       setMode('done')
     }
   }, [task, mode, qc])
+
+  useEffect(() => {
+    if (!batch) return
+    if (mode === 'progress' && batch.status !== 'running') {
+      qc.invalidateQueries({ queryKey: ['snapshots'] })
+      qc.invalidateQueries({ queryKey: ['volumes'] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+      setMode('done')
+    }
+  }, [batch, mode, qc])
 
   const excludeGlobs = useMemo(() => {
     return excludeGlobsText
@@ -106,10 +122,20 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
         include_system: true,
         smartctl,
         on_disk_copy: onDiskCopy,
+        all_partitions: allPartitions,
+        resume,
+        cross_filesystems: crossFilesystems,
       })
-      setTaskId(res.task_id)
-      setCancelRequested(false)
-      setMode('progress')
+
+      if (isBatchCollectResponse(res)) {
+        setBatchResponse(res)
+        setCancelRequested(false)
+        setMode('progress')
+      } else {
+        setTaskId(res.task_id)
+        setCancelRequested(false)
+        setMode('progress')
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       setSubmitError(msg)
@@ -117,10 +143,11 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
   }
 
   const handleCancel = async () => {
-    if (!taskId || cancelRequested) return
+    if (cancelRequested) return
+    const ids = batchResponse?.task_ids ?? (taskId ? [taskId] : [])
+    if (!ids.length) return
     try {
-      await cancelTaskMutation.mutateAsync(taskId)
-      // 取消请求已受理：本地禁用按钮，避免再点触发重复 409（终态前轮询有延迟）
+      await Promise.all(ids.map((id) => cancelTaskMutation.mutateAsync(id)))
       setCancelRequested(true)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -128,8 +155,7 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
     }
   }
 
-  const handleViewSnapshot = () => {
-    const snapshotId = task?.result?.snapshot_id
+  const handleViewSnapshot = (snapshotId: string) => {
     if (!snapshotId) return
     onClose()
     navigate(`/snapshots?snapshot=${encodeURIComponent(snapshotId)}`)
@@ -138,7 +164,8 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
   const canStart =
     !createCollectMutation.isPending && path.trim().length > 0
 
-  const isActive = task && (task.status === 'pending' || task.status === 'running')
+  const singleTask = taskId ? task : null
+  const isSingleActive = singleTask && (singleTask.status === 'pending' || singleTask.status === 'running')
 
   return (
     <Modal
@@ -150,7 +177,7 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
       }
       open={open}
       onCancel={onClose}
-      width={640}
+      width={720}
       footer={null}
     >
       <Space orientation="vertical" style={{ width: '100%' }} size="middle">
@@ -160,9 +187,9 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
 
         {mode === 'form' && (
           <Form layout="vertical">
-            <Form.Item label="采集路径" required>
+            <Form.Item label={allPartitions ? '盘 / 挂载点路径' : '采集路径'} required>
               <Input
-                placeholder="例如 /tmp/opencode/collect-demo"
+                placeholder={allPartitions ? '例如 /tmp/opencode/collect-demo' : '例如 /tmp/opencode/collect-demo'}
                 value={path}
                 onChange={(e) => setPath(e.target.value)}
                 onPressEnter={startCollect}
@@ -181,13 +208,15 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
               />
             </Form.Item>
 
-            <Form.Item label="卷 ID（可选）">
-              <Input
-                placeholder="默认由程序自动生成"
-                value={volumeId}
-                onChange={(e) => setVolumeId(e.target.value)}
-              />
-            </Form.Item>
+            {!allPartitions && (
+              <Form.Item label="卷 ID（可选）">
+                <Input
+                  placeholder="默认由程序自动生成"
+                  value={volumeId}
+                  onChange={(e) => setVolumeId(e.target.value)}
+                />
+              </Form.Item>
+            )}
 
             <Form.Item label="排除规则（每行一条 glob）">
               <TextArea
@@ -212,6 +241,46 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
               </Space>
             </Form.Item>
 
+            <Form.Item>
+              <Space orientation="vertical" size={0}>
+                <Checkbox checked={allPartitions} onChange={(e) => setAllPartitions(e.target.checked)}>
+                  <Space>
+                    <PartitionOutlined />
+                    <span>采集整盘所有分区</span>
+                  </Space>
+                </Checkbox>
+                <Text type="secondary" style={{ fontSize: 12, marginLeft: 24 }}>
+                  勾选后，上方路径视为盘或挂载点，程序会枚举该盘所有卷并建立批次
+                </Text>
+              </Space>
+            </Form.Item>
+
+            <Form.Item>
+              <Space orientation="vertical" size={0}>
+                <Checkbox checked={resume} onChange={(e) => setResume(e.target.checked)}>
+                  <Space>
+                    <ReloadOutlined />
+                    <span>续采上次中断</span>
+                  </Space>
+                </Checkbox>
+                <Text type="secondary" style={{ fontSize: 12, marginLeft: 24 }}>
+                  优先续采该卷最新未封库（含 journal）的目录；单卷模式生效
+                </Text>
+              </Space>
+            </Form.Item>
+
+            <Collapse ghost items={[
+              {
+                key: 'advanced',
+                label: '高级选项',
+                children: (
+                  <Checkbox checked={crossFilesystems} onChange={(e) => setCrossFilesystems(e.target.checked)}>
+                    跨文件系统扫描（默认只采集同一文件系统）
+                  </Checkbox>
+                ),
+              },
+            ]} />
+
             <Button
               type="primary"
               icon={<PlayCircleOutlined />}
@@ -219,43 +288,56 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
               disabled={!canStart}
               onClick={startCollect}
               block
+              style={{ marginTop: 12 }}
             >
-              开始采集
+              {allPartitions ? '开始批次采集' : '开始采集'}
             </Button>
           </Form>
         )}
 
-        {(mode === 'progress' || mode === 'done') && task && (
+        {(mode === 'progress' || mode === 'done') && batchResponse && (
+          <BatchPanel
+            batchResponse={batchResponse}
+            batch={batch}
+            mode={mode}
+            cancelRequested={cancelRequested}
+            onCancel={handleCancel}
+            onViewSnapshot={handleViewSnapshot}
+            onClose={onClose}
+          />
+        )}
+
+        {(mode === 'progress' || mode === 'done') && !batchResponse && singleTask && (
           <>
             <Space style={{ justifyContent: 'space-between', width: '100%' }}>
-              <Text strong>{task.payload.path as string}</Text>
-              <StatusTag status={task.status} />
+              <Text strong>{singleTask.payload.path as string}</Text>
+              <StatusTag status={singleTask.status} />
             </Space>
 
-            <ProgressSection task={task} />
+            <ProgressSection task={singleTask} />
 
-            {task.status === 'done' && (
+            {singleTask.status === 'done' && (
               <Alert
                 type="success"
                 showIcon
                 title="采集完成"
-                description={<DoneDescription task={task} />}
+                description={<DoneDescription task={singleTask} />}
               />
             )}
-            {task.status === 'cancelled' && (
-              <Alert type="warning" showIcon title="已取消" description={task.message ?? '采集任务已被取消'} />
+            {singleTask.status === 'cancelled' && (
+              <Alert type="warning" showIcon title="已取消" description={singleTask.message ?? '采集任务已被取消'} />
             )}
-            {task.status === 'error' && (
-              <Alert type="error" showIcon title="采集失败" description={task.error ?? '未知错误'} />
+            {singleTask.status === 'error' && (
+              <Alert type="error" showIcon title="采集失败" description={singleTask.error ?? '未知错误'} />
             )}
 
             <Space wrap>
-              {task.status === 'done' && task.result?.snapshot_id && (
-                <Button type="primary" onClick={handleViewSnapshot}>
+              {singleTask.status === 'done' && singleTask.result?.snapshot_id && (
+                <Button type="primary" onClick={() => handleViewSnapshot(singleTask.result!.snapshot_id!)}>
                   查看快照
                 </Button>
               )}
-              {isActive && (
+              {isSingleActive && (
                 <Button
                   danger
                   icon={<StopOutlined />}
@@ -266,13 +348,161 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
                   取消采集
                 </Button>
               )}
-              <Button onClick={onClose}>{isActive ? '后台运行' : '关闭'}</Button>
+              <Button onClick={onClose}>{isSingleActive ? '后台运行' : '关闭'}</Button>
             </Space>
           </>
         )}
       </Space>
     </Modal>
   )
+}
+
+interface BatchPanelProps {
+  batchResponse: BatchCollectCreateResponse
+  batch: Batch | undefined
+  mode: Mode
+  cancelRequested: boolean
+  onCancel: () => void
+  onViewSnapshot: (snapshotId: string) => void
+  onClose: () => void
+}
+
+function BatchPanel({ batchResponse, batch, mode, cancelRequested, onCancel, onViewSnapshot, onClose }: BatchPanelProps) {
+  const { batch_id, planned_volumes, task_ids, warnings } = batchResponse
+  const batchStatus = batch?.status ?? 'running'
+  const summary = batch?.summary ?? {}
+  const doneCount = (summary.done ?? 0) + (summary.error ?? 0) + (summary.cancelled ?? 0)
+  const errorCount = summary.error ?? 0
+  const isActive = mode === 'progress' && batchStatus === 'running'
+
+  return (
+    <Space orientation="vertical" style={{ width: '100%' }} size="middle">
+      <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+        <Text strong>
+          <PartitionOutlined /> 批次 {batch_id.slice(0, 16)}…
+        </Text>
+        <BatchStatusTag status={batchStatus} />
+      </Space>
+
+      <Space size="large">
+        <Text type="secondary">计划卷：{planned_volumes.length} 个</Text>
+        <Text type="secondary">已完成：{doneCount}/{task_ids.length}</Text>
+        {errorCount > 0 && <Text type="danger">失败 {errorCount} 个</Text>}
+      </Space>
+
+      {warnings.length > 0 && (
+        <Alert type="warning" showIcon title="批次警告" description={warnings.join('；')} />
+      )}
+
+      <Collapse
+        defaultActiveKey={['volumes']}
+        items={[
+          {
+            key: 'volumes',
+            label: '计划卷',
+            children: (
+              <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+                {planned_volumes.map((vol, idx) => (
+                  <div key={idx} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <Text>{vol.path}</Text>
+                    <Text type="secondary">{vol.filesystem ?? '-'} · {vol.label || '无标签'}</Text>
+                  </div>
+                ))}
+              </Space>
+            ),
+          },
+        ]}
+      />
+
+      <Divider style={{ margin: '8px 0' }} />
+
+      <Text strong>子任务进度</Text>
+      <Space orientation="vertical" style={{ width: '100%' }} size="small">
+        {task_ids.map((id, idx) => (
+          <BatchChildTaskRow
+            key={id}
+            index={idx}
+            taskId={id}
+            plannedVolume={planned_volumes[idx]}
+            onViewSnapshot={onViewSnapshot}
+          />
+        ))}
+      </Space>
+
+      <Space wrap>
+        {mode === 'done' && (
+          <Alert
+            type={errorCount > 0 ? 'warning' : 'success'}
+            showIcon
+            title={errorCount > 0 ? `批次完成：${doneCount - errorCount} 成功，${errorCount} 失败` : '批次全部完成'}
+            style={{ width: '100%' }}
+          />
+        )}
+        {isActive && (
+          <Button
+            danger
+            icon={<StopOutlined />}
+            disabled={cancelRequested}
+            onClick={onCancel}
+          >
+            取消批次
+          </Button>
+        )}
+        <Button onClick={onClose}>{isActive ? '后台运行' : '关闭'}</Button>
+      </Space>
+    </Space>
+  )
+}
+
+interface BatchChildTaskRowProps {
+  index: number
+  taskId: string
+  plannedVolume: { path: string; filesystem?: string; label?: string | null }
+  onViewSnapshot: (snapshotId: string) => void
+}
+
+function BatchChildTaskRow({ index, taskId, plannedVolume, onViewSnapshot }: BatchChildTaskRowProps) {
+  const { task } = useTaskEvents(taskId, true)
+  if (!task) {
+    return (
+      <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: 12 }}>
+        <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+          <Text strong>卷 {index + 1}: {plannedVolume.path}</Text>
+          <Tag>待处理</Tag>
+        </Space>
+        <Progress percent={0} status="active" showInfo={false} />
+      </div>
+    )
+  }
+
+  return (
+    <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: 12 }}>
+      <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+        <Text strong>卷 {index + 1}: {plannedVolume.path}</Text>
+        <StatusTag status={task.status} />
+      </Space>
+      <div style={{ marginTop: 8 }}>
+        <ProgressSection task={task} />
+      </div>
+      {task.status === 'done' && task.result?.snapshot_id && (
+        <div style={{ marginTop: 8 }}>
+          <Button type="link" style={{ padding: 0 }} onClick={() => onViewSnapshot(task.result!.snapshot_id!)}>
+            查看快照
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function BatchStatusTag({ status }: { status: 'running' | 'partial' | 'done' }) {
+  if (status === 'done') {
+    return <Tag color="success" icon={<CheckCircleOutlined />}>完成</Tag>
+  }
+  if (status === 'partial') {
+    return <Tag color="warning" icon={<CloseCircleOutlined />}>部分完成</Tag>
+  }
+  return <Tag color="processing">运行中</Tag>
 }
 
 function StatusTag({ status }: { status: Task['status'] }) {
@@ -338,7 +568,7 @@ function ProgressSection({ task }: { task: Task }) {
       <Progress percent={Math.round(task.progress * 100)} status="active" />
       <Text type="secondary">{message}</Text>
     </Space>
-    )
+  )
 }
 
 function DoneDescription({ task }: { task: Task }) {

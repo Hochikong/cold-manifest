@@ -37,13 +37,15 @@ def list_tasks(
     limit: int = Query(default=_LIMIT_DEFAULT, ge=1, le=_LIMIT_MAX),
     cursor: "str | None" = Query(default=None),
     status: "Literal['pending','running','done','error','cancelled'] | None" = Query(default=None),
+    batch_id: "str | None" = Query(default=None),
 ) -> dict:
     runner: TaskRunner = request.app.state.task_runner
     c_at = c_id = None
     if cursor:
         c_at, c_id = _decode_task_cursor(cursor)
     items, next_cursor, has_more = runner.list_tasks(
-        limit, cursor_created_at=c_at, cursor_id=c_id, status=status)
+        limit, cursor_created_at=c_at, cursor_id=c_id, status=status,
+        related_id=batch_id)
     return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
 
 

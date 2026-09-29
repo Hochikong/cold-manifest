@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Card, Table, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal } from 'antd'
-import { ReloadOutlined, StopOutlined } from '@ant-design/icons'
-import { useTasks, useCancelTask } from '../api/hooks'
-import { listTasks, type Task } from '../api/client'
+import { Card, Table, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal, Drawer } from 'antd'
+import { ReloadOutlined, StopOutlined, ApartmentOutlined } from '@ant-design/icons'
+import { useTasks, useCancelTask, useBatch } from '../api/hooks'
+import { listTasks, type Task, type Batch } from '../api/client'
 import ErrorAlert from '../components/ErrorAlert'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatDateTime } from '../utils/format'
@@ -25,11 +25,18 @@ const typeMap: Record<Task['type'], string> = {
   collect: '采集',
 }
 
+const batchStatusMap: Record<Batch['status'], { label: string; color: string }> = {
+  running: { label: '运行中', color: 'processing' },
+  done: { label: '完成', color: 'success' },
+  partial: { label: '部分完成', color: 'warning' },
+}
+
 export default function TasksPage() {
   const navigate = useNavigate()
   const [items, setItems] = useState<Task[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null)
 
   const { data, isLoading, error } = useTasks({ limit: PAGE_SIZE }, true)
   const cancelTaskMutation = useCancelTask()
@@ -38,11 +45,9 @@ export default function TasksPage() {
   useEffect(() => {
     if (data) {
       if (!hasPagedRef.current) {
-        // 未翻页：直接用首页刷新数据
         setItems(data.items)
         setCursor(data.next_cursor)
       } else {
-        // 已翻页：按 id 合并首页新数据，保留已加载的尾部（翻页结果不在这里）
         setItems((prev) => {
           const seen = new Set(data.items.map((t) => t.id))
           const tail = prev.filter((t) => !seen.has(t.id))
@@ -96,6 +101,26 @@ export default function TasksPage() {
       dataIndex: 'status',
       width: 100,
       render: (v: Task['status']) => <Tag color={statusMap[v].color}>{statusMap[v].label}</Tag>,
+    },
+    {
+      title: '批次',
+      key: 'batch',
+      width: 140,
+      render: (_: unknown, record: Task) => {
+        const batchId = record.related_id
+        if (!batchId) return '-'
+        return (
+          <Button
+            type="link"
+            size="small"
+            icon={<ApartmentOutlined />}
+            style={{ padding: 0 }}
+            onClick={() => setSelectedBatchId(batchId)}
+          >
+            {batchId.slice(0, 12)}…
+          </Button>
+        )
+      },
     },
     {
       title: '进度',
@@ -195,7 +220,91 @@ export default function TasksPage() {
       ) : (
         <Empty description="暂无任务" />
       )}
+
+      <BatchDrawer batchId={selectedBatchId} onClose={() => setSelectedBatchId(null)} />
     </Card>
+  )
+}
+
+function BatchDrawer({ batchId, onClose }: { batchId: string | null; onClose: () => void }) {
+  const { data: batch, isLoading } = useBatch(batchId ?? undefined, true)
+  const { data: tasks } = useTasks({ batch_id: batchId ?? undefined, limit: 500 }, true)
+
+  return (
+    <Drawer
+      title="批次详情"
+      size={560}
+      open={!!batchId}
+      onClose={onClose}
+    >
+      {isLoading && !batch ? (
+        <Spin style={{ display: 'block', margin: '32px auto' }} />
+      ) : batch ? (
+        <Space orientation="vertical" style={{ width: '100%' }} size="large">
+          <div>
+            <Text type="secondary">批次 ID</Text>
+            <div><Text copyable>{batch.batch_id}</Text></div>
+          </div>
+
+          <div>
+            <Text type="secondary">状态</Text>
+            <div>
+              <Tag color={batchStatusMap[batch.status].color}>
+                {batchStatusMap[batch.status].label}
+              </Tag>
+            </div>
+          </div>
+
+          <div>
+            <Text type="secondary">根路径</Text>
+            <div><Text>{batch.root}</Text></div>
+          </div>
+
+          <div>
+            <Text type="secondary">汇总</Text>
+            <div>
+              <Space>
+                <Text>完成 {batch.summary?.done ?? 0}</Text>
+                <Text type="danger">失败 {batch.summary?.error ?? 0}</Text>
+                <Text type="warning">取消 {batch.summary?.cancelled ?? 0}</Text>
+                <Text type="success">运行中 {batch.summary?.running ?? 0}</Text>
+              </Space>
+            </div>
+          </div>
+
+          <div>
+            <Text type="secondary">计划卷</Text>
+            <div>
+              {batch.planned_volumes.map((vol, idx) => (
+                <div key={idx}>
+                  {vol.path} {vol.filesystem ? `(${vol.filesystem})` : ''}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <Text type="secondary">子任务</Text>
+            <Space orientation="vertical" style={{ width: '100%' }} size="small">
+              {tasks?.items.map((t) => (
+                <div key={t.id} style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: 12 }}>
+                  <Space style={{ justifyContent: 'space-between', width: '100%' }}>
+                    <Text strong>{t.id.slice(0, 16)}…</Text>
+                    <Tag color={statusMap[t.status].color}>{statusMap[t.status].label}</Tag>
+                  </Space>
+                  <div style={{ marginTop: 8 }}>
+                    <ProgressCell task={t} />
+                  </div>
+                </div>
+              ))}
+              {!tasks?.items.length && <Text type="secondary">暂无子任务</Text>}
+            </Space>
+          </div>
+        </Space>
+      ) : (
+        <Empty description="未找到批次" />
+      )}
+    </Drawer>
   )
 }
 

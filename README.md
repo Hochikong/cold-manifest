@@ -22,6 +22,8 @@ cd frontend && npm run dev
 .venv-wsl/bin/python -m pytest -q
 ```
 
+> 同一 data_root 同时只允许一个写者（采集/清扫），并发会提示"data_root 被占用"；中断的大卷采集可用 `cldm collect --resume` 断点续采（详见 docs/Windows-运行说明.md）。
+
 
 ## 查询 API（只读，P0 阶段二）
 

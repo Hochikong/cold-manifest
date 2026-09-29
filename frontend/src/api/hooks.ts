@@ -21,6 +21,7 @@ import {
   cancelTask,
   listTasks,
   getTask,
+  getBatch,
   getSettings,
   type ListEntriesParams,
   type SearchParams,
@@ -31,6 +32,7 @@ import {
   type ListTasksParams,
   type Task,
   type TaskStatus,
+  type Batch,
 } from './client'
 
 export function useHealth() {
@@ -209,6 +211,20 @@ export function useTask(id: string | undefined, autoRefresh = false) {
       if (!autoRefresh || !id) return false
       const task = query.state.data as Task | undefined
       return task && (task.status === 'pending' || task.status === 'running' || task.status === 'cancelling') ? 1_000 : false
+    },
+  })
+}
+
+export function useBatch(id: string | undefined, autoRefresh = false) {
+  return useQuery({
+    queryKey: ['batch', id],
+    queryFn: () => getBatch(id!),
+    enabled: !!id,
+    staleTime: 1_000,
+    refetchInterval: (query) => {
+      if (!autoRefresh || !id) return false
+      const batch = query.state.data as Batch | undefined
+      return batch && (batch.status === 'running') ? 2_000 : false
     },
   })
 }

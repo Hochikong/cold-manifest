@@ -26,6 +26,7 @@ from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume,
                       register_snapshot, snapshot_path, validate_volume_id)
 from .probe import DiskInfo, ProbeError, VolumeInfo, probe_path
 from .scanner import ScanCancelled, scan_tree
+from .scan_journal import ScanJournal, journal_path, read_completed
 from .schema import SNAPSHOT_TABLES_DDL
 from .seal import is_collect_orphan, is_sealed, seal_snapshot
 
@@ -62,14 +63,16 @@ class CollectResult:
     host_sha256: str
     on_disk_path: Path | None
     on_disk_sha256: str | None
+    resumed: bool = False
     warnings: list[str] = field(default_factory=list)
 
 
 class _SQLiteEntryWriter:
     """scan_tree → entries/skipped 的批量写入适配器（万行批事务）。"""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, resume: bool = False) -> None:
         self._conn = conn
+        self._resume = resume
         self._buf: list[tuple] = []
         self._skipped_buf: list[tuple] = []
 
@@ -77,14 +80,27 @@ class _SQLiteEntryWriter:
                   size_bytes: int | None, allocated_bytes: int | None, mtime_ns: int | None,
                   ctime_ns: int | None, btime_ns: int | None, attrs: int | None, ext: str,
                   error: str | None = None) -> int:
-        eid = self._conn.execute(
-            "INSERT INTO entries(parent_id,path,name,depth,type,size_bytes,allocated_bytes,"
-            "mtime_ns,ctime_ns,btime_ns,attrs,ext,path_norm,error)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (parent_id, path, name, depth, type, size_bytes, allocated_bytes,
-             mtime_ns, ctime_ns, btime_ns, attrs, ext, path.casefold(), error),
-        ).lastrowid
-        assert eid is not None
+        vals = (parent_id, path, name, depth, type, size_bytes, allocated_bytes,
+                mtime_ns, ctime_ns, btime_ns, attrs, ext, path.casefold(), error)
+        if self._resume:
+            # 断点续采重扫：安全重扫已部分入库的目录。取舍：用 INSERT OR IGNORE
+            # （而非"按子树先清理再重插"——重扫库未封库、path 索引在续采开始时
+            # 一次性补建，清理式 DELETE 需逐目录全表扫 path 前缀，代价更高且
+            # 会丢已入库行的稳定 entry_id）；被忽略的既有行按 path 查回
+            # entry_id，父目录引用因此正确回填。
+            self._conn.execute(
+                "INSERT OR IGNORE INTO entries(parent_id,path,name,depth,type,size_bytes,"
+                "allocated_bytes,mtime_ns,ctime_ns,btime_ns,attrs,ext,path_norm,error)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
+            row = self._conn.execute(
+                "SELECT entry_id FROM entries WHERE path=?", (path,)).fetchone()
+            eid = row[0]
+        else:
+            eid = self._conn.execute(
+                "INSERT INTO entries(parent_id,path,name,depth,type,size_bytes,allocated_bytes,"
+                "mtime_ns,ctime_ns,btime_ns,attrs,ext,path_norm,error)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals).lastrowid
+            assert eid is not None
         self._buf.append(eid)
         if len(self._buf) >= _BATCH_SIZE:
             self._conn.commit()
@@ -142,7 +158,7 @@ def _copy_with_hash(src: Path, dst: Path, cancel_event: "threading.Event | None"
 def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
                 vol: VolumeInfo, disk: DiskInfo, ts: str,
                 exclude_globs: list[str] | None, exclude_hidden: bool,
-                include_system: bool) -> None:
+                include_system: bool, cross_filesystems: bool = False) -> None:
     """§4.1 盘/卷/采集口径全量 meta；拿不到的字段写 NULL。"""
 
     def s(v) -> str | None:
@@ -176,6 +192,8 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
             "exclude_hidden": exclude_hidden,
             "include_system": include_system,
         }, ensure_ascii=False),
+        # 扫描口径旗标独立成键（不含"排除"语义，避免塞进 exclude_rules_json）
+        "scan_flags_json": json.dumps({"cross_filesystems": cross_filesystems}),
         "hash_policy": "none",
         "collect_time_utc": datetime.strptime(ts, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%dT%H:%M:%SZ"),
         "collector_version": __version__,
@@ -191,12 +209,38 @@ def _is_sealed(db_path: Path) -> bool:
     return is_sealed(db_path)
 
 
+def _find_resume_candidate(vol_root: Path) -> "Path | None":
+    """断点续采候选：该 volume 下**最新**的未封库且带 scan_journal 的 ts 目录。
+
+    带侧车 journal 的未封库目录视为可续采（清扫也按此口径保留，见
+    seal.is_collect_orphan）；封库后的目录不可续采。
+    """
+    if not vol_root.is_dir():
+        return None
+    best: "Path | None" = None
+    try:
+        children = sorted(vol_root.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return None
+    for child in children:
+        if not child.is_dir():
+            continue
+        if not journal_path(child).is_file():
+            continue
+        db = child / "snapshot.db"
+        if not db.is_file() or _is_sealed(db):
+            continue
+        best = child  # ts 目录名可排序，取最新
+    return best
+
+
 def _sweep_leftovers(data_root: Path, volume_id: str, keep_ts: str,
                      warnings: list[str]) -> None:
     """清扫同 volume_id 下未 sealed 的残留目录（上次采集崩溃留下的脏库）。
 
-    孤儿判定与任务层共用 seal.is_collect_orphan（含 collector_version 守卫，
-    外部/测试库不动）。
+    孤儿判定与任务层共用 seal.is_collect_orphan（含 collector_version 守卫与
+    断点续采口径：带 scan_journal 的未封库目录可续采，保留不删；
+    外部/测试库不动）。keep_ts（本次目标）始终跳过。
     """
     vol_root = data_root / volume_id
     if not vol_root.is_dir():
@@ -274,7 +318,8 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
                       exclude_globs: list[str] | None, exclude_hidden: bool,
                       on_disk_copy: bool,
                       on_disk_path: Path | None, on_disk_sha256: str | None,
-                      collected_at: str, warnings: list[str]) -> str:
+                      collected_at: str, warnings: list[str],
+                      cross_filesystems: bool = False) -> str:
     """catalog 注册：disk/volume/batch/snapshot + on_disk_copies。返回 batch_id。"""
     serial = (disk.disk_serial or "").strip()
     disk_id = serial or f"NOSERIAL_{volume_id}"
@@ -303,6 +348,7 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
                           exclude_rules_json=json.dumps({
                               "exclude_globs": list(exclude_globs or []),
                               "exclude_hidden": exclude_hidden,
+                              "cross_filesystems": cross_filesystems,
                           }, ensure_ascii=False),
                           file_count=stats["file_count"], dir_count=stats["dir_count"],
                           total_bytes=stats["total_bytes"], total_alloc=stats["total_alloc"],
@@ -332,7 +378,8 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
                    volume_id: str | None = None, manual_serial: str | None = None,
                    exclude_globs: list[str] | None = None, exclude_hidden: bool = False,
                    include_system: bool = True, smartctl: bool = True,
-                   on_disk_copy: bool = True,
+                   on_disk_copy: bool = True, resume: bool = False,
+                   cross_filesystems: bool = False,
                    cancel_event: "threading.Event | None" = None,
                    progress_cb: ProgressCB | None = None) -> CollectResult:
     """采集一个卷：probe → scan → seal → 盘上副本 → catalog 注册。
@@ -340,8 +387,19 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
     progress_cb(phase, done, total)，phase ∈ {"probe","scan","seal","copy","register","done"}；
     scan 阶段 total=None（流式，总数未知）；copy 按字节回调；seal 拆
     index/rollup(depth 多步)/optimize 细粒度步骤。取消检查在 scanner 目录
-    粒度与 copy 块循环；**取消=丢弃本次**：未封库的目标目录与盘上 .tmp 副本
-    会被删除，不做续采。
+    粒度与 copy 块循环。
+
+    断点续采（§4.3）：扫描开始前建 scan_journal 侧车并在 meta 写
+    resume_state='incomplete'；中断（崩溃/取消/失败）后未封库目录保留。
+    resume=True 时在 <data_root>/<volume_id>/ 下找最新可续采目录就地续采
+    （沿用其 ts/db/journal，跳过已完成子树、OR IGNORE 安全重扫未记录部分）；
+    找不到则照常新建。续采完成的库与一次完整扫描等效。封库成功后
+    resume_state 改写为 'complete'（保留键不删除：可区分"采集全程无中断"
+    之外的状态轨迹，便于诊断）。
+
+    cross_filesystems：默认 False（one_filesystem 剪枝）——扫描根以外的
+    文件系统（挂载点如 /proc、/sys、网络盘）整棵跳过并记 skipped。
+    True 时跨入子挂载点（口径记入 meta scan_flags_json）。
     """
     t0 = time.monotonic()
     warnings: list[str] = []
@@ -377,28 +435,49 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         # 含 LegacyImportError：CLI 层只认 CollectError（退出码 2，不裸 traceback）
         raise CollectError(str(e)) from e
 
+    # 断点续采：先找候选（沿用其 ts/db/journal），找不到回落正常新建
+    _check_cancel()  # 中断落在目标目录创建之前 → 不留任何现场
+    resumed = False
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if resume:
+        cand = _find_resume_candidate(Path(data_root) / volume_id)
+        if cand is not None:
+            dest_dir = cand
+            db_path = cand / "snapshot.db"
+            ts = cand.name
+            resumed = True
     sid = f"{volume_id}/{ts}"
-    dest_dir = snapshot_path(data_root, sid).parent
-    db_path = dest_dir / "snapshot.db"
+    if not resumed:
+        dest_dir = snapshot_path(data_root, sid).parent
+        db_path = dest_dir / "snapshot.db"
 
-    # 同 volume_id 下先清扫其他未 sealed 的残留目录，再处理本次目标
+    # 同 volume_id 下先清扫其他未 sealed 的残留目录（可续采的自动保留，
+    # keep_ts 罩住本次目标），再处理本次目标
     _sweep_leftovers(Path(data_root), volume_id, ts, warnings)
-    if db_path.exists():
+    if not resumed and db_path.exists():
         if _is_sealed(db_path):
             raise CollectError(
                 f"目标快照已存在且已封库：{sid}（同秒重跑或重复采集；如需重建请先删除 {dest_dir}）")
-        # 未封库 = 上次采集崩溃的脏残留，一律删除重建
+        # 未封库 = 上次采集崩溃的脏残留（无 journal，不可续采），一律删除重建
         shutil.rmtree(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
+    journal: "ScanJournal | None" = None
+    completed: "set[str] | None" = None
+
     def _cleanup_cancelled() -> None:
-        """取消=丢弃本次：删除未封库的目标目录与盘上副本临时目录（无续采）。"""
-        for p in (dest_dir, Path(scan_root) / "_coldmanifest" / volume_id / ts):
+        """中断（取消/失败）不丢弃：目标目录与 scan_journal 保留供续采；
+        只清理盘上副本临时目录。"""
+        if journal is not None:
             try:
-                shutil.rmtree(p)
-            except OSError as exc:
-                _log.warning("取消清理失败（残留 %s）：%s", p, exc)
+                journal.close()  # 落盘已记完成目录（先 commit DB，保证不变量）
+            except Exception:  # noqa: BLE001 — 中断清理不掩盖原异常
+                _log.warning("中断时 journal 落盘失败（%s）", journal._path)
+        try:
+            shutil.rmtree(Path(scan_root) / "_coldmanifest" / volume_id / ts)
+        except OSError as exc:
+            _log.warning("中断清理失败（残留 %s）：%s",
+                         Path(scan_root) / "_coldmanifest" / volume_id / ts, exc)
 
     try:
         _check_cancel()
@@ -406,13 +485,39 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         try:
             conn.execute("PRAGMA journal_mode=OFF")
             conn.execute("PRAGMA synchronous=OFF")
-            conn.executescript(SNAPSHOT_TABLES_DDL)
-            conn.execute("BEGIN")
+            if resumed:
+                # 续采：沿用首跑建的库。OR IGNORE 依赖 path 唯一索引——首跑
+                # 封库前没有索引，此处一次性补建（其后一直保留，seal 阶段幂等）
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_entries_path ON entries(path)")
+                conn.commit()
+                completed = read_completed(dest_dir) or set()
+                # 首跑已写全量 meta；resume_state 补写兜底（异常中断在写 meta 前）
+                conn.execute("INSERT OR REPLACE INTO meta(key, value)"
+                             " VALUES('resume_state', 'incomplete')")
+                conn.commit()
+                writer = _SQLiteEntryWriter(conn, resume=True)
+                journal = ScanJournal(dest_dir, on_flush=conn.commit)
+            else:
+                conn.executescript(SNAPSHOT_TABLES_DDL)
+                conn.execute("BEGIN")
 
-            _write_meta(conn, scan_root, volume_id, vol, disk, ts,
-                        exclude_globs, exclude_hidden, include_system)
-            writer = _SQLiteEntryWriter(conn)
+                _write_meta(conn, scan_root, volume_id, vol, disk, ts,
+                            exclude_globs, exclude_hidden, include_system,
+                            cross_filesystems=cross_filesystems)
+                # 断点续采标记：创建即 'incomplete'，封库成功后置 'complete'
+                conn.execute("INSERT OR REPLACE INTO meta(key, value)"
+                             " VALUES('resume_state', 'incomplete')")
+                writer = _SQLiteEntryWriter(conn)
+                journal = ScanJournal(dest_dir, on_flush=conn.commit)
             _check_cancel()
+
+            def _journal_record(rel: str) -> None:
+                # 目录子树完成：skipped 缓冲同批提交，再记 journal（顺序不可换）
+                writer._flush_skipped()
+                assert journal is not None
+                journal.record(rel)
+
             scan_stats = scan_tree(
                 scan_root, writer,
                 exclude_globs=exclude_globs, exclude_hidden=exclude_hidden,
@@ -420,7 +525,13 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
                 cancel_event=cancel_event,
                 progress_cb=(lambda done, _bytes: progress_cb("scan", done, None))
                 if progress_cb is not None else None,
+                journal_cb=_journal_record,
+                skip_subtrees=completed,
+                one_filesystem=not cross_filesystems,
             )
+            if journal is not None:
+                journal.close()
+                journal = None
             writer._flush_skipped()
             skipped_count = conn.execute("SELECT COUNT(*) FROM skipped").fetchone()[0]
 
@@ -433,8 +544,11 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
                               if progress_cb is not None else None)
             except sqlite3.Error as e:
                 raise CollectError(f"封库失败：{e}") from e
-            # status=sealed 在封库成功后写入：seal 中途失败不应留下 sealed 标记
+            # status=sealed 在封库成功后写入：seal 中途失败不应留下 sealed 标记；
+            # resume_state 同批置 complete（保留键：状态轨迹可诊断）
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('status', 'sealed')")
+            conn.execute("INSERT OR REPLACE INTO meta(key, value)"
+                         " VALUES('resume_state', 'complete')")
             conn.commit()
             if progress_cb is not None:
                 progress_cb("seal", 1, 1)
@@ -480,7 +594,8 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         collected_at = datetime.strptime(ts, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%dT%H:%M:%SZ")
         _register_catalog(data_root, sid, volume_id, vol, disk, stats,
                           exclude_globs, exclude_hidden, on_disk_copy,
-                          on_disk_path, on_disk_sha, collected_at, warnings)
+                          on_disk_path, on_disk_sha, collected_at, warnings,
+                          cross_filesystems=cross_filesystems)
         if progress_cb is not None:
             progress_cb("register", 1, 1)
             progress_cb("done", 1, 1)
@@ -491,9 +606,11 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         _cleanup_cancelled()
         raise CollectCancelled("采集已取消（scan 阶段）") from None
     except CollectError:
+        _cleanup_cancelled()  # 失败同样保留现场供 --resume
         raise
     except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError) as e:
         # 统一兜底：扫描/封库/统计阶段的底层错误 → CollectError（CLI 退出码 2）
+        _cleanup_cancelled()
         raise CollectError(f"采集失败：{e}") from e
 
     return CollectResult(
@@ -503,5 +620,5 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         total_bytes=stats["total_bytes"], total_allocated=stats["total_alloc"],
         skipped=stats["skipped_count"], elapsed_s=time.monotonic() - t0,
         host_sha256=host_sha, on_disk_path=on_disk_path, on_disk_sha256=on_disk_sha,
-        warnings=warnings,
+        resumed=resumed, warnings=warnings,
     )

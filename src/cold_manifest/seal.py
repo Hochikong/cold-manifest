@@ -107,11 +107,14 @@ def is_collect_orphan(ts_dir: Path) -> bool:
     tasks.TaskRunner 启动清扫与 collect._sweep_leftovers 共用同一判定口径：
     - snapshot.db 缺失 → 建库前崩溃残留，孤儿；
     - snapshot.db 存在 → 须带 collector_version meta（确认采集产生）且未 sealed；
-      打不开/缺 meta 的库保守起见不动（可能是外部/测试数据）。
+      打不开/缺 meta 的库保守起见不动（可能是外部/测试数据）；
+    - 带 scan_journal.jsonl 且未 sealed → **可续采（P1.2b 断点续采），保留**，
+      不再视为孤儿；续采完成（封库）或无 journal 的残留下仍照旧清理。
     """
     db = ts_dir / "snapshot.db"
     if not db.is_file():
         return True
+    resumable = (ts_dir / "scan_journal.jsonl").is_file()
     try:
         conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     except sqlite3.Error:
@@ -124,7 +127,10 @@ def is_collect_orphan(ts_dir: Path) -> bool:
         conn.close()
     if "collector_version" not in keys:
         return False
-    return not is_sealed(db)
+    sealed = is_sealed(db)
+    if resumable and not sealed:
+        return False  # 可续采：有 journal 的未封库目录，清扫保留
+    return not sealed
 
 
 def is_sealed(db_path) -> bool:

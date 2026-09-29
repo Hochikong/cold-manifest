@@ -104,9 +104,27 @@ class TaskRunner:
         遍历 <data_root>/<volume_id>/<ts>/：
         - snapshot.db 缺失（建库前崩溃的空目录）→ 删除；
         - snapshot.db 存在但未 sealed 且带 collector_version meta（确认是本工具
-          采集产生的脏库）→ 删除；无 collector_version 的库（外部/测试数据）不动。
+          采集产生的脏库）→ 删除；无 collector_version 的库（外部/测试数据）不动；
+          带 scan_journal 的未封库目录可续采，保留（P1.2b 断点续采口径）。
         下划线开头的顶层目录（_diffs 等内部目录）跳过。只记日志，不抛异常。
+        清扫是写操作：短暂持有 data_root 写锁，被其他写者占用时本轮跳过。
         """
+        if not self.data_root.is_dir():
+            return
+        from .lockfile import DataRootLock, LockBusy
+
+        lock = DataRootLock(self.data_root)
+        try:
+            lock.acquire()
+        except LockBusy as e:
+            _log.warning("孤儿清扫跳过（data_root 被占用）：%s", e)
+            return
+        try:
+            self._sweep_orphan_snapshots_locked()
+        finally:
+            lock.release()
+
+    def _sweep_orphan_snapshots_locked(self) -> None:
         if not self.data_root.is_dir():
             return
         try:
@@ -150,25 +168,28 @@ class TaskRunner:
 
     # ------------------------------------------------------------ 提交 / 查询
 
-    def submit(self, kind: str, payload: dict) -> str:
+    def submit(self, kind: str, payload: dict, related_id: "str | None" = None) -> str:
         """登记任务（catalog.tasks 插行）并入队，返回 task_id。
 
         fn 由 kind 经 _FN_REGISTRY 注册，工作线程按 kind 还原执行；
         返回值经 json 序列化写入 result_json。
+        related_id：关联 ID（collect batch → batch_id）。
         """
         task_id = new_task_id()
         now = _now()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO tasks(task_id, kind, payload_json, status, created_at)"
-                " VALUES(?,?,?,?,?)",
-                (task_id, kind, json.dumps(payload, ensure_ascii=False), "pending", now),
+                "INSERT INTO tasks(task_id, kind, payload_json, status, created_at, related_id)"
+                " VALUES(?,?,?,?,?,?)",
+                (task_id, kind, json.dumps(payload, ensure_ascii=False), "pending", now,
+                 related_id),
             )
             self._conn.commit()
         self._queue.put(task_id)
         return task_id
 
-    def submit_dedup(self, kind: str, payload: dict, field: str) -> "str | None":
+    def submit_dedup(self, kind: str, payload: dict, field: str,
+                     related_id: "str | None" = None) -> "str | None":
         """带去重的提交：锁内完成 check+insert（消除提交去重竞态）。
 
         同 kind+field 值已有 pending/running 任务 → 返回 None（不插行）；
@@ -180,9 +201,10 @@ class TaskRunner:
                 return None
             task_id = new_task_id()
             self._conn.execute(
-                "INSERT INTO tasks(task_id, kind, payload_json, status, created_at)"
-                " VALUES(?,?,?,?,?)",
-                (task_id, kind, json.dumps(payload, ensure_ascii=False), "pending", _now()),
+                "INSERT INTO tasks(task_id, kind, payload_json, status, created_at, related_id)"
+                " VALUES(?,?,?,?,?,?)",
+                (task_id, kind, json.dumps(payload, ensure_ascii=False), "pending", _now(),
+                 related_id),
             )
             self._conn.commit()
         self._queue.put(task_id)
@@ -210,13 +232,17 @@ class TaskRunner:
 
     def list_tasks(self, limit: int, cursor_created_at: "str | None" = None,
                    cursor_id: "str | None" = None,
-                   status: "str | None" = None) -> "tuple[list[dict], str | None, bool]":
-        """keyset 分页（created_at DESC + task_id DESC）。"""
+                   status: "str | None" = None,
+                   related_id: "str | None" = None) -> "tuple[list[dict], str | None, bool]":
+        """keyset 分页（created_at DESC + task_id DESC）。related_id 过滤批次子任务。"""
         where = ["1=1"]
         params: "list[Any]" = []
         if status:
             where.append("status = ?")
             params.append(status)
+        if related_id:
+            where.append("related_id = ?")
+            params.append(related_id)
         if cursor_created_at is not None and cursor_id:
             where.append("(created_at < ? OR (created_at = ? AND task_id < ?))")
             params += [cursor_created_at, cursor_created_at, cursor_id]
@@ -253,6 +279,96 @@ class TaskRunner:
             except (json.JSONDecodeError, TypeError):
                 continue
         return False
+
+    # ------------------------------------------------------------ 批次（P1.2a）
+
+    def create_batch_row(self, batch_id: str, disk_id: str, root: str,
+                         planned: "list[dict]") -> None:
+        """登记采集批次行（catalog.batches；status=running，终态由
+        refresh_batch_status 按子任务回写）。planned 为卷目标摘要列表。"""
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO batches(batch_id, disk_id, started_at, status,"
+                " planned_volumes_json) VALUES(?,?,?,?,?)",
+                (batch_id, disk_id, now, "running",
+                 json.dumps({"root": root, "planned": planned}, ensure_ascii=False)),
+            )
+            self._conn.commit()
+
+    def batch_child_statuses(self, batch_id: str) -> "list[str]":
+        """批次全部子任务状态（按 created_at, task_id 稳定序）。"""
+        rows = self._conn.execute(
+            "SELECT status FROM tasks WHERE related_id=? ORDER BY created_at, task_id",
+            (batch_id,),
+        ).fetchall()
+        return [r["status"] for r in rows]
+
+    def delete_batch_and_tasks(self, batch_id: str) -> bool:
+        """删除"刚创建、尚未执行"的批次及其 pending 子任务（提交原子性补救）。
+
+        仅限路由在提交中途失败时清理现场：任一子任务已非 pending
+        （已被工作线程认领）或批次行不存在 → 不删，返回 False。"""
+        with self._lock:
+            batch = self._conn.execute(
+                "SELECT 1 FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
+            if batch is None:
+                return False
+            rows = self._conn.execute(
+                "SELECT status FROM tasks WHERE related_id=?", (batch_id,)
+            ).fetchall()
+            if any(r["status"] != "pending" for r in rows):
+                return False
+            self._conn.execute("DELETE FROM tasks WHERE related_id=?", (batch_id,))
+            self._conn.execute("DELETE FROM batches WHERE batch_id=?", (batch_id,))
+            self._conn.commit()
+        return True
+
+    @staticmethod
+    def batch_status_from_children(statuses: "list[str]") -> str:
+        """批次终态规则（§4.2）：无子任务=planned；有未终态=running；
+        全 done=done；有 error/cancelled=partial。"""
+        if not statuses:
+            return "planned"
+        if any(s in ("pending", "running") for s in statuses):
+            return "running"
+        if all(s == "done" for s in statuses):
+            return "done"
+        return "partial"
+
+    def get_batch(self, batch_id: str) -> "dict | None":
+        """批次 + 子任务摘要；不存在返回 None。终态回写 batches.status。"""
+        row = self._conn.execute(
+            "SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            planned_doc = json.loads(row["planned_volumes_json"] or "{}")
+        except json.JSONDecodeError:
+            planned_doc = {}
+        tasks, _, _ = self.list_tasks(limit=500, related_id=batch_id)
+        statuses = self.batch_child_statuses(batch_id)
+        status = self.batch_status_from_children(statuses)
+        summary = {s: statuses.count(s) for s in
+                   ("pending", "running", "done", "error", "cancelled") if s in statuses}
+        if status in ("done", "partial") and row["status"] not in ("done", "partial"):
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE batches SET status=?, finished_at=? WHERE batch_id=?",
+                    (status, _now(), batch_id),
+                )
+                self._conn.commit()
+        return {
+            "batch_id": batch_id,
+            "disk_id": row["disk_id"],
+            "status": status,
+            "root": planned_doc.get("root", ""),
+            "planned_volumes": planned_doc.get("planned", []),
+            "summary": summary,
+            "tasks": tasks,
+            "created_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
 
     # ------------------------------------------------------------ 取消
 
@@ -300,12 +416,13 @@ class TaskRunner:
                 continue  # stop 后遗留的排队任务
             # CAS 认领：仅当仍为 pending 时置 running，消除与 cancel 的竞态
             # （cancel 先把 pending 置 cancelled → rowcount=0 → 跳过，任务不复活）
-            cur = conn.execute(
-                "UPDATE tasks SET status='running', started_at=?, message=''"
-                " WHERE task_id=? AND status='pending'",
-                (_now(), task_id),
-            )
-            conn.commit()
+            with self._lock:  # 与 API 线程写同一连接：写事务全程持锁
+                cur = conn.execute(
+                    "UPDATE tasks SET status='running', started_at=?, message=''"
+                    " WHERE task_id=? AND status='pending'",
+                    (_now(), task_id),
+                )
+                conn.commit()
             if cur.rowcount == 0:
                 continue  # 已被取消（或其他线程认领），不执行
 
@@ -317,11 +434,12 @@ class TaskRunner:
                     return
                 last_write[0] = now
                 progress = round(done / total, 4) if total and total > 0 else None
-                conn.execute(
-                    "UPDATE tasks SET progress=?, message=? WHERE task_id=?",
-                    (progress, f"{phase}:{done}/{total}", _tid),
-                )
-                conn.commit()
+                with self._lock:  # 写事务全程持锁（与 API 线程互斥）
+                    conn.execute(
+                        "UPDATE tasks SET progress=?, message=? WHERE task_id=?",
+                        (progress, f"{phase}:{done}/{total}", _tid),
+                    )
+                    conn.commit()
 
             last_write = [0.0]
             ev = threading.Event()
@@ -330,25 +448,28 @@ class TaskRunner:
                 result = _invoke(row, cb, ev)
                 # 成功恒 done：fn 正常返回即视为完成，不因 cancel_event 置位改判
                 # cancelled（cancelled 只走异常分支）
-                conn.execute(
-                    "UPDATE tasks SET status='done', progress=1.0, finished_at=?, result_json=?"
-                    " WHERE task_id=?",
-                    (_now(), json.dumps(result, ensure_ascii=False, default=str), task_id),
-                )
+                with self._lock:
+                    conn.execute(
+                        "UPDATE tasks SET status='done', progress=1.0, finished_at=?, result_json=?"
+                        " WHERE task_id=?",
+                        (_now(), json.dumps(result, ensure_ascii=False, default=str), task_id),
+                    )
+                    conn.commit()
             except Exception as e:  # noqa: BLE001 — 任务失败入 error 行，不杀线程
-                if ev.is_set():
-                    conn.execute(
-                        "UPDATE tasks SET status='cancelled', finished_at=?, error=? WHERE task_id=?",
-                        (_now(), f"cancelled: {type(e).__name__}: {e}", task_id),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status='error', finished_at=?, error=? WHERE task_id=?",
-                        (_now(), f"{type(e).__name__}: {e}", task_id),
-                    )
+                with self._lock:
+                    if ev.is_set():
+                        conn.execute(
+                            "UPDATE tasks SET status='cancelled', finished_at=?, error=? WHERE task_id=?",
+                            (_now(), f"cancelled: {type(e).__name__}: {e}", task_id),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE tasks SET status='error', finished_at=?, error=? WHERE task_id=?",
+                            (_now(), f"{type(e).__name__}: {e}", task_id),
+                        )
+                    conn.commit()
             finally:
                 self._cancel_events.pop(task_id, None)
-            conn.commit()
 
 
 def _invoke(row: sqlite3.Row, cb: ProgressCb, cancel_event: "threading.Event | None" = None) -> Any:
@@ -395,4 +516,5 @@ def _task_row_to_dict(row: sqlite3.Row) -> dict:
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
+        "related_id": row["related_id"],
     }

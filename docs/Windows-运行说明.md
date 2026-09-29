@@ -23,6 +23,9 @@ packaging\windows\cldm.cmd collect D:\photo-archive --data-root D:\cldm-data --n
 
 采集完成后，Web 页面（快照页）即可看到该卷。
 
+> 写互斥：同一 data_root 同时只允许一个写者（采集/清扫）。并发执行会提示"data_root 被占用"，等待对方完成后重试；进程崩溃锁自动释放。
+> 断点续采：大卷采集被中断（崩溃/取消/断电）后，用 `collect --resume` 续接该卷最新的未封库采集，已完成部分自动跳过，结果与一次完整扫描一致。
+
 ## 注意事项
 
 - **防火墙**：首次 `start.cmd` 会触发防火墙放行提示；拒绝的话局域网访问不通，可在「Windows 安全中心 → 防火墙 → 允许应用通过防火墙」里补放行 Python。

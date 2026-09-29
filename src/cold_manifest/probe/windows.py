@@ -10,7 +10,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from . import DiskInfo, ProbeError, VolumeInfo
+from . import DiskInfo, ProbeError, VolumeInfo, VolumeTarget
 
 # 单次调用产出一段 JSON：卷（Win32_LogicalDisk）+ 分区（Get-Partition）+ 盘
 # （Get-Disk 的 PartitionStyle/BusType + Win32_DiskDrive 的桥型号/接口）。
@@ -148,6 +148,109 @@ def parse_windows_json(text: str, drive_letter: str) -> tuple[VolumeInfo, DiskIn
         smart_status=smart_status,
     )
     return volume, info
+
+
+# 多分区枚举（§4.2）：单次调用列出该盘全部带盘符分区；无盘符分区记入 skipped。
+PS_ENUM_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$letter = '{letter}'
+$p0 = Get-Partition -DriveLetter $letter
+$dnum = $p0.DiskNumber
+$skipped = @()
+$vols = @()
+foreach ($p in (Get-Partition -DiskNumber $dnum | Sort-Object PartitionNumber)) {{
+  if (-not $p.DriveLetter) {{ $skipped += "partition#$($p.PartitionNumber)"; continue }}
+  $ld = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($p.DriveLetter):'"
+  if (-not $ld) {{ $skipped += "partition#$($p.PartitionNumber)"; continue }}
+  $vols += [pscustomobject]@{{
+    letter = $p.DriveLetter
+    index = $p.PartitionNumber
+    fs = $ld.FileSystem
+    label = $ld.VolumeName
+    size = $p.Size
+  }}
+}}
+$dsk = Get-Disk -Number $dnum
+[pscustomobject]@{{
+  diskNumber = $dnum
+  partitionStyle = $dsk.PartitionStyle
+  volumes = $vols
+  skipped = $skipped
+}} | ConvertTo-Json -Depth 4
+"""
+
+
+def build_powershell_enum_command(drive_letter: str) -> str:
+    """构造多分区枚举的 PowerShell 脚本文本（夹具单测断言用）。"""
+    letter = drive_letter.rstrip(":").upper()
+    if not (len(letter) == 1 and letter.isalpha()):
+        raise ProbeError(f"非法盘符：{drive_letter!r}")
+    return PS_ENUM_SCRIPT.format(letter=letter)
+
+
+def parse_windows_volumes_json(text: str) -> "tuple[list[VolumeTarget], list[str]]":
+    """解析枚举 JSON → (VolumeTarget 列表, warnings)。
+
+    ConvertTo-Json 单元素时输出对象而非数组，此处统一处理；
+    字段缺失归空值，不抛异常。
+    """
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProbeError(f"PowerShell 输出不是合法 JSON：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ProbeError("PowerShell 枚举输出结构不合法")
+
+    vols = data.get("volumes") or []
+    if isinstance(vols, dict):  # 单卷时 ConvertTo-Json 不产数组
+        vols = [vols]
+    targets: list[VolumeTarget] = []
+    for v in vols:
+        if not isinstance(v, dict):
+            continue
+        letter = str(v.get("letter") or "").strip().rstrip(":").upper()
+        if not letter:
+            continue
+        try:
+            size = int(v["size"]) if v.get("size") is not None else None
+        except (TypeError, ValueError):
+            size = None
+        try:
+            index = int(v["index"]) if v.get("index") is not None else None
+        except (TypeError, ValueError):
+            index = None
+        targets.append(
+            VolumeTarget(
+                path=f"{letter}:\\",
+                device_path=f"{letter}:",
+                partition_index=index,
+                filesystem=str(v.get("fs") or "").strip(),
+                label=str(v.get("label") or "").strip(),
+                capacity_bytes=size,
+                mount_point=f"{letter}:\\",
+            )
+        )
+    warnings = [
+        f"分区 {s} 无盘符或无法关联逻辑盘，跳过"
+        for s in (data.get("skipped") or [])
+        if isinstance(s, str)
+    ]
+    return targets, warnings
+
+
+def enumerate_disk_volumes_win(path: str) -> "tuple[list[VolumeTarget], list[str]]":
+    """枚举 path 所在物理盘的全部带盘符分区（Windows）。"""
+    p = Path(path)
+    if not p.exists():
+        raise ProbeError(f"路径不存在：{path}")
+    letter = str(p.resolve())[:2].rstrip(":")
+    if not (len(letter) == 1 and letter.isalpha()):
+        raise ProbeError(f"无法确定 {path} 的盘符（不支持 UNC/映射路径）")
+    text = run_powershell(build_powershell_enum_command(letter))
+    targets, warnings = parse_windows_volumes_json(text)
+    if not targets:
+        raise ProbeError(f"{path} 所在盘没有可采集的带盘符卷")
+    return targets, warnings
 
 
 def probe_path_win(

@@ -36,6 +36,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_collect.add_argument("--exclude-hidden", action="store_true", help="跳过隐藏文件/目录")
     p_collect.add_argument("--no-smartctl", action="store_true", help="不调用 smartctl")
     p_collect.add_argument("--no-on-disk-copy", action="store_true", help="不写盘上副本")
+    p_collect.add_argument("--resume", action="store_true",
+                           help="断点续采：续接该卷最新的未封库采集（scan_journal），找不到则新建")
+    p_collect.add_argument("--cross-filesystems", action="store_true",
+                           help="跨入子挂载点（默认剪枝其他文件系统，如 /proc、/sys、网络盘）")
+    p_collect.add_argument("--all-partitions", action="store_true",
+                           help="把 root 视为盘/挂载点，逐个采集该盘全部分区（串行，批次部分失败=partial）")
 
     p_import = sub.add_parser("import-legacy", help="导入 v1 旧版快照目录（metadata.csv）")
     p_import.add_argument("snapshot_dir", help="旧版快照目录路径")
@@ -126,9 +132,103 @@ def _cmd_export(args: argparse.Namespace) -> int:
         conn.close()
 
 
-def _cmd_collect(args: argparse.Namespace) -> int:
+def _print_collect_result(result) -> None:
+    print(f"  文件：{result.files:,}  目录：{result.dirs:,}  符号链接：{result.symlinks:,}"
+          f"  跳过：{result.skipped:,}")
+    print(f"  总字节：{result.total_bytes:,}（{result.total_bytes / 2**30:.2f} GiB）")
+    print(f"  耗时：{result.elapsed_s:.1f}s  吞吐："
+          f"{(result.files + result.dirs) / result.elapsed_s:,.0f} 条目/s")
+    print(f"  快照库：{result.db_path}")
+    print(f"  主机 sha256：{result.host_sha256}")
+    if result.on_disk_path is not None:
+        print(f"  盘上副本：{result.on_disk_path}（sha256 一致：{result.on_disk_sha256}）")
+    for w in result.warnings:
+        print(f"  警告：{w}")
+
+
+def _cmd_collect_all_partitions(args: argparse.Namespace) -> int:
+    """多分区批次采集（§4.2）：逐卷串行 collect_volume，打印每卷摘要与批次结果。"""
     from .collect import CollectError, collect_volume
+    from .lockfile import DataRootLock, LockBusy
+    from .probe import ProbeError, enumerate_disk_volumes
+
+    lock = DataRootLock(args.data_root)
+    try:
+        lock.acquire()
+    except LockBusy as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    try:
+        return _collect_all_partitions_locked(args)
+    finally:
+        lock.release()
+
+
+def _collect_all_partitions_locked(args: argparse.Namespace) -> int:
+    from .collect import CollectError, collect_volume
+    from .probe import ProbeError, enumerate_disk_volumes
+
+    try:
+        targets, warnings = enumerate_disk_volumes(args.root)
+    except ProbeError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    for w in warnings:
+        print(f"警告：{w}")
+    if not targets:
+        print("错误：该盘没有可采集的卷", file=sys.stderr)
+        return 2
+
+    print(f"批次共 {len(targets)} 个卷：")
+    for i, t in enumerate(targets, 1):
+        idx = t.partition_index if t.partition_index is not None else "?"
+        print(f"  [{i}] {t.path}（{t.device_path or t.mount_point}，"
+              f"分区 #{idx}，{t.filesystem or '?'}{'，' + t.label if t.label else ''}）")
+
+    statuses: list[tuple[str, str]] = []
+    for t in targets:
+        print(f"\n== 采集 {t.path} ==")
+        try:
+            result = collect_volume(
+                t.path, data_root=args.data_root, manual_serial=args.serial,
+                exclude_globs=args.exclude_globs, exclude_hidden=args.exclude_hidden,
+                smartctl=not args.no_smartctl, on_disk_copy=not args.no_on_disk_copy,
+                resume=args.resume,
+                cross_filesystems=args.cross_filesystems,
+                progress_cb=lambda phase, done, total: None,
+            )
+        except (CollectError, ProbeError) as e:
+            print(f"  失败：{e}", file=sys.stderr)
+            statuses.append((t.path, f"error: {e}"))
+            continue
+        print(f"采集完成：{result.snapshot_id}")
+        _print_collect_result(result)
+        statuses.append((t.path, "done"))
+
+    print("\n== 批次结果 ==")
+    done = sum(1 for _, s in statuses if s == "done")
+    failed = len(statuses) - done
+    overall = "done" if failed == 0 else "partial"
+    for path, s in statuses:
+        print(f"  {path}: {s}")
+    print(f"批次状态：{overall}（成功 {done}/{len(statuses)}）")
+    return 0 if failed == 0 else 1
+
+
+def _cmd_collect(args: argparse.Namespace) -> int:
+    if getattr(args, "all_partitions", False):
+        return _cmd_collect_all_partitions(args)
+
+    from .collect import CollectError, collect_volume
+    from .lockfile import DataRootLock, LockBusy
     from .probe import ProbeError
+
+    lock = DataRootLock(args.data_root)
+    try:
+        lock.acquire()
+    except LockBusy as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
 
     t0 = time.monotonic()
 
@@ -142,25 +242,18 @@ def _cmd_collect(args: argparse.Namespace) -> int:
             args.root, data_root=args.data_root, volume_id=args.volume_id,
             manual_serial=args.serial, exclude_globs=args.exclude_globs,
             exclude_hidden=args.exclude_hidden, smartctl=not args.no_smartctl,
-            on_disk_copy=not args.no_on_disk_copy,
+            on_disk_copy=not args.no_on_disk_copy, resume=args.resume,
+            cross_filesystems=args.cross_filesystems,
             progress_cb=cb,
         )
     except (CollectError, ProbeError) as e:
         print(f"\n错误：{e}", file=sys.stderr)
         return 2
+    finally:
+        lock.release()
     print()
-    print(f"采集完成：{result.snapshot_id}")
-    print(f"  文件：{result.files:,}  目录：{result.dirs:,}  符号链接：{result.symlinks:,}"
-          f"  跳过：{result.skipped:,}")
-    print(f"  总字节：{result.total_bytes:,}（{result.total_bytes / 2**30:.2f} GiB）")
-    print(f"  耗时：{result.elapsed_s:.1f}s  吞吐："
-          f"{(result.files + result.dirs) / result.elapsed_s:,.0f} 条目/s")
-    print(f"  快照库：{result.db_path}")
-    print(f"  主机 sha256：{result.host_sha256}")
-    if result.on_disk_path is not None:
-        print(f"  盘上副本：{result.on_disk_path}（sha256 一致：{result.on_disk_sha256}）")
-    for w in result.warnings:
-        print(f"  警告：{w}")
+    print(f"采集完成：{result.snapshot_id}" + ("（断点续采）" if result.resumed else ""))
+    _print_collect_result(result)
     return 0
 
 

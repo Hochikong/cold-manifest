@@ -390,15 +390,68 @@ export interface CollectCreateBody {
   include_system?: boolean
   smartctl?: boolean
   on_disk_copy?: boolean
+  all_partitions?: boolean
+  resume?: boolean
+  cross_filesystems?: boolean
 }
 
-export interface CollectCreateResponse {
+export interface SingleCollectCreateResponse {
   task_id: string
   status: string
 }
 
+export interface PlannedVolume {
+  path: string
+  device_path?: string | null
+  partition_index?: number | null
+  filesystem?: string
+  label?: string | null
+  capacity_bytes?: number
+}
+
+export interface BatchCollectCreateResponse {
+  batch_id: string
+  task_ids: string[]
+  planned_volumes: PlannedVolume[]
+  warnings: string[]
+}
+
+export type CollectCreateResponse = SingleCollectCreateResponse | BatchCollectCreateResponse
+
+export function isBatchCollectResponse(res: CollectCreateResponse): res is BatchCollectCreateResponse {
+  return 'batch_id' in res
+}
+
 export async function createCollect(body: CollectCreateBody): Promise<CollectCreateResponse> {
   const { data } = await client.post('/collect', body)
+  return data
+}
+
+export type BatchStatus = 'running' | 'done' | 'partial'
+
+export interface BatchSummary {
+  done?: number
+  error?: number
+  cancelled?: number
+  running?: number
+  pending?: number
+  cancelling?: number
+}
+
+export interface Batch {
+  batch_id: string
+  disk_id: string
+  root: string
+  status: BatchStatus
+  planned_volumes: PlannedVolume[]
+  summary: BatchSummary
+  tasks: Task[]
+  created_at: string
+  finished_at: string | null
+}
+
+export async function getBatch(batch_id: string): Promise<Batch> {
+  const { data } = await client.get(`/batches/${encodeURIComponent(batch_id)}`)
   return data
 }
 
@@ -434,6 +487,7 @@ export interface Task {
   payload: Record<string, unknown>
   result: { snapshot_id?: string; skipped_import?: boolean } & Partial<CollectResult> | null
   error: string | null
+  related_id: string | null
   created_at: string
   started_at: string | null
   finished_at: string | null
@@ -449,6 +503,7 @@ export interface ListTasksParams {
   limit?: number
   cursor?: string
   status?: string
+  batch_id?: string
 }
 
 export async function listTasks(params: ListTasksParams = {}): Promise<TasksResponse> {
