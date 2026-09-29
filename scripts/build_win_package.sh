@@ -21,10 +21,16 @@ UV="${UV:-$HOME/.local/bin/uv}"
 "$UV" pip compile pyproject.toml --python-platform windows --python-version 3.10 \
   --no-annotate --no-header -o "$OUT/reqs-win.txt"
 grep -vE "^cold-manifest" "$OUT/reqs-win.txt" > "$OUT/reqs-win-filtered.txt"
-/tmp/opencode/penv/bin/python -m pip download --no-deps --only-binary=:all: \
+# pip download 需要一个本地 venv 跑 pip；缺失时自动用 uv 创建（--seed 带 pip）
+PENV="${PENV:-/tmp/opencode/penv}"
+if [ ! -x "$PENV/bin/python" ]; then
+  echo "  (venv 缺失，自动创建：$PENV)"
+  "$UV" venv --seed "$PENV"
+fi
+"$PENV/bin/python" -m pip download --no-deps --only-binary=:all: \
   --platform win_amd64 --python-version 310 --implementation cp \
   --dest "$STAGE/wheels" -r "$OUT/reqs-win-filtered.txt"
-/tmp/opencode/penv/bin/python -m pip download --no-deps --only-binary=:all: \
+"$PENV/bin/python" -m pip download --no-deps --only-binary=:all: \
   --platform win_amd64 --python-version 310 --implementation cp \
   --dest "$STAGE/wheels" pip setuptools wheel
 

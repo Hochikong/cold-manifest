@@ -23,6 +23,22 @@ packaging\windows\cldm.cmd collect D:\photo-archive --data-root D:\cldm-data --n
 
 采集完成后，Web 页面（快照页）即可看到该卷。
 
+其他常用命令（在包根执行；`packaging\windows\cldm.cmd <子命令> --help` 可看全部子命令）：
+
+```bat
+:: 补算完整哈希（重复文件报告、内容级对比的前提）
+packaging\windows\cldm.cmd hash VOL_P0\20260101T000000Z --policy full
+
+:: 重复文件报告（默认只统计 ≥1MiB；--min-size 0 看全部；--html 另存 HTML）
+packaging\windows\cldm.cmd duplicates VOL_P0\20260101T000000Z --min-size 0 --html dup.html
+
+:: 校验盘上副本与源文件完整性（--sample N 抽检 N 个已哈希文件；--full 全量）
+packaging\windows\cldm.cmd verify-copy VOL_P0\20260101T000000Z --sample 200
+
+:: 导出 CSV（默认写到**当前目录**，用 --output 指定路径）
+packaging\windows\cldm.cmd export VOL_P0\20260101T000000Z --format csv --output snap.csv
+```
+
 > 写互斥：同一 data_root 同时只允许一个写者（采集/清扫）。并发执行会提示"data_root 被占用"，等待对方完成后重试；进程崩溃锁自动释放。
 > 断点续采：大卷采集被中断（崩溃/取消/断电）后，用 `collect --resume` 续接该卷最新的未封库采集，已完成部分自动跳过，结果与一次完整扫描一致。
 
