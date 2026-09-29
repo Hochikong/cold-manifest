@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .api.routes_collect import batches_router, router as collect_router
 from .api.routes_diffs import router as diffs_router
+from .api.routes_duplicates import router as duplicates_router
 from .api.routes_imports import router as imports_router
 from .api.routes_misc import router as misc_router
 from .api.routes_snapshots import router as snapshots_router
@@ -48,6 +49,9 @@ def create_app(data_root: "str | None" = None) -> FastAPI:
         return JSONResponse({"detail": exc.errors()}, status_code=400)
 
     # /api 路由（必须先于静态 mount 注册）
+    # duplicates_router 须先于 snapshots_router：后者有 /{snapshot_id:path}
+    # catch-all，会吞掉 .../duplicates 后缀（见 routes_duplicates.py 头注）
+    app.include_router(duplicates_router)
     app.include_router(snapshots_router)
     app.include_router(diffs_router)
     app.include_router(misc_router)

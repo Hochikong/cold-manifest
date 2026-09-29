@@ -90,6 +90,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p_hash.add_argument("--root", default=None,
                         help="显式指定源目录（覆盖 catalog 记录的 host_path，须为目录）")
 
+    p_dups = sub.add_parser("duplicates",
+                            help="快照内重复文件报告（按完整哈希分组；要求已 cldm hash --policy full）")
+    p_dups.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_dups.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_dups.add_argument("--min-size", type=int, default=1048576,
+                        help="只统计 ≥ 此字节数的文件（默认 1048576 = 1MiB）")
+    p_dups.add_argument("--limit", type=int, default=100, help="列出前 N 组（默认 100，上限 1000）")
+    p_dups.add_argument("--output", choices=["text", "csv"], default="text",
+                        help="text=摘要（默认）；csv=全字段清单")
+    p_dups.add_argument("--html", default=None, help="另存自包含 HTML 报告到指定路径")
+
+    p_verify = sub.add_parser("verify-copy",
+                              help="校验快照盘上副本与源文件完整性（只读；退出码 0 一致 / 1 不一致 / 2 错误）")
+    p_verify.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
+    p_verify.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_verify.add_argument("--sample", type=int, default=0,
+                          help="源文件随机抽检条数（需快照已 cldm hash --policy full；默认 0 = 只对副本）")
+    p_verify.add_argument("--full", action="store_true",
+                          help="抽检全部已哈希文件（可能很慢）")
+    p_verify.add_argument("--seed", type=int, default=None, help="抽样随机种子（可复现）")
+    p_verify.add_argument("--root", default=None,
+                          help="显式指定扫描根（覆盖 meta/catalog 记录，须为目录）")
+
     return parser
 
 
@@ -434,6 +457,122 @@ def _cmd_hash(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- duplicates ---------------------------------------------------------------
+
+def _cmd_duplicates(args: argparse.Namespace) -> int:
+    """快照内重复文件报告（P3-A）：只认 full 哈希，按 wasted_bytes 降序列组。"""
+    from .db import open_snapshot
+    from .duplicates import (MAX_LIMIT, DuplicatesError,
+                             duplicates_csv, find_duplicates,
+                             render_duplicates_html)
+    from .report import fmt_bytes
+
+    db = Path(args.snapshot_id)
+    if not db.is_file():
+        from .catalog import snapshot_path
+        db = snapshot_path(args.data_root, args.snapshot_id)
+        if not db.is_file():
+            print(f"错误：快照不存在：{args.snapshot_id}（{db}）", file=sys.stderr)
+            return 2
+
+    if not (1 <= args.limit <= MAX_LIMIT):
+        print(f"错误：limit 须在 1..{MAX_LIMIT}", file=sys.stderr)
+        return 2
+    if args.min_size < 0:
+        print("错误：min-size 不能为负", file=sys.stderr)
+        return 2
+
+    conn = open_snapshot(db)
+    try:
+        result = find_duplicates(conn, args.snapshot_id,
+                                 min_size=args.min_size, limit=args.limit)
+    except (DuplicatesError, ValueError) as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    finally:
+        conn.close()
+
+    if args.html:
+        Path(args.html).write_text(render_duplicates_html(result, time.strftime(
+            "%Y-%m-%d %H:%M:%S")), encoding="utf-8")
+        print(f"HTML 报告：{args.html}")
+
+    if args.output == "csv":
+        sys.stdout.write(duplicates_csv(result))
+        return 0
+
+    # text 摘要
+    print(f"重复文件报告：{result['snapshot_id']}")
+    print(f"  重复组数：{result['duplicate_groups']:,}  "
+          f"可回收空间：{fmt_bytes(result['total_wasted_bytes'])}  "
+          f"已哈希文件：{result['hashed_files']:,}（{result['hash_algo']}，"
+          f"大小下限 {fmt_bytes(result['min_size'])}）")
+    if not result["items"]:
+        print("  没有满足条件的重复文件。")
+        return 0
+    print(f"  前 {len(result['items'])} 组：")
+    for i, it in enumerate(result["items"], 1):
+        paths = "、".join(it["paths"][:3])
+        if len(it["paths"]) > 3:
+            paths += " …"
+        print(f"   {i:>3}. 浪费 {fmt_bytes(it['wasted_bytes']):>10}  "
+              f"{it['count']} × {fmt_bytes(it['size_bytes']):<10} {paths}")
+        if it["paths_truncated"]:
+            print("        （路径仅列部分）")
+    return 0
+
+
+def _cmd_verify_copy(args: argparse.Namespace) -> int:
+    """盘上副本对账 + 可选源文件抽检（只读，不持写锁）。
+
+    副本基准是**采集时记录**的 sha256（catalog.on_disk_copies），因为采集后
+    用户还可能跑 hash / build-fts / build-stats，那些都会改主机库；主机库与
+    记录值不一致只作信息项（host_status），不计失败。
+    退出码：0 全部一致 / 1 发现不一致 / 2 错误。
+    """
+    from .verify import VerifyError, verify_snapshot_copy
+
+    try:
+        result = verify_snapshot_copy(
+            args.data_root, args.snapshot_id,
+            sample=args.sample, seed=args.seed, full=args.full,
+            root_override=args.root)
+    except VerifyError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+
+    print(f"校验：{result['snapshot_id']}  {'OK' if result['ok'] else '发现不一致'}")
+    c = result["copy"]
+    status_text = {
+        "ok": "副本与采集记录一致",
+        "mismatch": "副本与采集记录不一致（被改动或损坏）",
+        "missing_disk": "盘上副本缺失",
+        "not_recorded": "无采集时副本记录（import-legacy 或 --no-on-disk-copy），副本校验不可用",
+    }.get(c["status"], c["status"])
+    print(f"  副本：{status_text}")
+    if c.get("recorded_sha256"):
+        disk = (c.get("disk_sha256") or "—")[:16]
+        print(f"        记录={c['recorded_sha256'][:16]}…  盘上={disk}…")
+    if c.get("host_status") == "modified_since_collection":
+        print("  主机库：采集后做过 hash/FTS/stats 等操作（属正常，不影响副本结论）")
+    s = result["sidecar"]
+    print(f"  旁车：{s['status']}")
+    for p in s["problems"]:
+        print(f"    - {p}")
+    src = result["source"]
+    if not src["available"]:
+        print(f"  抽检：不可用（{src.get('error', '')}）")
+    elif src["checked"]:
+        print(f"  抽检：{src['checked']:,}  match={src['match']:,}  mismatch={src['mismatch']:,}"
+              f"  missing={src['missing']:,}  unreadable={src['unreadable']:,}")
+        for sm in src["samples"]:
+            if sm["status"] != "match":
+                exp = (sm.get("expected") or "—")[:12]
+                act = (sm.get("actual") or "—")[:12]
+                print(f"    [{sm['status']}] {sm['path']}  期望={exp}…  实际={act}…")
+    return 0 if result["ok"] else 1
+
+
 # ---- main -------------------------------------------------------------------
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -482,6 +621,12 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "build-stats":
         return _cmd_build_stats(args)
+
+    if args.command == "duplicates":
+        return _cmd_duplicates(args)
+
+    if args.command == "verify-copy":
+        return _cmd_verify_copy(args)
 
     if args.command == "hash":
         return _cmd_hash(args)
