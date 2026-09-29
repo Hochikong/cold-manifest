@@ -245,6 +245,28 @@ export async function listVolumes(): Promise<VolumesResponse> {
   return data
 }
 
+export interface VolumeTrendItem {
+  snapshot_id: string
+  collect_time: string
+  status: string
+  file_count: number
+  dir_count: number
+  total_bytes: number
+  max_depth: number
+}
+
+export interface VolumeTrendsResponse {
+  volume_id: string
+  items: VolumeTrendItem[]
+}
+
+export async function getVolumeTrends(volume_id: string, limit?: number): Promise<VolumeTrendsResponse> {
+  const { data } = await client.get(`/volumes/${encodeURIComponent(volume_id)}/trends`, {
+    params: limit ? { limit } : undefined,
+  })
+  return data
+}
+
 export interface DiffRun {
   diff_id: string
   a: string

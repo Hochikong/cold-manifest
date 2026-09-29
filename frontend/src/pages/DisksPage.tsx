@@ -1,6 +1,7 @@
 import { Card, Table, Typography, Empty, Spin } from 'antd'
 import { useVolumes } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import VolumeTrendsChart from '../components/VolumeTrendsChart'
 import { formatFileSize, formatNumber } from '../utils/format'
 
 const { Title } = Typography
@@ -32,6 +33,10 @@ export default function DisksPage() {
             dataSource={data.items}
             pagination={{ pageSize: 20 }}
             scroll={{ x: 'max-content' }}
+            expandable={{
+              expandedRowRender: (record) => <VolumeTrendsChart volume_id={record.volume_id} />,
+              rowExpandable: () => true,
+            }}
           />
         ) : !isLoading ? (
           <Empty description="尚未发现磁盘" />

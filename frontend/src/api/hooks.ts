@@ -10,6 +10,7 @@ import {
   getDu,
   searchEntries,
   listVolumes,
+  getVolumeTrends,
   listDiffs,
   createDiff,
   getDiff,
@@ -109,6 +110,15 @@ export function useVolumes() {
   return useQuery({
     queryKey: ['volumes'],
     queryFn: listVolumes,
+    staleTime: 60_000,
+  })
+}
+
+export function useVolumeTrends(volume_id: string | undefined, limit?: number) {
+  return useQuery({
+    queryKey: ['volume-trends', volume_id, limit],
+    queryFn: () => getVolumeTrends(volume_id!, limit),
+    enabled: !!volume_id,
     staleTime: 60_000,
   })
 }
