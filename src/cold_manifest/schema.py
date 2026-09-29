@@ -153,7 +153,9 @@ CREATE TABLE IF NOT EXISTS diff_entries(
   a_entry_id INTEGER, b_entry_id INTEGER,
   a_size INTEGER, b_size INTEGER,
   a_mtime_ns INTEGER, b_mtime_ns INTEGER,
-  a_type TEXT, b_type TEXT               -- 两侧条目类型（file/dir/...），type_changed 展示用
+  a_type TEXT, b_type TEXT,              -- 两侧条目类型（file/dir/...），type_changed 展示用
+  a_hash TEXT, b_hash TEXT,              -- 两侧哈希（hash 联动 diff 才填充）
+  b_path TEXT                            -- moved_or_renamed 的 B 侧新路径
 );
 CREATE INDEX IF NOT EXISTS idx_de_type_path ON diff_entries(change_type, path);
 CREATE INDEX IF NOT EXISTS idx_de_path ON diff_entries(path);

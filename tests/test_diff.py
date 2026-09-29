@@ -110,8 +110,10 @@ def test_idempotent_reuse(tmp_path: Path, two_snaps) -> None:
     with pytest.raises(DiffError):
         materialize_diff(tmp_path, a, b, options={"depth": 0})
     with pytest.raises(DiffError):
-        materialize_diff(tmp_path, a, b, options={"hash": "sha256"})
+        materialize_diff(tmp_path, a, b, options={"hash": "md5"})
     assert compute_options_hash(None) == compute_options_hash({"hash": "none"})
+    # sha256 是合法选项，与 none 产生不同 options_hash / diff_id
+    assert compute_options_hash({"hash": "sha256"}) != compute_options_hash({"hash": "none"})
 
 
 def test_force_rebuild(tmp_path: Path, two_snaps) -> None:

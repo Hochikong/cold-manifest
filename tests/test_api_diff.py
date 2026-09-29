@@ -126,8 +126,9 @@ def test_post_diff_errors(client: TestClient) -> None:
     # M6 回归：未知选项 → 400（不得静默接受污染幂等键）
     r = client.post("/api/diffs", json={"a": A, "b": B, "options": {"depth": 0}})
     assert r.status_code == 400
+    # 非法 hash 值 → 400（合法值 'none'/'sha256'）
     assert client.post("/api/diffs",
-                       json={"a": A, "b": B, "options": {"hash": "sha256"}}).status_code == 400
+                       json={"a": A, "b": B, "options": {"hash": "md5"}}).status_code == 400
 
 
 # ---------------------------------------------------------------- detail / summary

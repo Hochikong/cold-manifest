@@ -155,6 +155,10 @@ def generate_diff_report(diff_db_path: "str | Path", out: "str | Path | IO[str]"
             """).fetchall()
 
         # 各分类清单（截断）
+        has_hash_cols = "a_hash" in {r[1] for r in
+                                     conn.execute("PRAGMA table_info(diff_entries)")}
+        hsel = ", a_hash, b_hash, b_path" if has_hash_cols else \
+               ", NULL AS a_hash, NULL AS b_hash, NULL AS b_path"
         sections: "dict[str, dict]" = {}
         for cat in _SECTION_CATEGORIES:
             n = counts[cat] or 0
@@ -162,7 +166,7 @@ def generate_diff_report(diff_db_path: "str | Path", out: "str | Path | IO[str]"
                 continue
             rows = conn.execute(
                 "SELECT path, a_type, b_type, a_size, b_size,"
-                " a_mtime_ns, b_mtime_ns FROM diff_entries"
+                f" a_mtime_ns, b_mtime_ns{hsel} FROM diff_entries"
                 " WHERE change_type=? ORDER BY path LIMIT ?",
                 (cat, max_rows_per_section)).fetchall()
             sections[cat] = {"total": n, "rows": [dict(r) for r in rows]}
@@ -229,16 +233,25 @@ def generate_diff_report(diff_db_path: "str | Path", out: "str | Path | IO[str]"
                   "moved_or_renamed": "移动/改名"}
     has_type_diff = any(s["rows"] and (r["a_type"] != r["b_type"])
                         for s in sections.values() for r in s["rows"])
+    has_hash = any(s["rows"] and (r["a_hash"] or r["b_hash"])
+                   for s in sections.values() for r in s["rows"])
     headers = (["路径", "类型", "A 大小", "B 大小", "A mtime", "B mtime"]
                if has_type_diff else
                ["路径", "A 大小", "B 大小", "A mtime", "B mtime"])
-    num_cols = set(range(1, len(headers)))
+    if has_hash:
+        headers += ["A 哈希", "B 哈希"]
+    num_cols = set(range(1, len(headers))) - (
+        {len(headers) - 2, len(headers) - 1} if has_hash else set())
     for cat, sec in sections.items():
         h.append(f"<details open><summary>{_esc(sec_labels[cat])}"
                  f"（{sec['total']:,} 条）</summary>")
         rows = []
         for r in sec["rows"]:
-            cells = [_esc(r["path"])]
+            # moved_or_renamed：path 为 A 侧原路径，b_path 为 B 侧新路径
+            if r["b_path"] and r["b_path"] != r["path"]:
+                cells = [f"{_esc(r['path'])} → {_esc(r['b_path'])}"]
+            else:
+                cells = [_esc(r["path"])]
             if has_type_diff:
                 t = _esc(r["a_type"] or "—") if r["a_type"] == r["b_type"] \
                     else f"{_esc(r['a_type'] or '—')} → {_esc(r['b_type'] or '—')}"
@@ -254,6 +267,10 @@ def generate_diff_report(diff_db_path: "str | Path", out: "str | Path | IO[str]"
                 cells.append(_esc(fmt_bytes(r["b_size"])))
             cells.append(_esc(_fmt_ns(r["a_mtime_ns"])))
             cells.append(_esc(_fmt_ns(r["b_mtime_ns"])))
+            if has_hash:
+                # 截断展示前 12 位（sha256 全长 64 位太宽），error/缺失显示 —
+                cells.append(_esc((r["a_hash"] or "")[:12] + "…" if r["a_hash"] else "—"))
+                cells.append(_esc((r["b_hash"] or "")[:12] + "…" if r["b_hash"] else "—"))
             rows.append(cells)
         h += _table(headers, rows, num_cols=num_cols)
         if sec["total"] > len(sec["rows"]):

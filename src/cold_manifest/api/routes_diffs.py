@@ -45,6 +45,14 @@ def _open_diff_ro(state: AppState, diff_id: str) -> sqlite3.Connection:
     return conn
 
 
+def _hash_cols(conn: sqlite3.Connection) -> "tuple[str, str]":
+    """旧 diff 库可能无 a_hash/b_hash/b_path 列：存在才查询（兼容读取）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(diff_entries)")}
+    if "a_hash" in cols:
+        return "a_hash, b_hash, b_path", ""
+    return "NULL AS a_hash, NULL AS b_hash, NULL AS b_path", ""
+
+
 def _require_diff_run(state: AppState, diff_id: str) -> Any:
     row = state.catalog.execute(
         "SELECT * FROM diff_runs WHERE diff_id=?", (diff_id,)).fetchone()
@@ -60,6 +68,7 @@ class DiffCreateBody(BaseModel):
     a: str
     b: str
     options: "dict | None" = None
+    hash: "str | None" = None     # 便捷字段：等价 options={"hash": ...}
 
 
 @router.post("")
@@ -67,9 +76,12 @@ def create_diff(body: DiffCreateBody, request: Request) -> dict:
     """同步物化 diff(a, b, options)；同参幂等复用既有结果库。"""
     if not body.a or not body.b:
         raise HTTPException(status_code=400, detail="a 与 b 不能为空")
+    options = dict(body.options or {})
+    if body.hash is not None:
+        options["hash"] = body.hash
     state = get_state(request)
     try:
-        result = materialize_diff(state.data_root, body.a, body.b, options=body.options)
+        result = materialize_diff(state.data_root, body.a, body.b, options=options)
     except DiffError as e:
         msg = str(e)
         code = 404 if "不存在" in msg else 400
@@ -193,10 +205,11 @@ def diff_entries(
         order_sql = "DESC" if desc else "ASC"
         # path 为文本排序键，须与 keyset 的 COLLATE NOCASE 一致，否则混合大小写翻页丢行
         coll = " COLLATE NOCASE" if is_text else ""
+        hash_cols, _ = _hash_cols(conn)
         rows = conn.execute(
             f"""
             SELECT id, change_type AS category, path, depth,
-                   a_type, b_type,
+                   a_type, b_type, {hash_cols},
                    a_size, b_size, a_mtime_ns, b_mtime_ns,
                    {size_delta} AS size_delta
             FROM diff_entries

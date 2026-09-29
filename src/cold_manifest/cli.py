@@ -54,6 +54,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("a", help="快照 A（快照 ID，如 VOL_P0/20260101T000000Z）")
     p_diff.add_argument("b", help="快照 B")
     p_diff.add_argument("--depth", type=int, default=None, help="结果按目录深度过滤（查询期，不影响物化）")
+    p_diff.add_argument("--hash", choices=["none", "sha256"], default="none",
+                        help="内容比对模式：sha256 需两快照已 cldm hash，可识别 content_changed / moved_or_renamed")
     p_diff.add_argument("--output", default=None, help="diff 结果写 CSV（category,path,type,size_a,size_b,mtime_a,mtime_b）")
     p_diff.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
 
@@ -101,7 +103,8 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     from .diff_engine import DiffError, iter_diff_csv, materialize_diff
 
     try:
-        result = materialize_diff(args.data_root, args.a, args.b)
+        result = materialize_diff(args.data_root, args.a, args.b,
+                                  options={"hash": args.hash})
     except DiffError as e:
         print(f"错误：{e}", file=sys.stderr)
         return 2
