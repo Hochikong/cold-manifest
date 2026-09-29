@@ -4,6 +4,7 @@ import argparse
 import csv
 import os
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -24,6 +25,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0，仅本机用 127.0.0.1）")
     p_serve.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
     p_serve.add_argument("--data-root", default=None, help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+
+    p_collect = sub.add_parser("collect", help="采集一个卷：probe → 扫描 → 封库 → 盘上副本 → 注册")
+    p_collect.add_argument("root", help="扫描根目录（卷挂载点/盘符）")
+    p_collect.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_collect.add_argument("--volume-id", default=None, help="手动指定卷 ID（默认 {serial}_P{index}）")
+    p_collect.add_argument("--serial", default=None, help="手动指定磁盘序列号（USB 桥兜底）")
+    p_collect.add_argument("--exclude-glob", action="append", default=[], dest="exclude_globs",
+                           metavar="GLOB", help="排除 glob（可多次；目录命中整棵剪枝）")
+    p_collect.add_argument("--exclude-hidden", action="store_true", help="跳过隐藏文件/目录")
+    p_collect.add_argument("--no-smartctl", action="store_true", help="不调用 smartctl")
+    p_collect.add_argument("--no-on-disk-copy", action="store_true", help="不写盘上副本")
 
     p_import = sub.add_parser("import-legacy", help="导入 v1 旧版快照目录（metadata.csv）")
     p_import.add_argument("snapshot_dir", help="旧版快照目录路径")
@@ -114,6 +126,44 @@ def _cmd_export(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def _cmd_collect(args: argparse.Namespace) -> int:
+    from .collect import CollectError, collect_volume
+    from .probe import ProbeError
+
+    t0 = time.monotonic()
+
+    def cb(phase: str, done: int, total: "int | None") -> None:
+        if phase == "scan":
+            sys.stdout.write(f"\r  扫描中：{done:,} 条目")
+            sys.stdout.flush()
+
+    try:
+        result = collect_volume(
+            args.root, data_root=args.data_root, volume_id=args.volume_id,
+            manual_serial=args.serial, exclude_globs=args.exclude_globs,
+            exclude_hidden=args.exclude_hidden, smartctl=not args.no_smartctl,
+            on_disk_copy=not args.no_on_disk_copy,
+            progress_cb=cb,
+        )
+    except (CollectError, ProbeError) as e:
+        print(f"\n错误：{e}", file=sys.stderr)
+        return 2
+    print()
+    print(f"采集完成：{result.snapshot_id}")
+    print(f"  文件：{result.files:,}  目录：{result.dirs:,}  符号链接：{result.symlinks:,}"
+          f"  跳过：{result.skipped:,}")
+    print(f"  总字节：{result.total_bytes:,}（{result.total_bytes / 2**30:.2f} GiB）")
+    print(f"  耗时：{result.elapsed_s:.1f}s  吞吐："
+          f"{(result.files + result.dirs) / result.elapsed_s:,.0f} 条目/s")
+    print(f"  快照库：{result.db_path}")
+    print(f"  主机 sha256：{result.host_sha256}")
+    if result.on_disk_path is not None:
+        print(f"  盘上副本：{result.on_disk_path}（sha256 一致：{result.on_disk_sha256}）")
+    for w in result.warnings:
+        print(f"  警告：{w}")
+    return 0
+
+
 # ---- main -------------------------------------------------------------------
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -127,6 +177,9 @@ def main(argv: "list[str] | None" = None) -> int:
             os.environ["CLDM_DATA_ROOT"] = str(Path(args.data_root).resolve())
         uvicorn.run("cold_manifest.server:app", host=args.host, port=args.port)
         return 0
+
+    if args.command == "collect":
+        return _cmd_collect(args)
 
     if args.command == "import-legacy":
         from .import_legacy import LegacyImportError, import_snapshot
