@@ -7,6 +7,11 @@ export default defineConfig({
   server: {
     host: true,
     port: 5173,
+    // /mnt/c（9p 文件系统）上 inotify 事件不可靠，用轮询保证 HMR/热更新
+    watch: {
+      usePolling: true,
+      interval: 800,
+    },
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8765',

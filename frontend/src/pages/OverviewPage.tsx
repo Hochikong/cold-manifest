@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Card,
@@ -25,12 +25,14 @@ import {
 } from '@ant-design/icons'
 import { useVolumes, useSnapshots, useDiffs } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import ImportDialog from '../components/ImportDialog'
 import { formatFileSize, formatDateTime } from '../utils/format'
 
 const { Title } = Typography
 
 export default function OverviewPage() {
   const navigate = useNavigate()
+  const [importOpen, setImportOpen] = useState(false)
   const { data: volumes, isLoading: volLoading, error: volError } = useVolumes()
   const { data: snapshots, isLoading: snapLoading, error: snapError } = useSnapshots()
   const { data: diffs, isLoading: diffLoading, error: diffError } = useDiffs()
@@ -148,11 +150,13 @@ export default function OverviewPage() {
           <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/tasks')}>
             开始采集
           </Button>
-          <Button icon={<ImportOutlined />} onClick={() => navigate('/tasks')}>
+          <Button icon={<ImportOutlined />} onClick={() => setImportOpen(true)}>
             导入旧快照
           </Button>
         </Space>
       </Card>
+
+      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} />
 
       <Card title="磁盘与卷" style={{ marginTop: 16 }}>
         {volumes?.count ? (

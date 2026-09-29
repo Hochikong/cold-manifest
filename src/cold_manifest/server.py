@@ -16,9 +16,12 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .api.routes_diffs import router as diffs_router
+from .api.routes_imports import router as imports_router
 from .api.routes_misc import router as misc_router
 from .api.routes_snapshots import router as snapshots_router
+from .api.routes_tasks import router as tasks_router
 from .api.state import AppState
+from .tasks import TaskRunner
 
 # 前端构建产物目录（仓库根/frontend/dist，随 zip 分发）
 _FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -46,6 +49,8 @@ def create_app(data_root: "str | None" = None) -> FastAPI:
     app.include_router(snapshots_router)
     app.include_router(diffs_router)
     app.include_router(misc_router)
+    app.include_router(imports_router)
+    app.include_router(tasks_router)
 
     if _FRONTEND_DIST.is_dir():
         app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="spa")
@@ -66,9 +71,13 @@ def _lifespan_factory(data_root: str) -> Any:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         state = AppState(data_root)
         app.state.cldm = state
+        runner = TaskRunner(data_root)
+        runner.start()
+        app.state.task_runner = runner
         try:
             yield
         finally:
+            runner.stop()
             state.close()
 
     return lifespan

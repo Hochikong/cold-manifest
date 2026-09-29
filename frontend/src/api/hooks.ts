@@ -14,11 +14,18 @@ import {
   getDiff,
   getDiffSummary,
   listDiffEntries,
+  scanImports,
+  createImport,
+  listTasks,
+  getTask,
   getSettings,
   type ListEntriesParams,
   type SearchParams,
   type DiffEntriesParams,
   type DiffCreateBody,
+  type ImportCreateBody,
+  type ListTasksParams,
+  type Task,
 } from './client'
 
 export function useHealth() {
@@ -139,6 +146,49 @@ export function useCreateDiff() {
   return useMutation({
     mutationFn: (body: DiffCreateBody) => createDiff(body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['diffs'] }),
+  })
+}
+
+export function useImportScan(path: string | undefined, enabled = true) {
+  return useQuery({
+    queryKey: ['import-scan', path],
+    queryFn: () => scanImports(path!),
+    enabled: !!path && enabled,
+    staleTime: 10_000,
+  })
+}
+
+export function useCreateImport() {
+  return useMutation({
+    mutationFn: (body: ImportCreateBody) => createImport(body),
+  })
+}
+
+export function useTasks(params: ListTasksParams = {}, autoRefresh = false) {
+  return useQuery({
+    queryKey: ['tasks', params],
+    queryFn: () => listTasks(params),
+    staleTime: 5_000,
+    refetchInterval: (query) => {
+      if (!autoRefresh) return false
+      const tasks = query.state.data as { items: Task[] } | undefined
+      const active = tasks?.items.some((t) => t.status === 'pending' || t.status === 'running')
+      return active ? 2_000 : false
+    },
+  })
+}
+
+export function useTask(id: string | undefined, autoRefresh = false) {
+  return useQuery({
+    queryKey: ['task', id],
+    queryFn: () => getTask(id!),
+    enabled: !!id,
+    staleTime: 1_000,
+    refetchInterval: (query) => {
+      if (!autoRefresh || !id) return false
+      const task = query.state.data as Task | undefined
+      return task && (task.status === 'pending' || task.status === 'running') ? 1_000 : false
+    },
   })
 }
 

@@ -346,6 +346,77 @@ export function exportDiffUrl(diff_id: string): string {
   return `/api/diffs/${diff_id}/export?format=csv`
 }
 
+export interface ImportCandidate {
+  snapshot_dir: string
+  volume_id: string
+  collect_time: string
+  tree_csv_bytes: number
+  status: 'new' | 'imported'
+}
+
+export interface ImportScanResponse {
+  root: string
+  candidates: ImportCandidate[]
+  errors: string[]
+}
+
+export async function scanImports(path: string): Promise<ImportScanResponse> {
+  const { data } = await client.get('/imports/scan', { params: { path } })
+  return data
+}
+
+export interface ImportCreateBody {
+  snapshot_dir: string
+  volume_id?: string | null
+  force?: boolean
+}
+
+export interface ImportCreateResponse {
+  task_id: string
+  status: string
+}
+
+export async function createImport(body: ImportCreateBody): Promise<ImportCreateResponse> {
+  const { data } = await client.post('/imports', body)
+  return data
+}
+
+export interface Task {
+  id: string
+  type: 'import'
+  status: 'pending' | 'running' | 'done' | 'error'
+  progress: number | null
+  message: string | null
+  payload: Record<string, unknown>
+  result: { snapshot_id?: string; skipped_import?: boolean } | null
+  error: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+export interface TasksResponse {
+  items: Task[]
+  next_cursor: string | null
+  has_more: boolean
+}
+
+export interface ListTasksParams {
+  limit?: number
+  cursor?: string
+  status?: string
+}
+
+export async function listTasks(params: ListTasksParams = {}): Promise<TasksResponse> {
+  const { data } = await client.get('/tasks', { params })
+  return data
+}
+
+export async function getTask(id: string): Promise<Task> {
+  const { data } = await client.get(`/tasks/${encodeURIComponent(id)}`)
+  return data
+}
+
 export interface SettingsResponse {
   data_root: string
   version: string

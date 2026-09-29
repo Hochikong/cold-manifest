@@ -31,9 +31,30 @@ def open_catalog(path: "str | Path", check_same_thread: bool = True) -> sqlite3.
     return conn
 
 
+def _migrate_catalog(conn: sqlite3.Connection) -> None:
+    """幂等列迁移：pragma table_info 检查 + ALTER TABLE ADD COLUMN。
+
+    tasks 表早期 DDL 缺 started_at/progress/message/result_json（P1.0 任务队列需要），
+    对既有 catalog.db（如 /home/jack2/cold-data/catalog.db）补列，不影响已注册快照。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+    if not cols:
+        return  # 表不存在（首次建库由 CATALOG_DDL 直接带全列）
+    for name, decl in (
+        ("started_at", "TEXT"),
+        ("progress", "REAL"),
+        ("message", "TEXT"),
+        ("result_json", "TEXT"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {decl}")
+    conn.commit()
+
+
 def init_catalog(conn: sqlite3.Connection) -> None:
-    """建 catalog 表结构（幂等）。"""
+    """建 catalog 表结构（幂等）+ 补列迁移。"""
     conn.executescript(CATALOG_DDL)
+    _migrate_catalog(conn)
     conn.commit()
 
 

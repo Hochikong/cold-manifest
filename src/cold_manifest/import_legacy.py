@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume, register_snapshot,
                       snapshot_path, validate_volume_id)
@@ -126,8 +126,10 @@ def _ensure_dir_chain(dir_ids: "dict[str, int]", conn: sqlite3.Connection,
     return eid
 
 
-def _build_entries(conn: sqlite3.Connection, tree_path: Path) -> "dict[str, Any]":
-    """灌 entries 表，返回统计。"""
+def _build_entries(conn: sqlite3.Connection, tree_path: Path,
+                   progress_cb: "Callable[[str, int, int], None] | None" = None,
+                   total_rows: "int | None" = None) -> "dict[str, Any]":
+    """灌 entries 表，返回统计。progress_cb 在 parse 阶段每约 5 万行回调一次。"""
     if not tree_path.is_file():
         raise LegacyImportError(f"缺少 tree.csv：{tree_path}")
     file_count = dir_count = 0
@@ -168,7 +170,13 @@ def _build_entries(conn: sqlite3.Connection, tree_path: Path) -> "dict[str, Any]
                 buf.clear()
 
 
+        _PROGRESS_EVERY = 50_000
+        n_rows = 0
+
         for row in reader:
+            n_rows += 1
+            if progress_cb is not None and n_rows % _PROGRESS_EVERY == 0:
+                progress_cb("parse", n_rows, total_rows if total_rows is not None else -1)
             if len(row) <= i_mtime:
                 continue
             rel = row[i_path].strip()
@@ -223,6 +231,8 @@ def _build_entries(conn: sqlite3.Connection, tree_path: Path) -> "dict[str, Any]
                 conn.commit()
         flush()
         conn.commit()
+    if progress_cb is not None:
+        progress_cb("parse", n_rows, n_rows if total_rows is None else total_rows)
     return {"file_count": file_count, "dir_count_derived": dir_count,
             "total_bytes": total_bytes, "zero_byte_count": zero_byte, "max_depth": max_depth}
 
@@ -337,11 +347,20 @@ def _is_sealed(db_path: Path) -> bool:
 
 
 def import_snapshot(snapshot_dir: "str | Path", data_root: "str | Path",
-                    volume_id: "str | None" = None, force: bool = False) -> ImportResult:
-    """导入一个 v1 快照目录。见模块 docstring。"""
+                    volume_id: "str | None" = None, force: bool = False,
+                    progress_cb: "Callable[[str, int, int], None] | None" = None) -> ImportResult:
+    """导入一个 v1 快照目录。见模块 docstring。
+
+    progress_cb(phase, done, total)：phase ∈ {"read","parse","seal","done"}；
+    parse 的 total 未知时为 -1；可选回调，不传时行为与旧版完全一致。
+    """
     t0 = time.monotonic()
+    if progress_cb is not None:
+        progress_cb("read", 0, 3)
     snapshot_dir = Path(snapshot_dir)
     meta = _read_metadata(snapshot_dir)
+    if progress_cb is not None:
+        progress_cb("read", 1, 3)
     volume_id = volume_id or meta.get("volume_id") or ""
     if not volume_id:
         raise LegacyImportError("volume_id 未提供且 metadata.csv 中无 volume_id")
@@ -367,8 +386,11 @@ def import_snapshot(snapshot_dir: "str | Path", data_root: "str | Path",
         conn.executescript(SNAPSHOT_TABLES_DDL)
         conn.execute("BEGIN")
 
-        ent_stats = _build_entries(conn, snapshot_dir / "tree.csv")
+        ent_stats = _build_entries(conn, snapshot_dir / "tree.csv", progress_cb=progress_cb)
         skipped_count = _import_warnings(conn, snapshot_dir)
+
+        if progress_cb is not None:
+            progress_cb("seal", 0, 3)
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         meta_rows: "list[tuple[str, str]]" = [(str(k), str(v)) for k, v in meta.items()]
@@ -388,6 +410,10 @@ def import_snapshot(snapshot_dir: "str | Path", data_root: "str | Path",
         _build_dir_rollup(conn)
         conn.execute("PRAGMA optimize")
         conn.commit()
+
+        if progress_cb is not None:
+            progress_cb("seal", 3, 3)
+            progress_cb("done", 1, 1)
 
         stats: "dict[str, Any]" = {
             "file_count": ent_stats["file_count"],
