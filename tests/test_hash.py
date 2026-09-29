@@ -154,9 +154,51 @@ def test_hash_snapshot_cache_reuse_across_snapshots(env, tmp_path) -> None:
     result = hash_snapshot(conn2, data_root, sid2)
     assert result["cached"] == 2 and result["computed"] == 0
     rows = _hash_rows(conn2)
-    assert rows[3]["hash_state"] == "cached"
+    # 缓存命中写实际策略，不再写废弃的 'cached'
+    assert rows[3]["hash_state"] == "full"
     assert rows[3]["hash_hex"] == hashlib.sha256(A_TXT).hexdigest()
     conn2.close()
+
+
+def test_hash_snapshot_cache_hit_records_actual_policy(env, tmp_path) -> None:
+    """sampled 哈希的缓存命中 → hash_state='sampled'（非 full、非废弃 cached）。"""
+    data_root, host, sid = env
+    conn = _open_rw(_snap_db(data_root, sid))
+    hash_snapshot(conn, data_root, sid, policy="sampled")
+    conn.close()
+    sid2 = _build_snapshot(data_root, host, "vol/20260102T000000Z", _std_rows())
+    conn2 = _open_rw(_snap_db(data_root, sid2))
+    result = hash_snapshot(conn2, data_root, sid2, policy="sampled")
+    assert result["cached"] == 2
+    rows = _hash_rows(conn2)
+    assert rows[3]["hash_state"] == "sampled"
+    conn2.close()
+
+    # 旧缓存行（policy 为 NULL）→ 回退本次请求的 policy
+    cat = sqlite3.connect(catalog_path(data_root))
+    cat.execute("UPDATE hash_cache SET policy=NULL")
+    cat.commit()
+    cat.close()
+    sid3 = _build_snapshot(data_root, host, "vol/20260103T000000Z", _std_rows())
+    conn3 = _open_rw(_snap_db(data_root, sid3))
+    result = hash_snapshot(conn3, data_root, sid3, policy="full")
+    assert result["cached"] == 2
+    rows = _hash_rows(conn3)
+    assert rows[3]["hash_state"] == "full"
+    conn3.close()
+
+
+def test_ensure_disk_no_extra_fields(tmp_path) -> None:
+    """ensure_disk 无附加字段也不产生残缺 SQL（rstrip(', ') 防御）。"""
+    cat = sqlite3.connect(catalog_path(tmp_path))
+    init_catalog(cat)
+    ensure_disk(cat, "DISK_X")
+    ensure_disk(cat, "DISK_X")  # 幂等
+    row = cat.execute(
+        "SELECT disk_id, last_seen IS NOT NULL FROM disks WHERE disk_id='DISK_X'"
+    ).fetchone()
+    cat.close()
+    assert row[0] == "DISK_X" and row[1] == 1
 
 
 def test_hash_snapshot_resumable(env) -> None:

@@ -42,8 +42,12 @@ def ensure_disk(conn: sqlite3.Connection, disk_id: str, **fields: Any) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     cols = {"disk_id": disk_id, "first_seen": now, "last_seen": now, **fields}
     keys = list(cols)
-    updates = "last_seen=excluded.last_seen, " + ", ".join(
-        f"{k}=COALESCE(excluded.{k}, {k})" for k in keys if k not in ("disk_id", "first_seen", "last_seen"))
+    updates = ("last_seen=excluded.last_seen, " + ", ".join(
+        f"{k}=COALESCE(excluded.{k}, {k})"
+        for k in keys if k not in ("disk_id", "first_seen", "last_seen"))).rstrip(", ")
+    if not updates:
+        # 只有 disk_id/first_seen/last_seen（无附加字段）：UPSERT 只刷 last_seen
+        updates = "last_seen=excluded.last_seen"
     conn.execute(
         f"INSERT INTO disks({','.join(keys)}) VALUES({','.join('?' * len(keys))}) "
         f"ON CONFLICT(disk_id) DO UPDATE SET {updates}",

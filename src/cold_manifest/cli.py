@@ -72,12 +72,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fts.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
 
     p_hash = sub.add_parser("hash",
-                            help="为快照补算文件哈希（按需，可续算，跨快照缓存复用）")
+                            help="为快照补算文件哈希（按需，可续算，跨快照缓存复用；"
+                                 "缓存键不含 volume_id，跨盘同名同大小同 mtime 可能复用旧哈希）")
     p_hash.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
     p_hash.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
     p_hash.add_argument("--algo", default="sha256", help="哈希算法（默认 sha256）")
     p_hash.add_argument("--policy", choices=["full", "sampled"], default="full",
-                        help="哈希策略：full=整文件（默认）；sampled=首尾 64KB 指纹")
+                        help="哈希策略：full=整文件（默认，diff 内容比对可用）；"
+                             "sampled=首尾 64KB 指纹（不能证明内容等值）")
     p_hash.add_argument("--limit", type=int, default=None,
                         help="调试：本次最多处理 N 个条目（默认不限）")
     p_hash.add_argument("--root", default=None,

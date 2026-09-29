@@ -75,6 +75,7 @@ function DiffSelector() {
 
   const [a, setA] = useState<string | undefined>(undefined)
   const [b, setB] = useState<string | undefined>(undefined)
+  const [hash, setHash] = useState<'none' | 'sha256'>('none')
 
   const snapshotOptions = useMemo(
     () =>
@@ -88,7 +89,7 @@ function DiffSelector() {
   const start = () => {
     if (!a || !b) return
     create.mutate(
-      { a, b, options: { hash: 'none' } },
+      { a, b, options: { hash } },
       {
         onSuccess: (res) => {
           navigate(`/diff?id=${res.diff_id}`)
@@ -123,6 +124,15 @@ function DiffSelector() {
             onChange={setB}
             loading={snapLoading}
           />
+          <Select
+            value={hash}
+            onChange={setHash}
+            style={{ width: 150 }}
+            options={[
+              { value: 'none', label: '不比对内容' },
+              { value: 'sha256', label: 'sha256 内容比对' },
+            ]}
+          />
           <Button
             type="primary"
             icon={<PlayCircleOutlined />}
@@ -133,6 +143,11 @@ function DiffSelector() {
             开始对比
           </Button>
         </Space>
+        {hash === 'sha256' && (
+          <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
+            需要先在两个快照上算好 sha256 哈希，才能识别改名与同尺寸改写
+          </Typography.Text>
+        )}
         {create.isError && <Alert style={{ marginTop: 16 }} type="error" title={String(create.error)} />}
       </Card>
 
@@ -450,7 +465,7 @@ function DiffEntryDetail({ entry }: { entry: DiffEntry }) {
       </div>
       <div>
         <Text strong>B 快照</Text>
-        <div><Text style={labelStyle}>路径</Text>{entry.path || '—'}</div>
+        <div><Text style={labelStyle}>路径</Text>{entry.b_path || entry.path || '—'}</div>
         <div><Text style={labelStyle}>类型</Text>{entry.b_type || '—'}</div>
         <div><Text style={labelStyle}>大小</Text>{formatFileSize(entry.b_size)}</div>
         <div><Text style={labelStyle}>修改时间</Text>{nsToDate(entry.b_mtime_ns)}</div>

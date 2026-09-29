@@ -150,6 +150,48 @@ def test_hash_none_keeps_null_counts(tmp_path: Path, two_snaps) -> None:
         conn.close()
 
 
+def test_sampled_hashes_fall_back_to_size_mtime(tmp_path: Path) -> None:
+    """sampled 哈希不能证明内容等值：diff 不产生 content_changed/moved，
+    回退 size/mtime 语义（即使同名同尺寸同 mtime 改写也不造假）。"""
+    a = _mk_snapshot(tmp_path, "VOL_P0", "20260101T000000Z", [
+        ("same_name.txt", "file", 10, 111, H1, "sampled"),   # B 改了内容但哈希是 sampled
+        ("orig_name.txt", "file", 20, 555, H2, "sampled"),   # B 改名（内容不变）
+        ("mtime_ch.txt", "file", 10, 444, H3, "sampled"),
+    ])
+    b = _mk_snapshot(tmp_path, "VOL_P0", "20260202T000000Z", [
+        ("same_name.txt", "file", 10, 111, H2, "sampled"),   # sampled 不同 → 不据其判
+        ("renamed.txt", "file", 20, 555, H2, "sampled"),
+        ("mtime_ch.txt", "file", 10, 999999, H3, "sampled"),
+    ])
+    r = materialize_diff(tmp_path, a, b, options={"hash": "sha256"})
+    t = _types(r.db_path)
+    # 同尺寸同 mtime：两侧哈希均不可信 → identical（不报 content_changed）
+    assert t.get("content_changed") is None
+    assert t.get("moved_or_renamed") is None
+    assert r.counts["moved_or_renamed"] == 0
+    # 回退语义仍然工作
+    assert ("orig_name.txt", None) in t["removed"]
+    assert ("renamed.txt", "renamed.txt") in t["added"]
+    assert ("mtime_ch.txt", None) in t["mtime_changed"]
+
+
+def test_legacy_cached_state_not_trusted(tmp_path: Path) -> None:
+    """旧库 hash_state='cached'：兼容读取不炸，且不作为内容等值证明。"""
+    a = _mk_snapshot(tmp_path, "VOL_P0", "20260101T000000Z", [
+        ("f.txt", "file", 10, 111, H1, "cached"),
+        ("g.txt", "file", 20, 222, H2, "cached"),
+    ])
+    b = _mk_snapshot(tmp_path, "VOL_P0", "20260202T000000Z", [
+        ("f.txt", "file", 10, 111, H2, "cached"),   # 同尺寸同 mtime，cached 不同 → 不判 content_changed
+        ("g.txt", "file", 20, 222, H2, "cached"),
+    ])
+    r = materialize_diff(tmp_path, a, b, options={"hash": "sha256"})
+    t = _types(r.db_path)
+    assert t.get("content_changed") is None
+    assert r.counts["content_changed"] == 0
+    assert r.counts["identical"] == 3   # root + f.txt + g.txt（回退语义）
+
+
 def test_hash_error_side_falls_back(tmp_path: Path) -> None:
     """任一侧 hash_state='error' → 该对不可用，回退 size/mtime 语义。"""
     a = _mk_snapshot(tmp_path, "VOL_P0", "20260101T000000Z", [

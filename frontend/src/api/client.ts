@@ -271,7 +271,7 @@ export async function listDiffs(): Promise<DiffsResponse> {
 export interface DiffCreateBody {
   a: string
   b: string
-  options?: { hash: 'none' | 'full' | 'sample' }
+  options?: { hash: 'none' | 'sha256' }
 }
 
 export interface DiffCreateResponse {
@@ -316,6 +316,7 @@ export interface DiffEntry {
   a_mtime_ns: string | null
   b_mtime_ns: string | null
   size_delta: number | null
+  b_path?: string | null
 }
 
 export interface DiffEntriesResponse {

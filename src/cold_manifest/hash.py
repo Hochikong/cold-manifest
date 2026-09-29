@@ -5,7 +5,9 @@
 - policy=full 整文件哈希（sha256，与 sha256sum 逐字节一致）；sampled 只读
   首尾 sample_bytes 并把文件大小混入哈希（大文件快速指纹，非内容等值证明）；
 - 跨快照缓存：catalog.hash_cache 按 (size_bytes, mtime_ns, path_norm, algo)
-  复用哈希值——冷备多代快照间绝大多数文件不变，命中即免读盘；
+  复用哈希值——冷备多代快照间绝大多数文件不变，命中即免读盘。
+  注意：缓存键**不含 volume_id**，跨盘同名同大小同 mtime 的极端场景可能
+  复用旧哈希（文件系统语义下 (path, size, mtime) 相同通常意味着未改动）；
 - 可续算：只处理 hash_hex IS NULL 的条目，中断后重跑自动跳过已算的；
 - 只读打开数据文件（1MB 大块读），路径用 catalog.snapshots.host_path +
   entries.path（相对路径，'/' 分隔）拼接。
@@ -158,7 +160,8 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
     conn：**可写**打开的快照库连接（immutable 只读连接无法回写）。
     遍历 type='file' 且 hash_hex IS NULL 的条目（entry_id 升序）：
     - 缓存命中（catalog.hash_cache 同 size/mtime/path_norm/algo）→ 直接写回，
-      hash_state='cached'，不读盘；
+      hash_state=缓存行记录的实际策略（'full'/'sampled'；旧缓存行无 policy
+      时回退本次 policy），不读盘；
     - 未命中 → 读源文件计算，写回 hash_state='full'|'sampled' 并写缓存；
     - 文件不可读 → hash_state='error'，error 记原因，不中断整体。
     每 BATCH_SIZE 条一个事务提交；结束时写 meta（hash_policy/hash_algo/hash_scope）。
@@ -209,9 +212,11 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
                 last_id = r["entry_id"]
                 done += 1
 
-                cache_hex = _cache_lookup(cat, r, algo)
+                cache_hex, cache_policy = _cache_lookup(cat, r, algo)
                 if cache_hex is not None:
-                    updates.append((algo, cache_hex, "cached", r["entry_id"]))
+                    # hash_state 记实际策略（旧缓存行 policy 为 NULL 时回退本次 policy）
+                    updates.append((algo, cache_hex, cache_policy or policy,
+                                    r["entry_id"]))
                     cached += 1
                     continue
 
@@ -266,17 +271,22 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
 # ---------------------------------------------------------------- 内部辅助
 
 
-def _cache_lookup(cat: sqlite3.Connection, row: sqlite3.Row, algo: str) -> "str | None":
-    """查跨快照缓存；size/mtime 缺失（无法构成缓存键）时不查。"""
+def _cache_lookup(cat: sqlite3.Connection, row: sqlite3.Row,
+                  algo: str) -> "tuple[str, str | None]":
+    """查跨快照缓存；size/mtime 缺失（无法构成缓存键）时不查。
+
+    返回 (hash_hex, policy)；policy 为缓存行记录的实际策略（旧缓存行可能为
+    NULL），供 hash_state 回写，diff 侧据此判断哈希是否可信。
+    """
     if row["size_bytes"] is None or row["mtime_ns"] is None:
-        return None
+        return None, None
     path_norm = row["path_norm"] if row["path_norm"] is not None else row["path"].casefold()
     r = cat.execute(
-        "SELECT hash_hex FROM hash_cache"
+        "SELECT hash_hex, policy FROM hash_cache"
         " WHERE size_bytes=? AND mtime_ns=? AND path_norm=? AND algo=?",
         (row["size_bytes"], row["mtime_ns"], path_norm, algo),
     ).fetchone()
-    return r[0] if r else None
+    return (r[0], r[1]) if r else (None, None)
 
 
 def _cache_put(cat: sqlite3.Connection, row: sqlite3.Row, algo: str, hex_: str,

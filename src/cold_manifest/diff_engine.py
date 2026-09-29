@@ -3,7 +3,8 @@
 语义：
 - 仅 A 有 → removed；仅 B 有 → added；
 - 两侧都有：类型不同 → type_changed；
-  - hash 启用且两侧哈希均可用（hash_hex 非空且 hash_state != 'error'）时：
+  - hash 启用且两侧哈希均可用（hash_hex 非空且 hash_state == 'full'，sampled
+    只读首尾 64KB 不算内容等值证明）时：
     hash 不同 → content_changed（优先于 size/mtime，专抓"同尺寸同 mtime 改写"）；
     hash 相同 → 再按 mtime 判 mtime_changed / identical（此时忽略 size）；
   - hash 未启用或任一侧哈希不可用 → 依次 size_changed → mtime_changed → identical；
@@ -124,8 +125,12 @@ def _iter_entries(db: Path):
 
 
 def _hash_usable(row) -> bool:
-    """该条目哈希可用于比对：有 hash_hex 且状态非 error。"""
-    return bool(row[7]) and row[8] != "error"
+    """该条目哈希可用于内容等值比对：有 hash_hex 且 hash_state == 'full'。
+
+    sampled 只读首尾 64KB，不是内容等值证明——不能据此判 content_changed /
+    moved_or_renamed；'cached'（旧库遗留）同样不可信，一律回退 size/mtime 语义。
+    """
+    return bool(row[7]) and row[8] == "full"
 
 
 def _classify(ra, rb, hash_enabled: bool) -> str:

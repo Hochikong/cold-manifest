@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS entries(
   ext             TEXT,                    -- 小写扩展名（含点），无则 ''
   hash_algo       TEXT,                    -- NULL | 'sha256' | 'blake3'
   hash_hex        TEXT,
-  hash_state      TEXT,                    -- 'full' | 'sampled' | 'stale' | NULL
+  hash_state      TEXT,                    -- 'full' | 'sampled' | 'error' | 'stale' | NULL
+                                           -- （'cached' 已废弃：缓存命中写实际策略）
   path_norm       TEXT,                    -- casefold 后路径，跨文件系统比对用
   error           TEXT                     -- 采集该条目的非致命错误
 );
