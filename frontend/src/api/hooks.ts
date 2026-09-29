@@ -1,4 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useEffect, useRef, useState } from 'react'
 import {
   getHealth,
   listSnapshots,
@@ -16,6 +17,8 @@ import {
   listDiffEntries,
   scanImports,
   createImport,
+  createCollect,
+  cancelTask,
   listTasks,
   getTask,
   getSettings,
@@ -24,8 +27,10 @@ import {
   type DiffEntriesParams,
   type DiffCreateBody,
   type ImportCreateBody,
+  type CollectCreateBody,
   type ListTasksParams,
   type Task,
+  type TaskStatus,
 } from './client'
 
 export function useHealth() {
@@ -164,6 +169,20 @@ export function useCreateImport() {
   })
 }
 
+export function useCreateCollect() {
+  return useMutation({
+    mutationFn: (body: CollectCreateBody) => createCollect(body),
+  })
+}
+
+export function useCancelTask() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => cancelTask(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tasks'] }),
+  })
+}
+
 export function useTasks(params: ListTasksParams = {}, autoRefresh = false) {
   return useQuery({
     queryKey: ['tasks', params],
@@ -172,7 +191,9 @@ export function useTasks(params: ListTasksParams = {}, autoRefresh = false) {
     refetchInterval: (query) => {
       if (!autoRefresh) return false
       const tasks = query.state.data as { items: Task[] } | undefined
-      const active = tasks?.items.some((t) => t.status === 'pending' || t.status === 'running')
+      const active = tasks?.items.some(
+        (t) => t.status === 'pending' || t.status === 'running' || t.status === 'cancelling'
+      )
       return active ? 2_000 : false
     },
   })
@@ -187,9 +208,106 @@ export function useTask(id: string | undefined, autoRefresh = false) {
     refetchInterval: (query) => {
       if (!autoRefresh || !id) return false
       const task = query.state.data as Task | undefined
-      return task && (task.status === 'pending' || task.status === 'running') ? 1_000 : false
+      return task && (task.status === 'pending' || task.status === 'running' || task.status === 'cancelling') ? 1_000 : false
     },
   })
+}
+
+function isTerminalStatus(status: TaskStatus): boolean {
+  return status === 'done' || status === 'error' || status === 'cancelled'
+}
+
+export function useTaskEvents(taskId: string | undefined, enabled: boolean) {
+  const [task, setTask] = useState<Task | null>(null)
+  const [transport, setTransport] = useState<'sse' | 'poll' | null>(null)
+  const retryCountRef = useRef(0)
+
+  useEffect(() => {
+    if (!enabled || !taskId) {
+      setTask(null)
+      setTransport(null)
+      return
+    }
+
+    retryCountRef.current = 0
+    let closed = false
+    let es: EventSource | null = null
+    let pollTimer: number | null = null
+
+    const cleanup = () => {
+      if (closed) return
+      closed = true
+      es?.close()
+      es = null
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer)
+        pollTimer = null
+      }
+    }
+
+    const startPolling = () => {
+      if (closed) return
+      setTransport('poll')
+      const tick = async () => {
+        if (closed) return
+        try {
+          const t = await getTask(taskId)
+          if (!closed) {
+            setTask(t)
+            if (isTerminalStatus(t.status)) cleanup()
+          }
+        } catch {
+          // ignore polling errors
+        }
+      }
+      tick()
+      pollTimer = window.setInterval(tick, 1_000)
+    }
+
+    const connectSSE = () => {
+      if (closed) return
+      es = new EventSource(`/api/tasks/${encodeURIComponent(taskId)}/events?interval_ms=500`)
+
+      es.onopen = () => {
+        if (!closed) setTransport('sse')
+      }
+
+      es.onmessage = (event) => {
+        if (closed) return
+        try {
+          const t: Task = JSON.parse(event.data)
+          if (t === null || t === undefined) {
+            cleanup()
+            return
+          }
+          retryCountRef.current = 0
+          setTask(t)
+          if (isTerminalStatus(t.status)) cleanup()
+        } catch {
+          // ignore malformed frames
+        }
+      }
+
+      es.onerror = () => {
+        if (closed) return
+        retryCountRef.current += 1
+        if (retryCountRef.current > 2) {
+          es?.close()
+          es = null
+          startPolling()
+          return
+        }
+        es?.close()
+        es = null
+        window.setTimeout(connectSSE, 1_000)
+      }
+    }
+
+    connectSSE()
+    return cleanup
+  }, [taskId, enabled])
+
+  return { task, transport }
 }
 
 export function useSettings() {

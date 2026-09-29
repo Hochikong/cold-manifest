@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Card, Table, Button, Tag, Progress, Space, Typography, Empty, Spin } from 'antd'
-import { ReloadOutlined } from '@ant-design/icons'
-import { useTasks } from '../api/hooks'
+import { Card, Table, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal } from 'antd'
+import { ReloadOutlined, StopOutlined } from '@ant-design/icons'
+import { useTasks, useCancelTask } from '../api/hooks'
 import { listTasks, type Task } from '../api/client'
 import ErrorAlert from '../components/ErrorAlert'
+import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatDateTime } from '../utils/format'
 
 const { Text } = Typography
@@ -13,12 +14,15 @@ const PAGE_SIZE = 20
 const statusMap: Record<Task['status'], { label: string; color: string }> = {
   pending: { label: '待处理', color: 'default' },
   running: { label: '运行中', color: 'processing' },
+  cancelling: { label: '取消中', color: 'processing' },
+  cancelled: { label: '已取消', color: 'warning' },
   done: { label: '完成', color: 'success' },
   error: { label: '失败', color: 'error' },
 }
 
 const typeMap: Record<Task['type'], string> = {
   import: '导入',
+  collect: '采集',
 }
 
 export default function TasksPage() {
@@ -28,11 +32,23 @@ export default function TasksPage() {
   const [loadingMore, setLoadingMore] = useState(false)
 
   const { data, isLoading, error } = useTasks({ limit: PAGE_SIZE }, true)
+  const cancelTaskMutation = useCancelTask()
+  const hasPagedRef = useRef(false)
 
   useEffect(() => {
     if (data) {
-      setItems(data.items)
-      setCursor(data.next_cursor)
+      if (!hasPagedRef.current) {
+        // 未翻页：直接用首页刷新数据
+        setItems(data.items)
+        setCursor(data.next_cursor)
+      } else {
+        // 已翻页：按 id 合并首页新数据，保留已加载的尾部（翻页结果不在这里）
+        setItems((prev) => {
+          const seen = new Set(data.items.map((t) => t.id))
+          const tail = prev.filter((t) => !seen.has(t.id))
+          return [...data.items, ...tail]
+        })
+      }
     }
   }, [data])
 
@@ -41,11 +57,25 @@ export default function TasksPage() {
     setLoadingMore(true)
     try {
       const res = await listTasks({ limit: PAGE_SIZE, cursor })
+      hasPagedRef.current = true
       setItems((prev) => [...prev, ...res.items])
       setCursor(res.next_cursor)
     } finally {
       setLoadingMore(false)
     }
+  }
+
+  const handleCancel = (record: Task) => {
+    Modal.confirm({
+      title: '取消任务',
+      content: `确认取消 ${typeMap[record.type] ?? record.type} 任务 ${record.id.slice(0, 12)}… 吗？`,
+      okText: '确认取消',
+      okButtonProps: { danger: true, icon: <StopOutlined /> },
+      cancelText: '再等等',
+      onOk: async () => {
+        await cancelTaskMutation.mutateAsync(record.id)
+      },
+    })
   }
 
   const columns = [
@@ -85,6 +115,26 @@ export default function TasksPage() {
       render: (v: string | null) => formatDateTime(v),
     },
     {
+      title: '操作',
+      key: 'action',
+      width: 100,
+      render: (_: unknown, record: Task) => {
+        const cancellable = record.status === 'pending' || record.status === 'running' || record.status === 'cancelling'
+        if (!cancellable) return '-'
+        return (
+          <Button
+            size="small"
+            danger
+            icon={<StopOutlined />}
+            loading={cancelTaskMutation.isPending}
+            onClick={() => handleCancel(record)}
+          >
+            取消
+          </Button>
+        )
+      },
+    },
+    {
       title: '结果',
       key: 'result',
       width: 140,
@@ -102,6 +152,9 @@ export default function TasksPage() {
         }
         if (record.status === 'error' && record.error) {
           return <Text type="danger" ellipsis title={record.error}>失败</Text>
+        }
+        if (record.status === 'cancelled') {
+          return <Text type="warning">已取消</Text>
         }
         return '-'
       },
@@ -150,44 +203,26 @@ function ProgressCell({ task }: { task: Task }) {
   if (task.status === 'done') {
     return <Progress percent={100} size="small" status="success" />
   }
-  if (task.status === 'error') {
+  if (task.status === 'error' || task.status === 'cancelled' || task.status === 'cancelling') {
     return (
-      <Space direction="vertical" size={0} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={0} style={{ width: '100%' }}>
         <Progress percent={100} size="small" status="exception" showInfo={false} />
-        <Text type="danger" style={{ fontSize: 12 }}>{task.error || '任务失败'}</Text>
+        <Text type="danger" style={{ fontSize: 12 }}>{task.error || formatTaskStatus(task.status)}</Text>
       </Space>
     )
   }
   if (task.progress == null) {
     return (
-      <Space direction="vertical" size={0} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={0} style={{ width: '100%' }}>
         <Progress percent={0} size="small" status="active" showInfo={false} />
-        <Text type="secondary" style={{ fontSize: 12 }}>{formatMessage(task.message)}</Text>
+        <Text type="secondary" style={{ fontSize: 12 }}>{formatTaskMessage(task.message)}</Text>
       </Space>
     )
   }
   return (
-    <Space direction="vertical" size={0} style={{ width: '100%' }}>
+    <Space orientation="vertical" size={0} style={{ width: '100%' }}>
       <Progress percent={Math.round(task.progress * 100)} size="small" status="active" />
-      <Text type="secondary" style={{ fontSize: 12 }}>{formatMessage(task.message)}</Text>
+      <Text type="secondary" style={{ fontSize: 12 }}>{formatTaskMessage(task.message)}</Text>
     </Space>
   )
-}
-
-function formatMessage(message: string | null): string {
-  if (!message) return '准备中'
-  if (message.startsWith('parse:')) {
-    const parts = message.split(':')[1]
-    if (parts) {
-      const [done] = parts.split('/')
-      return `已解析 ${Number(done).toLocaleString('zh-CN')} 行`
-    }
-  }
-  const m = message.match(/^(\w+):(\d+)\/(\d+)$/)
-  if (m) {
-    const [, phase, done, total] = m
-    const phaseName = phase === 'seal' ? '封存' : phase === 'done' ? '完成' : phase
-    return `${phaseName} ${done}/${total}`
-  }
-  return message
 }

@@ -211,6 +211,8 @@ def _write_unsealed_db(dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(dest_dir / "snapshot.db"))
     conn.executescript(SNAPSHOT_TABLES_DDL)
+    # collector_version：标记为本工具采集产生的脏库（孤儿清扫口径 seal.is_collect_orphan）
+    conn.execute("INSERT INTO meta(key, value) VALUES('collector_version', '0.0.0-test')")
     conn.execute("INSERT INTO meta(key, value) VALUES('status', 'draft')")
     conn.commit()
     conn.close()
@@ -303,7 +305,7 @@ def test_collect_seal_failure_no_sealed_marker(tmp_path: Path, probe_env, monkey
     scan_root = tmp_path / "vol"
     _make_tree(scan_root)
 
-    def boom(_conn):
+    def boom(_conn, progress=None):
         raise sqlite3.OperationalError("no such table: dir_rollup")
 
     monkeypatch.setattr("cold_manifest.collect.seal_snapshot", boom)

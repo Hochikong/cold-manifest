@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
+from .api.routes_collect import router as collect_router
 from .api.routes_diffs import router as diffs_router
 from .api.routes_imports import router as imports_router
 from .api.routes_misc import router as misc_router
@@ -50,6 +51,7 @@ def create_app(data_root: "str | None" = None) -> FastAPI:
     app.include_router(diffs_router)
     app.include_router(misc_router)
     app.include_router(imports_router)
+    app.include_router(collect_router)
     app.include_router(tasks_router)
 
     if _FRONTEND_DIST.is_dir():

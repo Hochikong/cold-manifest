@@ -26,6 +26,7 @@ import {
 import { useVolumes, useSnapshots, useDiffs } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import ImportDialog from '../components/ImportDialog'
+import CollectDialog from '../components/CollectDialog'
 import { formatFileSize, formatDateTime } from '../utils/format'
 
 const { Title } = Typography
@@ -33,6 +34,7 @@ const { Title } = Typography
 export default function OverviewPage() {
   const navigate = useNavigate()
   const [importOpen, setImportOpen] = useState(false)
+  const [collectOpen, setCollectOpen] = useState(false)
   const { data: volumes, isLoading: volLoading, error: volError } = useVolumes()
   const { data: snapshots, isLoading: snapLoading, error: snapError } = useSnapshots()
   const { data: diffs, isLoading: diffLoading, error: diffError } = useDiffs()
@@ -147,7 +149,7 @@ export default function OverviewPage() {
 
       <Card style={{ marginTop: 16 }}>
         <Space>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => navigate('/tasks')}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => setCollectOpen(true)}>
             开始采集
           </Button>
           <Button icon={<ImportOutlined />} onClick={() => setImportOpen(true)}>
@@ -157,6 +159,7 @@ export default function OverviewPage() {
       </Card>
 
       <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} />
+      <CollectDialog open={collectOpen} onClose={() => setCollectOpen(false)} />
 
       <Card title="磁盘与卷" style={{ marginTop: 16 }}>
         {volumes?.count ? (

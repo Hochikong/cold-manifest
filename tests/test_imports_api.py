@@ -108,7 +108,7 @@ def test_post_409_duplicate_active(client, legacy_snap: Path, monkeypatch) -> No
     # 慢速假导入，制造 running 窗口
     orig = _FN_REGISTRY["import"]
 
-    def slow(payload, cb):
+    def slow(payload, cb, cancel_event=None):
         time.sleep(1.0)
         return orig(payload, cb)
 

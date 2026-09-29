@@ -43,6 +43,10 @@ class ScanStats:
     elapsed_s: float = 0.0
 
 
+class ScanCancelled(Exception):
+    """扫描被取消（cancel_event 置位）。由 collect 层转换为 CollectCancelled。"""
+
+
 class EntryWriter(Protocol):
     def add_entry(
         self,
@@ -132,8 +136,10 @@ def scan_tree(
     exclude_globs: list[str] | None = None,
     exclude_hidden: bool = False,
     include_system: bool = True,
+    cancel_event: "object | None" = None,
     progress_cb: Callable[[int, int], None] | None = None,
 ) -> ScanStats:
+    """cancel_event：目录粒度取消检查（threading.Event），置位时抛 ScanCancelled。"""
     stats = ScanStats()
     t0 = time.monotonic()
     root = os.fspath(root)
@@ -169,6 +175,8 @@ def scan_tree(
     # (parent_id, 相对前缀, 子项 depth, 绝对路径)
     stack: list[tuple[int, str, int, str]] = [(root_id, "", 1, root)]
     while stack:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ScanCancelled("扫描已取消")
         parent_id, prefix, depth, dpath = stack.pop()
         try:
             it = os.scandir(dpath)

@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -23,9 +25,9 @@ from . import __version__
 from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume,
                       register_snapshot, snapshot_path, validate_volume_id)
 from .probe import DiskInfo, ProbeError, VolumeInfo, probe_path
-from .scanner import scan_tree
+from .scanner import ScanCancelled, scan_tree
 from .schema import SNAPSHOT_TABLES_DDL
-from .seal import seal_snapshot
+from .seal import is_collect_orphan, is_sealed, seal_snapshot
 
 # 盘上副本的空间余量：库大小 + 64 MiB（旁车与临时空间）
 _COPY_MARGIN_BYTES = 64 * 1024 * 1024
@@ -33,9 +35,15 @@ _BATCH_SIZE = 10_000
 
 ProgressCB = Callable[[str, int, "int | None"], None]
 
+_log = logging.getLogger(__name__)
+
 
 class CollectError(Exception):
     """采集失败（probe 失败、非法 volume_id、目标已存在等）。"""
+
+
+class CollectCancelled(CollectError):
+    """采集被取消。取消=丢弃本次：目标目录与临时文件由引擎清理，不做续采。"""
 
 
 @dataclass
@@ -107,16 +115,27 @@ def _sha256_file(path: Path, chunk: int = 4 * 1024 * 1024) -> str:
     return h.hexdigest()
 
 
-def _copy_with_hash(src: Path, dst: Path) -> str:
-    """流式拷贝 src → dst，同时计算 sha256（单遍读）。"""
+def _copy_with_hash(src: Path, dst: Path, cancel_event: "threading.Event | None" = None,
+                    progress_cb: "Callable[[int, int], None] | None" = None,
+                    total_bytes: "int | None" = None) -> str:
+    """流式拷贝 src → dst，同时计算 sha256（单遍读）。
+
+    cancel_event：块循环逐块检查（CollectCancelled）；progress_cb(done_bytes, total_bytes)。
+    """
     h = hashlib.sha256()
+    done = 0
     with src.open("rb") as fin, dst.open("wb") as fout:
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise CollectCancelled("采集已取消（copy 阶段）")
             block = fin.read(4 * 1024 * 1024)
             if not block:
                 break
             h.update(block)
             fout.write(block)
+            done += len(block)
+            if progress_cb is not None:
+                progress_cb(done, total_bytes if total_bytes is not None else done)
     return h.hexdigest()
 
 
@@ -168,30 +187,25 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
 
 
 def _is_sealed(db_path: Path) -> bool:
-    """快照库是否已封库（meta 中存在 status=sealed）。与 import_legacy 同口径。"""
-    try:
-        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
-    except sqlite3.Error:
-        return False
-    try:
-        row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
-        return bool(row) and row[0] == "sealed"
-    except sqlite3.Error:
-        return False
+    """快照库是否已封库。与 import_legacy / 任务层孤儿清扫同口径（seal.is_sealed）。"""
+    return is_sealed(db_path)
 
 
 def _sweep_leftovers(data_root: Path, volume_id: str, keep_ts: str,
                      warnings: list[str]) -> None:
-    """清扫同 volume_id 下未 sealed 的其他残留目录（上次采集崩溃留下的脏库）。"""
+    """清扫同 volume_id 下未 sealed 的残留目录（上次采集崩溃留下的脏库）。
+
+    孤儿判定与任务层共用 seal.is_collect_orphan（含 collector_version 守卫，
+    外部/测试库不动）。
+    """
     vol_root = data_root / volume_id
     if not vol_root.is_dir():
         return
     for child in vol_root.iterdir():
         if not child.is_dir() or child.name == keep_ts:
             continue
-        db = child / "snapshot.db"
-        if db.exists() and _is_sealed(db):
-            continue  # 已封库的历史快照，不动
+        if not is_collect_orphan(child):
+            continue  # 已封库的历史快照或非本工具产生的库，不动
         try:
             shutil.rmtree(child)
         except OSError as exc:
@@ -202,10 +216,14 @@ def _sweep_leftovers(data_root: Path, volume_id: str, keep_ts: str,
 
 def _copy_to_disk(scan_root: Path, volume_id: str, ts: str, db_path: Path,
                   stats: dict, warnings: list[str],
-                  host_sha256: str) -> tuple[Path | None, str | None]:
+                  host_sha256: str,
+                  cancel_event: "threading.Event | None" = None,
+                  copy_progress: "Callable[[int, int], None] | None" = None,
+                  ) -> tuple[Path | None, str | None]:
     """§4.6 盘上副本：``<scan_root>/_coldmanifest/<volume_id>/<ts>/snapshot.db`` + snapshot.json。
 
     返回 (副本路径或 None, 副本 sha256 或 None)；空间不足/失败只记 warning，不抛异常。
+    copy_progress(done_bytes, total_bytes)：按字节的拷贝进度。
     """
     db_size = db_path.stat().st_size
     try:
@@ -224,7 +242,8 @@ def _copy_to_disk(scan_root: Path, volume_id: str, ts: str, db_path: Path,
         copy_dir.mkdir(parents=True, exist_ok=True)
         # 残留 .tmp 可重跑：直接覆盖；sha256 复用封库时已算好的主机哈希
         host_hash = host_sha256
-        copy_hash = _copy_with_hash(db_path, tmp)
+        copy_hash = _copy_with_hash(db_path, tmp, cancel_event=cancel_event,
+                                    progress_cb=copy_progress, total_bytes=db_size)
         if copy_hash != host_hash:
             tmp.unlink(missing_ok=True)
             warnings.append("on_disk_copy=failed(sha_mismatch)")
@@ -314,11 +333,15 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
                    exclude_globs: list[str] | None = None, exclude_hidden: bool = False,
                    include_system: bool = True, smartctl: bool = True,
                    on_disk_copy: bool = True,
+                   cancel_event: "threading.Event | None" = None,
                    progress_cb: ProgressCB | None = None) -> CollectResult:
     """采集一个卷：probe → scan → seal → 盘上副本 → catalog 注册。
 
     progress_cb(phase, done, total)，phase ∈ {"probe","scan","seal","copy","register","done"}；
-    scan 阶段 total=None（流式，总数未知）。
+    scan 阶段 total=None（流式，总数未知）；copy 按字节回调；seal 拆
+    index/rollup(depth 多步)/optimize 细粒度步骤。取消检查在 scanner 目录
+    粒度与 copy 块循环；**取消=丢弃本次**：未封库的目标目录与盘上 .tmp 副本
+    会被删除，不做续采。
     """
     t0 = time.monotonic()
     warnings: list[str] = []
@@ -326,6 +349,10 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
     if not scan_root.is_dir():
         raise CollectError(f"扫描根不存在或不是目录：{scan_root}")
     data_root = Path(data_root)
+
+    def _check_cancel() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise CollectCancelled("采集已取消")
 
     if progress_cb is not None:
         progress_cb("probe", 0, 1)
@@ -365,7 +392,16 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         shutil.rmtree(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
+    def _cleanup_cancelled() -> None:
+        """取消=丢弃本次：删除未封库的目标目录与盘上副本临时目录（无续采）。"""
+        for p in (dest_dir, Path(scan_root) / "_coldmanifest" / volume_id / ts):
+            try:
+                shutil.rmtree(p)
+            except OSError as exc:
+                _log.warning("取消清理失败（残留 %s）：%s", p, exc)
+
     try:
+        _check_cancel()
         conn = sqlite3.connect(str(db_path))
         try:
             conn.execute("PRAGMA journal_mode=OFF")
@@ -376,27 +412,32 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
             _write_meta(conn, scan_root, volume_id, vol, disk, ts,
                         exclude_globs, exclude_hidden, include_system)
             writer = _SQLiteEntryWriter(conn)
+            _check_cancel()
             scan_stats = scan_tree(
                 scan_root, writer,
                 exclude_globs=exclude_globs, exclude_hidden=exclude_hidden,
                 include_system=include_system,
+                cancel_event=cancel_event,
                 progress_cb=(lambda done, _bytes: progress_cb("scan", done, None))
                 if progress_cb is not None else None,
             )
             writer._flush_skipped()
             skipped_count = conn.execute("SELECT COUNT(*) FROM skipped").fetchone()[0]
 
+            _check_cancel()
             if progress_cb is not None:
-                progress_cb("seal", 0, 3)
+                progress_cb("seal", 0, 1)
             try:
-                seal_snapshot(conn)
+                # seal 内部步骤粒度（index 1 步 + rollup 按 depth 多步 + optimize 1 步）
+                seal_snapshot(conn, progress=(lambda d, t: progress_cb("seal", d, t))
+                              if progress_cb is not None else None)
             except sqlite3.Error as e:
                 raise CollectError(f"封库失败：{e}") from e
             # status=sealed 在封库成功后写入：seal 中途失败不应留下 sealed 标记
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('status', 'sealed')")
             conn.commit()
             if progress_cb is not None:
-                progress_cb("seal", 3, 3)
+                progress_cb("seal", 1, 1)
 
             stats = {
                 "file_count": conn.execute(
@@ -415,32 +456,45 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
             }
         finally:
             conn.close()
+
+        _check_cancel()
+        host_sha = _sha256_file(db_path)
+
+        on_disk_path: Path | None = None
+        on_disk_sha: str | None = None
+        if on_disk_copy:
+            copy_total = db_path.stat().st_size
+            if progress_cb is not None:
+                progress_cb("copy", 0, copy_total)
+            on_disk_path, on_disk_sha = _copy_to_disk(
+                scan_root, volume_id, ts, db_path, stats, warnings, host_sha256=host_sha,
+                cancel_event=cancel_event,
+                copy_progress=(lambda d, t: progress_cb("copy", d, t))
+                if progress_cb is not None else None)
+            if progress_cb is not None:
+                progress_cb("copy", copy_total, copy_total)
+
+        _check_cancel()
+        if progress_cb is not None:
+            progress_cb("register", 0, 1)
+        collected_at = datetime.strptime(ts, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%dT%H:%M:%SZ")
+        _register_catalog(data_root, sid, volume_id, vol, disk, stats,
+                          exclude_globs, exclude_hidden, on_disk_copy,
+                          on_disk_path, on_disk_sha, collected_at, warnings)
+        if progress_cb is not None:
+            progress_cb("register", 1, 1)
+            progress_cb("done", 1, 1)
+    except CollectCancelled:
+        _cleanup_cancelled()
+        raise
+    except ScanCancelled:
+        _cleanup_cancelled()
+        raise CollectCancelled("采集已取消（scan 阶段）") from None
     except CollectError:
         raise
     except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError) as e:
         # 统一兜底：扫描/封库/统计阶段的底层错误 → CollectError（CLI 退出码 2）
         raise CollectError(f"采集失败：{e}") from e
-    host_sha = _sha256_file(db_path)
-
-    on_disk_path: Path | None = None
-    on_disk_sha: str | None = None
-    if on_disk_copy:
-        if progress_cb is not None:
-            progress_cb("copy", 0, 1)
-        on_disk_path, on_disk_sha = _copy_to_disk(
-            scan_root, volume_id, ts, db_path, stats, warnings, host_sha256=host_sha)
-        if progress_cb is not None:
-            progress_cb("copy", 1, 1)
-
-    if progress_cb is not None:
-        progress_cb("register", 0, 1)
-    collected_at = datetime.strptime(ts, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%dT%H:%M:%SZ")
-    _register_catalog(data_root, sid, volume_id, vol, disk, stats,
-                      exclude_globs, exclude_hidden, on_disk_copy,
-                      on_disk_path, on_disk_sha, collected_at, warnings)
-    if progress_cb is not None:
-        progress_cb("register", 1, 1)
-        progress_cb("done", 1, 1)
 
     return CollectResult(
         snapshot_id=sid, volume_id=volume_id, db_path=db_path,

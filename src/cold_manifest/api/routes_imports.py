@@ -129,7 +129,7 @@ class ImportBody(BaseModel):
     force: bool = False
 
 
-def _run_import(payload: dict, progress_cb: Any) -> dict:
+def _run_import(payload: dict, progress_cb: Any, cancel_event: Any = None) -> dict:
     """工作线程执行体（经 tasks._FN_REGISTRY 调用）。"""
     result: ImportResult = import_snapshot(
         payload["snapshot_dir"], payload["data_root"],
@@ -157,11 +157,12 @@ def submit_import(body: ImportBody, request: Request) -> dict:
         raise HTTPException(status_code=400, detail=f"path 不在允许的导入根内：{body.snapshot_dir}")
 
     runner: TaskRunner = request.app.state.task_runner
-    if runner.has_active_for(str(d.resolve())):
-        raise HTTPException(status_code=409,
-                            detail="同目录已有 pending/running 的导入任务")
 
     payload = {"snapshot_dir": str(d.resolve()), "volume_id": body.volume_id,
                "force": body.force, "data_root": str(get_state(request).data_root)}
-    task_id = runner.submit(_KIND_IMPORT, payload, _run_import)
+    # 提交去重（check+insert 锁内完成）；None=已有同目录任务
+    task_id = runner.submit_dedup(_KIND_IMPORT, payload, field="snapshot_dir")
+    if task_id is None:
+        raise HTTPException(status_code=409,
+                            detail="同目录已有 pending/running 的导入任务")
     return {"task_id": task_id, "status": "pending"}

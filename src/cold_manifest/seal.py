@@ -5,14 +5,15 @@ import_legacy（CSV 导入）与 collect（在线采集）共用；库表结构�
 """
 
 import sqlite3
+from pathlib import Path
+from typing import Callable
 
 from .schema import SNAPSHOT_INDEXES_DDL
-
-
-def build_dir_rollup(conn: sqlite3.Connection) -> None:
+def build_dir_rollup(conn: sqlite3.Connection, step_done: "Callable[[], None] | None" = None) -> None:
     """dir_rollup：每个目录的**后代**统计（不含自身），root 覆盖全库。
 
     做法：先按直接子项聚合，再按深度自底向上合并子目录的聚合值。
+    step_done：可选回调，每完成一个 depth 合并步调用一次（封库进度粒度）。
     """
     conn.execute(
         """
@@ -61,6 +62,8 @@ def build_dir_rollup(conn: sqlite3.Connection) -> None:
             """,
             (depth,),
         )
+        if step_done is not None:
+            step_done()
     conn.execute(
         """
         INSERT OR REPLACE INTO dir_rollup(entry_id, file_count, dir_count, total_bytes, total_allocated, max_mtime_ns)
@@ -72,9 +75,68 @@ def build_dir_rollup(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE agg")
 
 
-def seal_snapshot(conn: sqlite3.Connection) -> None:
-    """封库收尾：建索引 → dir_rollup → PRAGMA optimize → commit。"""
+def seal_snapshot(conn: sqlite3.Connection,
+                  progress: "Callable[[int, int], None] | None" = None) -> None:
+    """封库收尾：建索引 → dir_rollup → PRAGMA optimize → commit。
+
+    progress(done, total)：细粒度步骤——建索引 1 步、dir_rollup 按 depth
+    多步（max_depth+1）、optimize 1 步，total = max_depth + 3。
+    """
+    max_depth = conn.execute(
+        "SELECT COALESCE(MAX(depth), 0) FROM entries WHERE type='dir'").fetchone()[0]
+    total = max_depth + 3
+    done = 0
+
+    def tick() -> None:
+        nonlocal done
+        done += 1
+        if progress is not None:
+            progress(done, total)
+
     conn.executescript(SNAPSHOT_INDEXES_DDL)
-    build_dir_rollup(conn)
+    tick()
+    build_dir_rollup(conn, step_done=tick)
     conn.execute("PRAGMA optimize")
+    tick()
     conn.commit()
+
+
+def is_collect_orphan(ts_dir: Path) -> bool:
+    """ts 目录是否为本工具采集产生的未封库孤儿（可安全删除）。
+
+    tasks.TaskRunner 启动清扫与 collect._sweep_leftovers 共用同一判定口径：
+    - snapshot.db 缺失 → 建库前崩溃残留，孤儿；
+    - snapshot.db 存在 → 须带 collector_version meta（确认采集产生）且未 sealed；
+      打不开/缺 meta 的库保守起见不动（可能是外部/测试数据）。
+    """
+    db = ts_dir / "snapshot.db"
+    if not db.is_file():
+        return True
+    try:
+        conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        keys = {r[0] for r in conn.execute("SELECT key FROM meta").fetchall()}
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    if "collector_version" not in keys:
+        return False
+    return not is_sealed(db)
+
+
+def is_sealed(db_path) -> bool:
+    """快照库是否已封库（meta 中存在 status=sealed）。库缺失/损坏 → False。"""
+    try:
+        conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
+        return bool(row) and row[0] == "sealed"
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()

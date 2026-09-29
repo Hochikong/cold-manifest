@@ -344,7 +344,6 @@ def import_snapshot(snapshot_dir: "str | Path", data_root: "str | Path",
             ("dirs_source", "derived"),
             ("allocated_source", "logical_size_fallback"),
             ("import_time_utc", now),
-            ("status", "sealed"),
         ]
         conn.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", meta_rows)
         conn.commit()
@@ -353,6 +352,10 @@ def import_snapshot(snapshot_dir: "str | Path", data_root: "str | Path",
         from .seal import seal_snapshot
 
         seal_snapshot(conn)
+        # status=sealed 在封库成功后写入（镜像 collect.py）：seal 中途崩溃不应留下
+        # 假 sealed 库——否则重导入会被 skip、启动孤儿清扫也不会清理它
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('status', 'sealed')")
+        conn.commit()
 
         if progress_cb is not None:
             progress_cb("seal", 3, 3)

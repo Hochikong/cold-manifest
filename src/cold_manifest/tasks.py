@@ -13,22 +13,39 @@
 
 import base64
 import json
+import logging
 import queue
+import shutil
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from .db import init_catalog, open_catalog
+from .seal import is_collect_orphan
 
 # 进度回调频率限制：写 DB 不宜过密（3M 行 tree.csv 每 5 万行一次已够）
 ProgressCb = Callable[[str, int, int], None]
 
+# 进度写库节流：≥200ms 才落一次盘（74k 条目/s 的 copy/scan 回调不能逐条直写）
+_PROGRESS_MIN_INTERVAL_S = 0.2
+
+# 终态集合
+_TERMINAL_STATUSES = ("done", "error", "cancelled")
+
+_log = logging.getLogger(__name__)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _is_collect_orphan(ts_dir: Path) -> bool:
+    """兼容别名：孤儿判定已抽取到 seal.py（与 collect._sweep_leftovers 同口径）。"""
+    return is_collect_orphan(ts_dir)
 
 
 def new_task_id() -> str:
@@ -46,6 +63,8 @@ class TaskRunner:
         self._thread: "threading.Thread | None" = None
         self._stop = threading.Event()
         self._lock = threading.Lock()  # submit 侧串行化 catalog 写
+        # 运行中任务的取消事件（task_id → Event）；任务终态后移除
+        self._cancel_events: "dict[str, threading.Event]" = {}
 
     # ------------------------------------------------------------ 生命周期
 
@@ -77,6 +96,40 @@ class TaskRunner:
         self._conn.commit()
         for r in rows:
             self._queue.put(r["task_id"])
+        self._sweep_orphan_snapshots()
+
+    def _sweep_orphan_snapshots(self) -> None:
+        """清扫 data_root 下未 sealed 的快照目录（进程崩溃/取消残留的孤儿）。
+
+        遍历 <data_root>/<volume_id>/<ts>/：
+        - snapshot.db 缺失（建库前崩溃的空目录）→ 删除；
+        - snapshot.db 存在但未 sealed 且带 collector_version meta（确认是本工具
+          采集产生的脏库）→ 删除；无 collector_version 的库（外部/测试数据）不动。
+        下划线开头的顶层目录（_diffs 等内部目录）跳过。只记日志，不抛异常。
+        """
+        if not self.data_root.is_dir():
+            return
+        try:
+            vol_dirs = [d for d in self.data_root.iterdir()
+                        if d.is_dir() and not d.name.startswith("_")]
+        except OSError as e:
+            _log.warning("孤儿清扫：遍历 data_root 失败：%s", e)
+            return
+        for vol_dir in vol_dirs:
+            try:
+                ts_dirs = [d for d in vol_dir.iterdir() if d.is_dir()]
+            except OSError as e:
+                _log.warning("孤儿清扫：遍历 %s 失败：%s", vol_dir, e)
+                continue
+            for ts_dir in ts_dirs:
+                if not _is_collect_orphan(ts_dir):
+                    continue
+                try:
+                    shutil.rmtree(ts_dir)
+                except OSError as e:
+                    _log.warning("孤儿清扫：删除 %s 失败：%s", ts_dir, e)
+                else:
+                    _log.info("孤儿清扫：删除未封库快照目录 %s", ts_dir)
 
     def stop(self, timeout: float = 10.0) -> None:
         """优雅退出：置 stop、唤醒队列、join 工作线程。
@@ -97,10 +150,11 @@ class TaskRunner:
 
     # ------------------------------------------------------------ 提交 / 查询
 
-    def submit(self, kind: str, payload: dict, fn: Callable[[ProgressCb], Any]) -> str:
+    def submit(self, kind: str, payload: dict) -> str:
         """登记任务（catalog.tasks 插行）并入队，返回 task_id。
 
-        fn(progress_cb) 在工作线程执行；返回值经 json 序列化写入 result_json。
+        fn 由 kind 经 _FN_REGISTRY 注册，工作线程按 kind 还原执行；
+        返回值经 json 序列化写入 result_json。
         """
         task_id = new_task_id()
         now = _now()
@@ -113,6 +167,41 @@ class TaskRunner:
             self._conn.commit()
         self._queue.put(task_id)
         return task_id
+
+    def submit_dedup(self, kind: str, payload: dict, field: str) -> "str | None":
+        """带去重的提交：锁内完成 check+insert（消除提交去重竞态）。
+
+        同 kind+field 值已有 pending/running 任务 → 返回 None（不插行）；
+        否则插行入队，返回 task_id。
+        """
+        key = payload.get(field)
+        with self._lock:
+            if self._has_active_for_locked(key, kind=kind, field=field):
+                return None
+            task_id = new_task_id()
+            self._conn.execute(
+                "INSERT INTO tasks(task_id, kind, payload_json, status, created_at)"
+                " VALUES(?,?,?,?,?)",
+                (task_id, kind, json.dumps(payload, ensure_ascii=False), "pending", _now()),
+            )
+            self._conn.commit()
+        self._queue.put(task_id)
+        return task_id
+
+    def _has_active_for_locked(self, key, *, kind: "str | None", field: str) -> bool:
+        """has_active_for 的锁内版本（调用方须已持有 _lock）。"""
+        sql = "SELECT kind, payload_json FROM tasks WHERE status IN ('pending','running')"
+        params: "list[Any]" = []
+        if kind is not None:
+            sql += " AND kind=?"
+            params.append(kind)
+        for r in self._conn.execute(sql, params).fetchall():
+            try:
+                if json.loads(r["payload_json"]).get(field) == key:
+                    return True
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return False
 
     def get_task(self, task_id: str) -> "dict | None":
         """任务行 → 契约 Task dict；不存在返回 None。可用任意线程调用。"""
@@ -145,18 +234,57 @@ class TaskRunner:
             next_cursor = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
         return [_task_row_to_dict(r) for r in rows], next_cursor, has_more
 
-    def has_active_for(self, key: str) -> bool:
-        """同目录（payload.snapshot_dir）是否已有 pending/running 任务。"""
-        rows = self._conn.execute(
-            "SELECT payload_json FROM tasks WHERE status IN ('pending','running')"
-        ).fetchall()
-        for r in rows:
+    def has_active_for(self, key: str, *, kind: "str | None" = None,
+                       field: str = "snapshot_dir") -> bool:
+        """同 dedupe 键是否已有 pending/running 任务。
+
+        kind：限定任务类型（import/collect 各自 dedupe）；field：payload 内
+        作为去重键的字段（import=snapshot_dir，collect=path）。
+        """
+        sql = "SELECT kind, payload_json FROM tasks WHERE status IN ('pending','running')"
+        params: "list[Any]" = []
+        if kind is not None:
+            sql += " AND kind=?"
+            params.append(kind)
+        for r in self._conn.execute(sql, params).fetchall():
             try:
-                if json.loads(r["payload_json"]).get("snapshot_dir") == key:
+                if json.loads(r["payload_json"]).get(field) == key:
                     return True
             except (json.JSONDecodeError, TypeError):
                 continue
         return False
+
+    # ------------------------------------------------------------ 取消
+
+    def cancel(self, task_id: str) -> str:
+        """取消任务：pending 直接置 cancelled；running 置 cancel 事件（引擎协作取消）。
+
+        返回任务当前状态（pending → "cancelled"，running → "cancelling"，
+        工作线程随后落终态 cancelled）。
+        KeyError=任务不存在；ValueError=已终态（不可取消）。
+        """
+        row = self._conn.execute(
+            "SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        status = row["status"]
+        if status in _TERMINAL_STATUSES:
+            raise ValueError(f"任务已终态，不可取消：{status}")
+        if status == "pending":
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE tasks SET status='cancelled', finished_at=?, error='任务取消（未执行）'"
+                    " WHERE task_id=?",
+                    (_now(), task_id),
+                )
+                self._conn.commit()
+            return "cancelled"
+        ev = self._cancel_events.get(task_id)
+        if ev is not None:
+            ev.set()
+        # "cancelling" 仅作为 cancel POST 的响应值，不落库：running 行保持
+        # status='running'，工作线程随后协作取消并落终态 cancelled
+        return "cancelling"
 
     # ------------------------------------------------------------ 工作线程
 
@@ -170,13 +298,24 @@ class TaskRunner:
             row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             if row is None or row["status"] not in ("pending",):
                 continue  # stop 后遗留的排队任务
-            conn.execute(
-                "UPDATE tasks SET status='running', started_at=?, message='' WHERE task_id=?",
+            # CAS 认领：仅当仍为 pending 时置 running，消除与 cancel 的竞态
+            # （cancel 先把 pending 置 cancelled → rowcount=0 → 跳过，任务不复活）
+            cur = conn.execute(
+                "UPDATE tasks SET status='running', started_at=?, message=''"
+                " WHERE task_id=? AND status='pending'",
                 (_now(), task_id),
             )
             conn.commit()
+            if cur.rowcount == 0:
+                continue  # 已被取消（或其他线程认领），不执行
 
             def cb(phase: str, done: int, total: int, _tid: str = task_id) -> None:
+                # 节流：≥200ms 落一次盘；末帧（done>=total）恒写，保证阶段收尾可见
+                now = time.monotonic()
+                final = bool(total) and done >= total
+                if not final and (now - last_write[0]) < _PROGRESS_MIN_INTERVAL_S:
+                    return
+                last_write[0] = now
                 progress = round(done / total, 4) if total and total > 0 else None
                 conn.execute(
                     "UPDATE tasks SET progress=?, message=? WHERE task_id=?",
@@ -184,35 +323,52 @@ class TaskRunner:
                 )
                 conn.commit()
 
+            last_write = [0.0]
+            ev = threading.Event()
+            self._cancel_events[task_id] = ev
             try:
-                result = _invoke(row, cb)
+                result = _invoke(row, cb, ev)
+                # 成功恒 done：fn 正常返回即视为完成，不因 cancel_event 置位改判
+                # cancelled（cancelled 只走异常分支）
                 conn.execute(
                     "UPDATE tasks SET status='done', progress=1.0, finished_at=?, result_json=?"
                     " WHERE task_id=?",
                     (_now(), json.dumps(result, ensure_ascii=False, default=str), task_id),
                 )
             except Exception as e:  # noqa: BLE001 — 任务失败入 error 行，不杀线程
-                conn.execute(
-                    "UPDATE tasks SET status='error', finished_at=?, error=? WHERE task_id=?",
-                    (_now(), f"{type(e).__name__}: {e}", task_id),
-                )
+                if ev.is_set():
+                    conn.execute(
+                        "UPDATE tasks SET status='cancelled', finished_at=?, error=? WHERE task_id=?",
+                        (_now(), f"cancelled: {type(e).__name__}: {e}", task_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status='error', finished_at=?, error=? WHERE task_id=?",
+                        (_now(), f"{type(e).__name__}: {e}", task_id),
+                    )
+            finally:
+                self._cancel_events.pop(task_id, None)
             conn.commit()
 
 
-def _invoke(row: sqlite3.Row, cb: ProgressCb) -> Any:
-    """从 task 行还原 fn 并执行。fn 由 kind 决定，经 _FN_REGISTRY 注册。"""
+def _invoke(row: sqlite3.Row, cb: ProgressCb, cancel_event: "threading.Event | None" = None) -> Any:
+    """从 task 行还原 fn 并执行。fn 由 kind 决定，经 _FN_REGISTRY 注册。
+
+    fn 签名 fn(payload, progress_cb, cancel_event)；cancel_event 供
+    collect 等长任务协作取消，import 等短任务可忽略。
+    """
     fn = _FN_REGISTRY.get(row["kind"])
     if fn is None:
         raise RuntimeError(f"未知任务类型：{row['kind']}")
     payload = json.loads(row["payload_json"])
-    return fn(payload, cb)
+    return fn(payload, cb, cancel_event)
 
 
-# kind → fn(payload, progress_cb)。由各路由模块在导入时注册，避免 tasks.py 依赖业务层。
-_FN_REGISTRY: "dict[str, Callable[[dict, ProgressCb], Any]]" = {}
+# kind → fn(payload, progress_cb, cancel_event)。由各路由模块在导入时注册，避免 tasks.py 依赖业务层。
+_FN_REGISTRY: "dict[str, Callable[..., Any]]" = {}
 
 
-def register_task_fn(kind: str, fn: Callable[[dict, ProgressCb], Any]) -> None:
+def register_task_fn(kind: str, fn: Callable[..., Any]) -> None:
     _FN_REGISTRY[kind] = fn
 
 

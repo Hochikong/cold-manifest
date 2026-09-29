@@ -248,3 +248,32 @@ def test_import_real_big(tmp_path: Path) -> None:
     assert rollup_root["file_count"] == s["file_count"]
     assert rollup_root["total_bytes"] == s["total_bytes"]
     conn.close()
+
+
+def test_import_seal_failure_leaves_no_sealed_marker(tmp_path: Path, monkeypatch) -> None:
+    """回归（M1）：seal_snapshot 中途崩溃不得留下 status=sealed 的假封库——
+    否则重导入会被 skip、启动孤儿清扫也不清理它。"""
+    snap = _make_legacy_dir(tmp_path)
+    data_root = tmp_path / "dataroot"
+
+    import cold_manifest.import_legacy as il  # noqa: F401 — 触发模块加载
+
+    def _boom(conn, progress=None):  # 模拟封库中途崩溃
+        raise sqlite3.OperationalError("seal exploded")
+
+    import cold_manifest.seal as seal_mod
+    with monkeypatch.context() as m:
+        m.setattr(seal_mod, "seal_snapshot", _boom)
+        with pytest.raises(sqlite3.OperationalError):
+            import_snapshot(snap, data_root)
+
+    db = snapshot_path(data_root, "TESTVOL_P0/20260504T123416Z")
+    assert db.is_file()
+    conn = _open(db)
+    row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
+    assert row is None  # 无 sealed 标记 → 下次导入按脏残留重建，不会被 skip
+    conn.close()
+
+    # 去掉故障注入后重导入应成功（脏残留被删除重建，而非 skipped_import）
+    result = import_snapshot(snap, data_root)
+    assert not result.skipped_import

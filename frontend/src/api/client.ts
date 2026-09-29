@@ -381,14 +381,58 @@ export async function createImport(body: ImportCreateBody): Promise<ImportCreate
   return data
 }
 
+export interface CollectCreateBody {
+  path: string
+  volume_id?: string | null
+  serial?: string | null
+  exclude_globs?: string[]
+  exclude_hidden?: boolean
+  include_system?: boolean
+  smartctl?: boolean
+  on_disk_copy?: boolean
+}
+
+export interface CollectCreateResponse {
+  task_id: string
+  status: string
+}
+
+export async function createCollect(body: CollectCreateBody): Promise<CollectCreateResponse> {
+  const { data } = await client.post('/collect', body)
+  return data
+}
+
+export interface CancelTaskResponse {
+  status: string
+}
+
+export async function cancelTask(id: string): Promise<CancelTaskResponse> {
+  const { data } = await client.post(`/tasks/${encodeURIComponent(id)}/cancel`)
+  return data
+}
+
+export type TaskType = 'import' | 'collect'
+export type TaskStatus = 'pending' | 'running' | 'cancelling' | 'cancelled' | 'done' | 'error'
+
+export interface CollectResult {
+  snapshot_id: string
+  volume_id: string
+  files: number
+  dirs: number
+  total_bytes: number
+  skipped: number
+  elapsed_s: number
+  warnings: string[]
+}
+
 export interface Task {
   id: string
-  type: 'import'
-  status: 'pending' | 'running' | 'done' | 'error'
+  type: TaskType
+  status: TaskStatus
   progress: number | null
   message: string | null
   payload: Record<string, unknown>
-  result: { snapshot_id?: string; skipped_import?: boolean } | null
+  result: { snapshot_id?: string; skipped_import?: boolean } & Partial<CollectResult> | null
   error: string | null
   created_at: string
   started_at: string | null
