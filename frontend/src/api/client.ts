@@ -1,0 +1,359 @@
+import axios from 'axios'
+
+const client = axios.create({
+  baseURL: '/api',
+  timeout: 60_000,
+})
+
+export interface HealthResponse {
+  status: string
+}
+
+export async function getHealth(): Promise<HealthResponse> {
+  const { data } = await client.get<HealthResponse>('/health')
+  return data
+}
+
+export interface Snapshot {
+  snapshot_id: string
+  volume_id: string
+  batch_id: string
+  collected_at: string
+  status: string
+  hash_policy: string
+  file_count: number
+  dir_count: number
+  total_bytes: number
+  total_alloc: number
+  zero_byte_count: number
+  max_depth: number
+  skipped_count: number
+  host_path: string
+  disk_id: string
+  filesystem: string
+  label: string | null
+  volume_capacity_bytes: number
+  physical_model: string
+  physical_serial: string | null
+  disk_capacity_bytes: number
+}
+
+export interface SnapshotsResponse {
+  items: Snapshot[]
+  count: number
+}
+
+export async function listSnapshots(volume_id?: string): Promise<SnapshotsResponse> {
+  const { data } = await client.get<SnapshotsResponse>('/snapshots', {
+    params: volume_id ? { volume_id } : undefined,
+  })
+  return data
+}
+
+export async function getSnapshot(snapshot_id: string): Promise<Snapshot & { volume: Record<string, unknown>; on_disk_copy: Record<string, unknown> | null; meta: Record<string, string> }> {
+  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}`)
+  return data
+}
+
+export interface ExtTopItem {
+  ext: string
+  total_bytes?: number
+  count?: number
+}
+
+export interface SizeHistogramItem {
+  label: string
+  count: number
+  total_bytes: number
+}
+
+export interface DepthHistogramItem {
+  depth: number
+  count: number
+}
+
+export interface TopFileItem {
+  entry_id: number
+  path: string
+  name: string
+  size_bytes: number
+  mtime_ns: string | null
+}
+
+export interface SnapshotStats {
+  snapshot_id: string
+  ext_top_by_bytes: ExtTopItem[]
+  ext_top_by_count: ExtTopItem[]
+  size_histogram: SizeHistogramItem[]
+  depth_histogram: DepthHistogramItem[]
+  zero_byte_count: number
+  top_files: TopFileItem[]
+}
+
+export async function getSnapshotStats(snapshot_id: string): Promise<SnapshotStats> {
+  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}/stats`)
+  return data
+}
+
+export interface DirRollup {
+  file_count: number
+  dir_count: number
+  total_bytes: number
+  total_allocated: number
+  max_mtime_ns: string | null
+}
+
+export interface Entry {
+  entry_id: number
+  name: string
+  type: 'file' | 'dir' | 'symlink' | 'other'
+  size_bytes: number | null
+  allocated_bytes: number | null
+  mtime_ns: string | null
+  ext: string
+  hash_state: string | null
+  attrs: string | null
+  rollup?: DirRollup
+}
+
+export interface EntriesResponse {
+  snapshot_id: string
+  parent_id: number
+  parent_path: string | null
+  direct_child_counts: { files: number; dirs: number; symlinks: number; others: number }
+  items: Entry[]
+  next_cursor: string | null
+  has_more: boolean
+}
+
+export interface ListEntriesParams {
+  parent_id?: number
+  cursor?: string
+  limit?: number
+  sort?: 'name' | 'size' | 'mtime'
+  order?: 'asc' | 'desc'
+  type?: 'file' | 'dir' | 'symlink' | 'other'
+  ext?: string
+  min_size?: number
+  max_size?: number
+  q?: string
+}
+
+export async function listEntries(snapshot_id: string, params: ListEntriesParams = {}): Promise<EntriesResponse> {
+  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}/entries`, { params })
+  return data
+}
+
+export interface TreeDir {
+  entry_id: number
+  name: string
+  file_count: number
+  dir_count: number
+  total_bytes: number
+  total_allocated: number
+  max_mtime_ns: string | null
+}
+
+export interface TreeResponse {
+  snapshot_id: string
+  parent_id: number
+  parent_path: string | null
+  dirs: TreeDir[]
+  direct_file_count: number
+}
+
+export async function getTree(snapshot_id: string, parent_id = 0): Promise<TreeResponse> {
+  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}/tree`, { params: { parent_id } })
+  return data
+}
+
+export interface DuItem {
+  entry_id: number
+  name: string
+  type: 'file' | 'dir'
+  path: string
+  total_bytes: number
+}
+
+export interface DuResponse {
+  snapshot_id: string
+  parent_id: number
+  items: DuItem[]
+}
+
+export async function getDu(snapshot_id: string, parent_id = 0, limit = 50): Promise<DuResponse> {
+  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}/du`, { params: { parent_id, limit } })
+  return data
+}
+
+export interface SearchItem {
+  entry_id: number
+  name: string
+  path: string
+  type: 'file' | 'dir' | 'symlink' | 'other'
+  size_bytes: number | null
+  ext: string
+}
+
+export interface SearchResponse {
+  snapshot_id: string
+  mode: string
+  items: SearchItem[]
+  next_cursor: string | null
+  has_more: boolean
+}
+
+export interface SearchParams {
+  q: string
+  mode?: 'prefix'
+  type?: 'file' | 'dir' | 'symlink' | 'other'
+  ext?: string
+  min_size?: number
+  max_size?: number
+  cursor?: string
+  limit?: number
+}
+
+export async function searchEntries(snapshot_id: string, params: SearchParams): Promise<SearchResponse> {
+  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}/search`, { params })
+  return data
+}
+
+export interface Volume {
+  volume_id: string
+  disk_id: string
+  partition_index: number
+  partition_uuid: string | null
+  volume_serial_hex: string | null
+  filesystem: string
+  label: string | null
+  capacity_bytes: number
+  physical_model: string
+  physical_serial: string | null
+  disk_capacity_bytes: number
+  snapshot_count: number
+}
+
+export interface VolumesResponse {
+  items: Volume[]
+  count: number
+}
+
+export async function listVolumes(): Promise<VolumesResponse> {
+  const { data } = await client.get('/volumes')
+  return data
+}
+
+export interface DiffRun {
+  diff_id: string
+  a: string
+  b: string
+  options_hash: string
+  created_at: string
+  duration_ms: number
+  status: string
+  result_path: string
+  options: { hash: string }
+  summary: Record<string, number | null>
+}
+
+export interface DiffsResponse {
+  items: DiffRun[]
+  count: number
+}
+
+export async function listDiffs(): Promise<DiffsResponse> {
+  const { data } = await client.get('/diffs')
+  return data
+}
+
+export interface DiffCreateBody {
+  a: string
+  b: string
+  options?: { hash: 'none' | 'full' | 'sample' }
+}
+
+export interface DiffCreateResponse {
+  diff_id: string
+  status: string
+  counts: Record<string, number | null>
+  reused: boolean
+  elapsed_s: number
+}
+
+export async function createDiff(body: DiffCreateBody): Promise<DiffCreateResponse> {
+  const { data } = await client.post('/diffs', body)
+  return data
+}
+
+export async function getDiff(diff_id: string): Promise<DiffRun> {
+  const { data } = await client.get(`/diffs/${diff_id}`)
+  return data
+}
+
+export interface DiffSummary {
+  diff_id: string
+  total_changes: number
+  total_size_delta: number
+  by_parent_dir: { parent_dir: string; count: number; size_delta: number }[]
+}
+
+export async function getDiffSummary(diff_id: string, top = 50): Promise<DiffSummary> {
+  const { data } = await client.get(`/diffs/${diff_id}/summary`, { params: { top } })
+  return data
+}
+
+export interface DiffEntry {
+  id: number
+  category: string
+  path: string
+  depth: number
+  a_type: string | null
+  b_type: string | null
+  a_size: number | null
+  b_size: number | null
+  a_mtime_ns: string | null
+  b_mtime_ns: string | null
+  size_delta: number | null
+}
+
+export interface DiffEntriesResponse {
+  diff_id: string
+  items: DiffEntry[]
+  next_cursor: string | null
+  has_more: boolean
+}
+
+export interface DiffEntriesParams {
+  category?: string
+  path_prefix?: string
+  cursor?: string
+  limit?: number
+  sort?: 'path' | 'size_delta'
+  order?: 'asc' | 'desc'
+}
+
+export async function listDiffEntries(diff_id: string, params: DiffEntriesParams = {}): Promise<DiffEntriesResponse> {
+  const { data } = await client.get(`/diffs/${diff_id}/entries`, { params })
+  return data
+}
+
+export function exportSnapshotUrl(snapshot_id: string, format: 'csv' | 'v1_csv' = 'csv'): string {
+  return `/api/snapshots/${encodeURIComponent(snapshot_id)}/export?format=${format}`
+}
+
+export function exportDiffUrl(diff_id: string): string {
+  return `/api/diffs/${diff_id}/export?format=csv`
+}
+
+export interface SettingsResponse {
+  data_root: string
+  version: string
+}
+
+export async function getSettings(): Promise<SettingsResponse> {
+  const { data } = await client.get('/settings')
+  return data
+}
+
+export default client

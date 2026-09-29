@@ -6,7 +6,7 @@
         "command": [
           "npx",
           "-y",
-          "@playwright/mcp@latest",
+          "@playwright/mcp@0.0.83",
           "--headless",
           "--browser",
           "chromium",

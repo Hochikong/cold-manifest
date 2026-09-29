@@ -237,3 +237,10 @@ frontend/dist/
 # 编辑器 / 工具输出
 .idea/
 .playwright-mcp/
+
+# Deepwork 进度与本地产物（截图等）
+.slim/
+
+# 本地工具文件
+.ignore
+.cortexkit/
