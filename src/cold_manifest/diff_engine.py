@@ -189,7 +189,11 @@ def _pair_moved(conn: sqlite3.Connection, counts: dict) -> None:
           AND r.path != ad.path
         ORDER BY r.path, ad.path
         """)
-    cur = conn.execute("SELECT rid, aid FROM _mv_pairs ORDER BY rid, aid")
+    cur = conn.execute(
+        "SELECT mp.rid, mp.aid FROM _mv_pairs mp"
+        " JOIN diff_entries r ON r.id = mp.rid"
+        " JOIN diff_entries ad ON ad.id = mp.aid"
+        " ORDER BY r.path, ad.path")
     used_r: set = set()
     used_a: set = set()
     merged: "list[tuple[int, int]]" = []
@@ -221,6 +225,252 @@ def _pair_moved(conn: sqlite3.Connection, counts: dict) -> None:
         conn.commit()
 
 
+def _cls_expr(alias_a: str, alias_b: str, colmap: "dict | None" = None) -> str:
+    """分类 CASE 表达式（与 _classify 逐分支等价）。
+
+    :hashp 参数为 1/0（hash 是否启用）。NULL 比较统一用 IS / IS NOT——
+    Python 的 None != None 为 False（视为相等），IS 语义一致。
+    colmap：B 侧别名列名映射（bside 紧凑副本的列名与 entries 不同）。
+    """
+    A, B = alias_a, alias_b
+    m = colmap or {}
+    B_id, B_type = m.get("entry_id", f'{B}.entry_id'), m.get("type", f'{B}."type"')
+    B_size, B_mtime = m.get("size", f"{B}.size_bytes"), m.get("mtime", f"{B}.mtime_ns")
+    B_hash, B_state = m.get("hash", f"{B}.hash_hex"), m.get("state", f"{B}.hash_state")
+    return f"""
+CASE
+  WHEN {B_id} IS NULL THEN 'removed'
+  WHEN {A}."type" IS NOT {B_type} THEN 'type_changed'
+  WHEN ?1 AND {A}.hash_hex IS NOT NULL AND {A}.hash_state = 'full'
+       AND {B_hash} IS NOT NULL AND {B_state} = 'full'
+    THEN CASE WHEN {A}.hash_hex IS NOT {B_hash} THEN 'content_changed'
+              WHEN {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
+              ELSE 'identical' END
+  WHEN {A}.size_bytes IS NOT {B_size} THEN 'size_changed'
+  WHEN {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
+  ELSE 'identical'
+END"""
+
+
+_BSIDE_COLS = {"entry_id": "bs.id", "type": "bs.ptype", "size": "bs.size",
+               "mtime": "bs.mtime", "hash": "bs.hash", "state": "bs.hstate"}
+
+
+_INSERT_COLS = (
+    "INSERT INTO diff_entries(change_type,path,path_norm,depth,a_entry_id,b_entry_id,"
+    "a_size,b_size,a_mtime_ns,b_mtime_ns,a_type,b_type,a_hash,b_hash,b_path)"
+)
+
+
+def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
+                     hash_enabled: bool) -> dict:
+    """SQL 下推归并（全顺序 IO 版）。
+
+    朴素「A LEFT JOIN B + 逐行取行数据」在 10M×2 上受随机行读支配
+    （HDD/WSL-VHD 实测 ~43µs/行，整场 380-620s，与旧 Python 归并无异）。
+    本实现把所有大 IO 都排成顺序流，随机访问只落在新写的热页/小索引上：
+
+    1. pairs：path 等值 join 只走两侧 uq_entries_path 索引（index-only 顺序扫，
+       不取行数据），产出 (a_entry_id, b_entry_id)；
+       removed/added 用 index-only 反连接各产出一个 id 集合；
+    2. bside：B 侧行数据紧凑副本（顺序扫 B 一遍），刚写完、页缓存热，
+       后续按 rowid 探测不再打冷盘；
+    3. matched 分类落库：CROSS JOIN 固定 join 顺序——顺序扫 A 表 →
+       pairs(aid) 索引（热）→ bside rowid（热）；
+    4. identical 只计数，且不再二次扫描：identical = pairs 总对数 −
+       已落库 matched 各类之和。
+
+    语义与 Python 归并逐项一致（见模块 docstring 与 _classify）：
+    - path 精确等值（uq_entries_path 为 BINARY collation，与 Python 字符串
+      等值/排序一致）；
+    - removed/added 的哈希只在 hash 启用且 _hash_usable 时落库；matched 的
+      a_hash/b_hash 只要 hash 启用就落原始值（含 sampled，与旧实现一致，
+      分类由 CASE 的 usable 条件守门）；
+    - diff_entries.id 的顺序与旧实现不同（按 A 表 rowid 序而非全局 path 序）；
+      所有读取路径（CSV/报告/API）都按显式列排序，唯一受 id 序影响的是
+      _pair_moved 的贪心遍历，已改为显式 ORDER BY path（语义不变，且不再
+      依赖插入顺序）。
+    要求两侧 entries.path_norm 全部非空非 ''（materialize_diff 预检，否则走
+    Python 归并回退——SQL 无法复现 casefold）。
+    """
+    counts = {k: 0 for k in _COUNTED}
+    counts["content_changed"] = 0 if hash_enabled else None
+    counts["moved_or_renamed"] = 0 if hash_enabled else None
+    h = 1 if hash_enabled else 0
+    cls = _cls_expr("sa", "bs", _BSIDE_COLS)
+    conn.execute("PRAGMA temp_store=FILE")
+    conn.execute("PRAGMA cache_size=-65536")
+    try:
+        conn.execute("ATTACH DATABASE ? AS sna",
+                     (f"file:{db_a.as_posix()}?mode=ro&immutable=1",))
+        conn.execute("ATTACH DATABASE ? AS snb",
+                     (f"file:{db_b.as_posix()}?mode=ro&immutable=1",))
+
+        # 1. matched 对（index-only，顺序）+ removed/added id 集合（index-only 反连接）
+        conn.executescript(
+            "CREATE TEMP TABLE pairs(aid INTEGER, bid INTEGER);"
+            "CREATE TEMP TABLE rem_ids(id INTEGER PRIMARY KEY) WITHOUT ROWID;"
+            "CREATE TEMP TABLE add_ids(id INTEGER PRIMARY KEY) WITHOUT ROWID;")
+        conn.execute("INSERT INTO pairs(aid, bid)"
+                     " SELECT sa.entry_id, sb.entry_id"
+                     " FROM sna.entries sa JOIN snb.entries sb ON sa.path = sb.path")
+        conn.execute("INSERT INTO rem_ids(id)"
+                     " SELECT sa.entry_id FROM sna.entries sa"
+                     " WHERE NOT EXISTS (SELECT 1 FROM snb.entries sb WHERE sb.path = sa.path)")
+        conn.execute("INSERT INTO add_ids(id)"
+                     " SELECT sb.entry_id FROM snb.entries sb"
+                     " WHERE NOT EXISTS (SELECT 1 FROM sna.entries sa WHERE sa.path = sb.path)")
+        conn.execute("CREATE INDEX ix_pairs_aid ON pairs(aid)")
+
+        # 2. B 侧紧凑副本（顺序扫一遍，后续探测全是热页）
+        conn.executescript(
+            "CREATE TEMP TABLE bside(id INTEGER PRIMARY KEY, path TEXT NOT NULL,"
+            " ptype TEXT, size INTEGER, mtime INTEGER, hash TEXT, hstate TEXT,"
+            " pnorm TEXT, depth INTEGER);")
+        conn.execute("INSERT INTO bside(id, path, ptype, size, mtime, hash, hstate, pnorm, depth)"
+                     ' SELECT entry_id, path, "type", size_bytes, mtime_ns, hash_hex,'
+                     " hash_state, path_norm, depth FROM snb.entries")
+
+        # 3. matched 分类落库（identical 不落库）
+        conn.execute(
+            f"""
+            {_INSERT_COLS}
+            SELECT {cls}, sa.path, sa.path_norm, sa.depth,
+                   sa.entry_id, bs.id,
+                   sa.size_bytes, bs.size,
+                   sa.mtime_ns, bs.mtime,
+                   sa."type", bs.ptype,
+                   CASE WHEN ?1 THEN sa.hash_hex END,
+                   CASE WHEN ?1 THEN bs.hash END,
+                   NULL
+            FROM sna.entries sa
+            CROSS JOIN pairs p INDEXED BY ix_pairs_aid ON p.aid = sa.entry_id
+            CROSS JOIN bside bs ON bs.id = p.bid
+            WHERE {cls} <> 'identical'
+            """, (h,))
+
+        # 4. removed（顺序扫 A）与 added（bside 热页）
+        conn.execute(
+            f"""
+            {_INSERT_COLS}
+            SELECT 'removed', sa.path, sa.path_norm, sa.depth,
+                   sa.entry_id, NULL,
+                   sa.size_bytes, NULL,
+                   sa.mtime_ns, NULL,
+                   sa."type", NULL,
+                   CASE WHEN ?1 AND sa.hash_hex IS NOT NULL
+                             AND sa.hash_state = 'full' THEN sa.hash_hex END,
+                   NULL, NULL
+            FROM sna.entries sa
+            CROSS JOIN rem_ids r ON r.id = sa.entry_id
+            """, (h,))
+        conn.execute(
+            f"""
+            {_INSERT_COLS}
+            SELECT 'added', bs.path, bs.pnorm, bs.depth,
+                   NULL, bs.id,
+                   NULL, bs.size,
+                   NULL, bs.mtime,
+                   NULL, bs.ptype,
+                   NULL,
+                   CASE WHEN ?1 AND bs.hash IS NOT NULL
+                             AND bs.hstate = 'full' THEN bs.hash END,
+                   bs.path
+            FROM bside bs
+            CROSS JOIN add_ids r ON r.id = bs.id
+            """, (h,))
+        conn.commit()
+
+        # 5. 计数：已落库各类走 GROUP BY；identical = 对总数 − matched 已落库之和
+        for ct, n in conn.execute(
+                "SELECT change_type, COUNT(*) FROM diff_entries GROUP BY change_type"):
+            counts[ct] = n
+        pairs_total = conn.execute("SELECT COUNT(*) FROM pairs").fetchone()[0]
+        matched_stored = (counts["type_changed"] + counts["size_changed"]
+                          + counts["mtime_changed"] + (counts["content_changed"] or 0))
+        counts["identical"] = pairs_total - matched_stored
+
+        conn.executescript(
+            "DROP INDEX ix_pairs_aid;"
+            "DROP TABLE pairs;"
+            "DROP TABLE rem_ids;"
+            "DROP TABLE add_ids;"
+            "DROP TABLE bside;")
+    finally:
+        try:
+            conn.execute("DETACH DATABASE sna")
+            conn.execute("DETACH DATABASE snb")
+        except sqlite3.Error:
+            pass
+    return counts
+
+
+def _materialize_python(conn: sqlite3.Connection, db_a: Path, db_b: Path,
+                        hash_enabled: bool) -> dict:
+    """旧 Python 逐行归并（path_norm 缺失时的回退路径，语义冻结）。"""
+    counts = {k: 0 for k in _COUNTED}
+    counts["content_changed"] = 0 if hash_enabled else None
+    counts["moved_or_renamed"] = 0 if hash_enabled else None
+    it_a = _iter_entries(db_a)
+    it_b = _iter_entries(db_b)
+    ra = next(it_a, None)
+    rb = next(it_b, None)
+    buf: "list[tuple]" = []
+
+    def flush() -> None:
+        if buf:
+            conn.executemany(
+                "INSERT INTO diff_entries(change_type,path,path_norm,depth,a_entry_id,b_entry_id,"
+                "a_size,b_size,a_mtime_ns,b_mtime_ns,a_type,b_type,a_hash,b_hash,b_path)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", buf)
+            buf.clear()
+
+    while ra is not None or rb is not None:
+        if rb is None or (ra is not None and ra[0] < rb[0]):      # 仅 A 有
+            counts["removed"] += 1
+            buf.append(("removed", ra[0], ra[2] or ra[0].casefold(), ra[3],
+                        ra[1], None, ra[5], None, ra[6], None, ra[4], None,
+                        ra[7] if hash_enabled and _hash_usable(ra) else None,
+                        None, None))
+            ra = next(it_a, None)
+        elif ra is None or rb[0] < ra[0]:                          # 仅 B 有
+            counts["added"] += 1
+            buf.append(("added", rb[0], rb[2] or rb[0].casefold(), rb[3],
+                        None, rb[1], None, rb[5], None, rb[6], None, rb[4],
+                        None,
+                        rb[7] if hash_enabled and _hash_usable(rb) else None,
+                        rb[0]))
+            rb = next(it_b, None)
+        else:                                                      # 两侧都有
+            ct = _classify(ra, rb, hash_enabled)
+            counts[ct] += 1
+            if ct != "identical":
+                buf.append((ct, ra[0], ra[2] or ra[0].casefold(), ra[3],
+                            ra[1], rb[1], ra[5], rb[5], ra[6], rb[6], ra[4], rb[4],
+                            ra[7] if hash_enabled else None,
+                            rb[7] if hash_enabled else None, None))
+            ra = next(it_a, None)
+            rb = next(it_b, None)
+        if len(buf) >= _BATCH_SIZE:
+            flush()
+            conn.commit()
+    flush()
+    conn.commit()
+    return counts
+
+
+def _all_path_norm_present(db: Path) -> bool:
+    """entries.path_norm 是否全部非空非 ''（SQL 快路径的前提）。"""
+    conn = open_snapshot(db)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM entries WHERE path_norm IS NULL OR path_norm = '' LIMIT 1"
+        ).fetchone()
+        return row is None
+    finally:
+        conn.close()
+
+
 def materialize_diff(data_root: "str | Path", a: str, b: str,
                      options: "dict | None" = None, force: bool = False) -> DiffResult:
     """物化 diff(a, b, options)，幂等复用已封库结果。见模块 docstring。"""
@@ -247,10 +497,6 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
     for stale in (out_db, Path(str(out_db) + "-wal"), Path(str(out_db) + "-shm")):
         stale.unlink(missing_ok=True)
 
-    counts = {k: 0 for k in _COUNTED}
-    counts["content_changed"] = 0 if hash_enabled else None    # 无哈希：不造假
-    counts["moved_or_renamed"] = 0 if hash_enabled else None
-
     conn = sqlite3.connect(str(out_db))
     try:
         conn.execute("PRAGMA journal_mode=OFF")
@@ -266,51 +512,10 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
             " a_hash TEXT, b_hash TEXT, b_path TEXT);"
         )
 
-        it_a = _iter_entries(db_a)
-        it_b = _iter_entries(db_b)
-        ra = next(it_a, None)
-        rb = next(it_b, None)
-        buf: "list[tuple]" = []
-
-        def flush() -> None:
-            if buf:
-                conn.executemany(
-                    "INSERT INTO diff_entries(change_type,path,path_norm,depth,a_entry_id,b_entry_id,"
-                    "a_size,b_size,a_mtime_ns,b_mtime_ns,a_type,b_type,a_hash,b_hash,b_path)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", buf)
-                buf.clear()
-
-        while ra is not None or rb is not None:
-            if rb is None or (ra is not None and ra[0] < rb[0]):      # 仅 A 有
-                counts["removed"] += 1
-                buf.append(("removed", ra[0], ra[2] or ra[0].casefold(), ra[3],
-                            ra[1], None, ra[5], None, ra[6], None, ra[4], None,
-                            ra[7] if hash_enabled and _hash_usable(ra) else None,
-                            None, None))
-                ra = next(it_a, None)
-            elif ra is None or rb[0] < ra[0]:                          # 仅 B 有
-                counts["added"] += 1
-                buf.append(("added", rb[0], rb[2] or rb[0].casefold(), rb[3],
-                            None, rb[1], None, rb[5], None, rb[6], None, rb[4],
-                            None,
-                            rb[7] if hash_enabled and _hash_usable(rb) else None,
-                            rb[0]))
-                rb = next(it_b, None)
-            else:                                                      # 两侧都有
-                ct = _classify(ra, rb, hash_enabled)
-                counts[ct] += 1
-                if ct != "identical":
-                    buf.append((ct, ra[0], ra[2] or ra[0].casefold(), ra[3],
-                                ra[1], rb[1], ra[5], rb[5], ra[6], rb[6], ra[4], rb[4],
-                                ra[7] if hash_enabled else None,
-                                rb[7] if hash_enabled else None, None))
-                ra = next(it_a, None)
-                rb = next(it_b, None)
-            if len(buf) >= _BATCH_SIZE:
-                flush()
-                conn.commit()
-        flush()
-        conn.commit()
+        if _all_path_norm_present(db_a) and _all_path_norm_present(db_b):
+            counts = _materialize_sql(conn, db_a, db_b, hash_enabled)
+        else:
+            counts = _materialize_python(conn, db_a, db_b, hash_enabled)
 
         if hash_enabled:
             _pair_moved(conn, counts)
