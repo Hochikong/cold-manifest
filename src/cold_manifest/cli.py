@@ -128,6 +128,17 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="text=摘要（默认）；csv=全字段清单")
     p_dups.add_argument("--html", default=None, help="另存自包含 HTML 报告到指定路径")
 
+    p_delete = sub.add_parser("delete",
+                              help="删除快照：主机快照目录 +（可选）盘上副本 + catalog 注册行"
+                                   "（退出码 0 成功 / 2 错误或被阻塞）")
+    p_delete.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
+    p_delete.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+    p_delete.add_argument("--on-disk", choices=["keep", "delete"], default="keep",
+                          help="盘上副本处置：keep=保留（默认）；delete=同时删除"
+                               " <scan_root>/_coldmanifest/<volume_id>/<ts>/")
+    p_delete.add_argument("--force", action="store_true",
+                          help="快照被 diff 引用时级联删除这些 diff（物化库 + catalog 行）")
+
     p_verify = sub.add_parser("verify-copy",
                               help="校验快照盘上副本与源文件完整性（只读；退出码 0 一致 / 1 不一致 / 2 错误）")
     p_verify.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
@@ -649,6 +660,57 @@ def _cmd_verify_copy(args: argparse.Namespace) -> int:
     return 0 if result["ok"] else 1
 
 
+# ---- delete ------------------------------------------------------------------
+
+def _cmd_delete(args: argparse.Namespace) -> int:
+    """删除快照（P4-①）：持 data_root 写锁；404/被阻塞 → 退出码 2。"""
+    from .catalog import (
+        SnapshotDeleteBlocked,
+        SnapshotDeleteError,
+        connect_catalog,
+        delete_snapshot,
+    )
+    from .lockfile import DataRootLock, LockBusy
+
+    data_root = Path(args.data_root)
+    if not data_root.is_dir():
+        print(f"错误：数据根不存在：{data_root}", file=sys.stderr)
+        return 2
+    cat = connect_catalog(data_root)
+    lock = DataRootLock(data_root)
+    try:
+        lock.acquire()
+    except LockBusy as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    try:
+        result = delete_snapshot(cat, data_root, args.snapshot_id,
+                                 on_disk=args.on_disk, force=args.force)
+    except LookupError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    except SnapshotDeleteError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    except SnapshotDeleteBlocked as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    finally:
+        lock.release()
+        cat.close()
+
+    print(f"已删除快照：{result['snapshot_id']}")
+    print(f"  主机目录：{'已删除' if result['deleted_host'] else '不存在（仅清理 catalog）'}")
+    dd = result["deleted_disk"]
+    print(f"  盘上副本：{'未处理（keep）' if dd is None else ('已删除' if dd else '未找到')}")
+    print(f"  释放字节：{result['freed_bytes']:,}")
+    if result["diffs_removed"]:
+        print(f"  级联 diff：{', '.join(result['diffs_removed'])}")
+    for w in result["warnings"]:
+        print(f"  警告：{w}")
+    return 0
+
+
 # ---- main -------------------------------------------------------------------
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -700,6 +762,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "duplicates":
         return _cmd_duplicates(args)
+
+    if args.command == "delete":
+        return _cmd_delete(args)
 
     if args.command == "verify-copy":
         return _cmd_verify_copy(args)

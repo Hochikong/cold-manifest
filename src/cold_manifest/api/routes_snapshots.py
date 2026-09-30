@@ -578,6 +578,53 @@ def snapshot_export(
     )
 
 
+# ---------------------------------------------------------------- 删除
+
+
+@router.delete("/{snapshot_id:path}")
+def delete_snapshot_ep(
+    snapshot_id: str,
+    request: Request,
+    on_disk: Literal["keep", "delete"] = Query(default="keep"),
+    force: bool = Query(default=False),
+) -> dict:
+    """删除快照（P4-①）：主机快照目录 +（可选）盘上副本 + catalog 注册行。
+
+    404=快照不存在；400=snapshot_id/on_disk 非法；409=被 diff 引用（?force=true
+    级联）或有活跃任务；持 DataRootLock 与采集/哈希互斥，占用 → 409。
+    """
+    from ..catalog import (
+        SnapshotDeleteBlocked,
+        SnapshotDeleteError,
+        delete_snapshot as _delete_snapshot,
+    )
+    from ..lockfile import DataRootLock, LockBusy
+
+    state = get_state(request)
+    lock = DataRootLock(state.data_root)
+    try:
+        lock.acquire()
+    except LockBusy as e:
+        raise HTTPException(status_code=409, detail=f"数据根被占用：{e}") from None
+    try:
+        return _delete_snapshot(state.catalog, state.data_root, snapshot_id,
+                                on_disk=on_disk, force=force)
+    except LookupError as e:
+        state.catalog.rollback()
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except SnapshotDeleteError as e:
+        state.catalog.rollback()
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    except SnapshotDeleteBlocked as e:
+        state.catalog.rollback()
+        detail: "dict | str" = str(e)
+        if e.diffs or e.tasks:
+            detail = {"message": str(e), "diffs": e.diffs, "tasks": e.tasks}
+        raise HTTPException(status_code=409, detail=detail) from None
+    finally:
+        lock.release()
+
+
 # ---------------------------------------------------------------- 详情（最后注册：:path 转换器会吞子路径）
 
 
