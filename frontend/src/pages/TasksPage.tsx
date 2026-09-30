@@ -23,6 +23,8 @@ const statusMap: Record<Task['status'], { label: string; color: string }> = {
 const typeMap: Record<Task['type'], string> = {
   import: '导入',
   collect: '采集',
+  hash: '哈希',
+  diff: '对比',
 }
 
 const batchStatusMap: Record<Batch['status'], { label: string; color: string }> = {

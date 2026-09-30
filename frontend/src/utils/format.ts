@@ -1,4 +1,7 @@
 import dayjs from 'dayjs'
+import relativeTime from 'dayjs/plugin/relativeTime'
+
+dayjs.extend(relativeTime)
 
 export function formatFileSize(bytes: number | null | undefined): string {
   if (bytes == null || Number.isNaN(bytes)) return '-'
@@ -44,4 +47,11 @@ export function nsToDate(ns: string | number | null | undefined): string {
   if (ns == null || ns === '') return '-'
   const ms = typeof ns === 'string' ? Number(ns) / 1_000_000 : ns / 1_000_000
   return formatDateTime(ms)
+}
+
+export function formatRelativeTime(value: string | number | Date | null | undefined): string {
+  if (value == null || value === '') return '-'
+  const d = dayjs(value)
+  if (!d.isValid()) return '-'
+  return d.fromNow()
 }

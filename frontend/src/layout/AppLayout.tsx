@@ -8,6 +8,8 @@ import {
   SettingOutlined,
 } from '@ant-design/icons'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { useTaskNotifications } from '../hooks/useTaskNotifications'
+import NotificationBell from '../components/NotificationBell'
 
 const { Sider, Header, Content } = Layout
 const { Search } = Input
@@ -23,6 +25,7 @@ const NAV_ITEMS = [
 export default function AppLayout() {
   const navigate = useNavigate()
   const { pathname } = useLocation()
+  const { notifications, unreadCount, markAllRead } = useTaskNotifications()
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -61,12 +64,19 @@ export default function AppLayout() {
         >
           <Space style={{ width: '100%', justifyContent: 'space-between' }}>
             <Typography.Text strong>冷备清单 · 元数据采集与比对</Typography.Text>
-            {/* 占位搜索框：后续由 designer 决定全局搜索行为 */}
-            <Search
-              placeholder="搜索快照 / 路径…"
-              style={{ width: 280 }}
-              disabled
-            />
+            <Space>
+              <NotificationBell
+                notifications={notifications}
+                unreadCount={unreadCount}
+                onMarkAllRead={markAllRead}
+              />
+              {/* 占位搜索框：后续由 designer 决定全局搜索行为 */}
+              <Search
+                placeholder="搜索快照 / 路径…"
+                style={{ width: 280 }}
+                disabled
+              />
+            </Space>
           </Space>
         </Header>
         <Content style={{ padding: 24, overflow: 'auto' }}>

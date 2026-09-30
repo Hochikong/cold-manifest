@@ -195,8 +195,10 @@ export function useCreateImport() {
 }
 
 export function useCreateCollect() {
+  const qc = useQueryClient()
   return useMutation({
     mutationFn: (body: CollectCreateBody) => createCollect(body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tasks'] }),
   })
 }
 
@@ -219,7 +221,7 @@ export function useTasks(params: ListTasksParams = {}, autoRefresh = false) {
       const active = tasks?.items.some(
         (t) => t.status === 'pending' || t.status === 'running' || t.status === 'cancelling'
       )
-      return active ? 2_000 : false
+      return active ? 4_000 : false
     },
   })
 }

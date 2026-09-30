@@ -523,7 +523,7 @@ export async function cancelTask(id: string): Promise<CancelTaskResponse> {
   return data
 }
 
-export type TaskType = 'import' | 'collect'
+export type TaskType = 'import' | 'collect' | 'hash' | 'diff'
 export type TaskStatus = 'pending' | 'running' | 'cancelling' | 'cancelled' | 'done' | 'error'
 
 export interface CollectResult {
@@ -544,7 +544,7 @@ export interface Task {
   progress: number | null
   message: string | null
   payload: Record<string, unknown>
-  result: { snapshot_id?: string; skipped_import?: boolean } & Partial<CollectResult> | null
+  result: ({ snapshot_id?: string; skipped_import?: boolean; diff_id?: string } & Partial<CollectResult> & Record<string, unknown>) | null
   error: string | null
   related_id: string | null
   created_at: string
