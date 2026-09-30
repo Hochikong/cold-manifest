@@ -101,16 +101,20 @@ def test_hash_file_missing_returns_none(tmp_path: Path) -> None:
 
 
 def test_hash_sampled_semantics(tmp_path: Path) -> None:
-    # 大文件（> 2×sample_bytes）：sampled 与 full 不同；改中段字节（大小不变）不影响 sampled
+    # sampled v2：首/中/尾各 64KB + 算法/大小混入；窗口外字节改动不影响指纹，
+    # 中段字节改动会被检出（v1 只看首尾，中段漏检——这是 v2 升级点）
     big = tmp_path / "big.bin"
-    payload = bytearray(b"\x00" * (65536 * 4))
+    payload = bytearray(b"\x00" * (65536 * 16))  # 1MiB，三窗口互不重叠
     big.write_bytes(payload)
     sampled1 = hash_file(big, policy="sampled")
     full = hash_file(big, policy="full")
     assert sampled1 != full
-    payload[65536 * 2] = 0xFF  # 中段
+    payload[800_000] = 0xFF  # 窗口外（首 0-64K / 中 ~480-544K / 尾 960K-1M）
     big.write_bytes(payload)
-    assert hash_file(big, policy="sampled") == sampled1  # 首尾未变 + 大小未变
+    assert hash_file(big, policy="sampled") == sampled1  # 三窗口未变 + 大小未变
+    payload[65536 * 8] = 0xFF  # 中段（~512K）
+    big.write_bytes(payload)
+    assert hash_file(big, policy="sampled") != sampled1  # v2 检出中段改动
     assert hash_file(big, policy="full") != full
 
     # 小文件（≤ 2×sample）：sampled 退化为整文件，但混入了大小标记 → 与 full 不同
@@ -561,3 +565,179 @@ def test_api_hash_unmounted_source_clear_error(client, env) -> None:
     task = _wait_task(client, r.json()["task_id"])
     assert task["status"] == "error"
     assert "不可用" in (task.get("error") or "")
+
+
+# ---------------------------------------------------------------- scope: candidates / group
+
+def _cand_env(tmp_path: Path):
+    """两同大小文件（同内容 → sampled 指纹相同）+ 一个独大小文件。"""
+    data_root = tmp_path / "data"
+    host = tmp_path / "host"
+    host.mkdir(parents=True)
+    payload = b"X" * 5000
+    (host / "dup1.bin").write_bytes(payload)
+    (host / "dup2.bin").write_bytes(payload)
+    (host / "solo.bin").write_bytes(b"Y" * 7000)
+    for p in ("dup1.bin", "dup2.bin", "solo.bin"):
+        os.utime(host / p, ns=(1111, 1111))
+    rows = [
+        (1, 0, ".", "", 0, "dir", None, None, None),
+        (2, 1, "dup1.bin", "dup1.bin", 1, "file", 5000, 1111, "dup1.bin"),
+        (3, 1, "dup2.bin", "dup2.bin", 1, "file", 5000, 1111, "dup2.bin"),
+        (4, 1, "solo.bin", "solo.bin", 1, "file", 7000, 1111, "solo.bin"),
+    ]
+    sid = _build_snapshot(data_root, host, "vol/20260101T000000Z", rows)
+    return data_root, host, sid
+
+
+def test_hash_scope_candidates_only(tmp_path) -> None:
+    """--candidates：只哈希『大小出现 ≥2 次且 >0』的候选；独大小文件不哈希；
+    meta 记 hash_scope=candidates。"""
+    data_root, host, sid = _cand_env(tmp_path)
+    conn = _open_rw(_snap_db(data_root, sid))
+    try:
+        r = hash_snapshot(conn, data_root, sid, policy="sampled",
+                          scope="candidates")
+        assert r["scope"] == "candidates"
+        assert r["total"] == 2 and r["computed"] == 2
+        rows = _hash_rows(conn)
+        assert rows[2]["hash_state"] == "sampled"
+        assert rows[3]["hash_state"] == "sampled"
+        assert rows[4]["hash_hex"] is None  # solo 7000B 独大小 → 不在候选集
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        assert meta["hash_scope"] == "candidates"
+        assert meta["hash_policy"] == "sampled"
+    finally:
+        conn.close()
+
+
+def test_hash_group_verify_one_group(tmp_path) -> None:
+    """sampled 指纹成组 → --group 精验：只重算命中条目、强制 full、
+    其余条目不动；fingerprint 档 verified 随之翻转。"""
+    from cold_manifest.duplicates import find_duplicates
+    data_root, host, sid = _cand_env(tmp_path)
+    conn = _open_rw(_snap_db(data_root, sid))
+    try:
+        r = hash_snapshot(conn, data_root, sid, policy="sampled",
+                          scope="candidates")
+        group_hex = None
+        rows = _hash_rows(conn)
+        assert rows[2]["hash_hex"] == rows[3]["hash_hex"]
+        group_hex = rows[2]["hash_hex"]
+        # 精验前：fingerprint 档该组 verified=False（全 sampled）
+        ro = sqlite3.connect(
+            f"file:{_snap_db(data_root, sid).as_posix()}?mode=ro&immutable=1",
+            uri=True)
+        rep = find_duplicates(ro, sid, mode="fingerprint", min_size=0)
+        ro.close()
+        item = next(it for it in rep["items"] if it["hash_hex"] == group_hex)
+        assert item["verified"] is False
+
+        r2 = hash_snapshot(conn, data_root, sid, group=group_hex)
+        assert r2["policy"] == "full" and r2["scope"] == "group"
+        assert r2["total"] == 2 and r2["computed"] == 2
+        rows = _hash_rows(conn)
+        assert rows[2]["hash_state"] == "full"
+        assert rows[3]["hash_state"] == "full"
+        assert rows[4]["hash_hex"] is None          # 独文件仍未哈希
+        assert rows[2]["hash_hex"] != group_hex     # v2 sampled → full 值不同
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        assert meta["hash_scope"] == "group" and meta["hash_policy"] == "full"
+
+        # 精验后：该组 verified=True
+        ro = sqlite3.connect(
+            f"file:{_snap_db(data_root, sid).as_posix()}?mode=ro&immutable=1",
+            uri=True)
+        rep = find_duplicates(ro, sid, mode="fingerprint", min_size=0)
+        ro.close()
+        item = next(it for it in rep["items"] if it["hash_hex"] == rows[2]["hash_hex"])
+        assert item["verified"] is True
+        assert item["count"] == 2  # 旧指纹组消失，只出现 full 组
+    finally:
+        conn.close()
+
+
+def test_hash_group_and_candidates_mutex(env) -> None:
+    data_root, _, sid = env
+    conn = _open_rw(_snap_db(data_root, sid))
+    try:
+        with pytest.raises(HashError, match="互斥"):
+            hash_snapshot(conn, data_root, sid, group="ab" * 32,
+                          scope="candidates")
+    finally:
+        conn.close()
+
+
+def test_hash_cache_policy_mismatch_no_hit(env, tmp_path) -> None:
+    """缓存行 policy 与本次不同（曾 sampled、现请求 full）→ 不命中，读盘重算。"""
+    data_root, host, sid = env
+    # 另一个快照先用 sampled 哈希同一批文件（写缓存 policy=sampled）
+    host2 = tmp_path / "host2"
+    host2.mkdir()
+    (host2 / "docs").mkdir()
+    (host2 / "docs" / "a.txt").write_bytes(A_TXT)
+    os.utime(host2 / "docs" / "a.txt", ns=(1111, 1111))
+    rows2 = [
+        (1, 0, ".", "", 0, "dir", None, None, None),
+        (2, 1, "docs", "docs", 1, "dir", None, None, None),
+        (3, 2, "docs/a.txt", "a.txt", 2, "file", len(A_TXT), 1111, "docs/a.txt"),
+    ]
+    sid2 = _build_snapshot(data_root, host2, "vol2/20260101T000000Z", rows2)
+    c1 = _open_rw(_snap_db(data_root, sid))
+    c2 = _open_rw(_snap_db(data_root, sid2))
+    try:
+        hash_snapshot(c2, data_root, sid2, policy="sampled")
+        r = hash_snapshot(c1, data_root, sid, policy="full")
+        # a.txt 若命中 sampled 缓存会被跳过——full 请求必须真算（computed 含它）
+        rows = _hash_rows(c1)
+        assert rows[3]["hash_state"] == "full"
+        assert r["computed"] >= 1
+    finally:
+        c1.close()
+        c2.close()
+
+
+def test_sampled_v1_v2_coexist(tmp_path) -> None:
+    """旧 v1 指纹（cldm-sampled:{algo}:{size} 前缀）与 v2 并存：都按 sampled 档
+    参与 fingerprint 查重（v1 手工复算，写入条目后成组、verified=False）。"""
+    import hashlib as _hl
+    from cold_manifest.hash import _hash_file_strict
+
+    size = 200_000
+    payload = bytes(range(256)) * (size // 256)
+    p = tmp_path / "old.bin"
+    p.write_bytes(payload)
+    # 手工复算 v1：前缀 + 首 64KB + 尾 64KB
+    h = _hl.sha256()
+    h.update(f"cldm-sampled:sha256:{size}".encode())
+    h.update(payload[:65536])
+    h.update(payload[-65536:])
+    v1_hex = h.hexdigest()
+    # 当前实现产出 v2（前缀不同 → 值不同）
+    v2_hex = _hash_file_strict(p, policy="sampled")
+    assert v2_hex != v1_hex
+
+    # 两行同大小、同 v1 指纹（hash_state=sampled）→ fingerprint 档成组
+    from test_duplicates import _build_snapshot
+    data_root = tmp_path / "data"
+    rows = [
+        (1, 0, ".", "", 0, "dir", None, None, None, None, None, None),
+        (2, 1, "o1.bin", "o1.bin", 1, "file", size, 1111, "o1.bin",
+         "sha256", v1_hex, "sampled"),
+        (3, 1, "o2.bin", "o2.bin", 1, "file", size, 1111, "o2.bin",
+         "sha256", v1_hex, "sampled"),
+    ]
+    sid = _build_snapshot(data_root, rows,
+                          {"status": "sealed", "hash_policy": "sampled",
+                           "hash_algo": "sha256"})
+    conn = sqlite3.connect(
+        f"file:{_snap_db(data_root, sid).as_posix()}?mode=ro&immutable=1",
+        uri=True)
+    try:
+        from cold_manifest.duplicates import find_duplicates
+        rep = find_duplicates(conn, sid, mode="fingerprint", min_size=0)
+        assert rep["duplicate_groups"] == 1
+        it = rep["items"][0]
+        assert it["hash_hex"] == v1_hex and it["verified"] is False
+    finally:
+        conn.close()

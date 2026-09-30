@@ -60,9 +60,13 @@ def _hash_file_strict(path: "str | Path", algo: str = "sha256",
                 if not chunk:
                     break
                 h.update(chunk)
-    else:  # sampled：首尾 sample_bytes + 文件大小混入
+    else:
+        # sampled v2：首/中/尾各 sample_bytes + 算法与文件大小混入指纹串。
+        # 中段读取显著降低"尾部追加/中段改动但首尾未变"的漏检概率。
+        # v1（cldm-sampled:{algo}:{size}，仅首尾）旧数据仍按 sampled 档参与
+        # fingerprint 查重，不强制重算；两代指纹串前缀不同、值域不碰撞。
         size = os.stat(path).st_size
-        h.update(f"cldm-sampled:{algo}:{size}".encode("utf-8"))
+        h.update(f"cldm-sampled:v2:{algo}:{size}".encode("utf-8"))
         with open(path, "rb") as f:
             if size <= 2 * sample_bytes:
                 # 小文件退化为整文件
@@ -73,6 +77,18 @@ def _hash_file_strict(path: "str | Path", algo: str = "sha256",
                     h.update(chunk)
             else:
                 remaining = sample_bytes
+                while remaining > 0:  # 首
+                    chunk = f.read(min(READ_BLOCK, remaining))
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                    remaining -= len(chunk)
+                # 中段：落在文件几何中部附近，且不越界（size > 2*sample 已保证
+                # size - sample_bytes > sample_bytes >= 0）
+                mid_off = max(sample_bytes, (size - sample_bytes) // 2)
+                mid_off = min(mid_off, size - sample_bytes)
+                f.seek(mid_off)
+                remaining = sample_bytes
                 while remaining > 0:
                     chunk = f.read(min(READ_BLOCK, remaining))
                     if not chunk:
@@ -81,7 +97,7 @@ def _hash_file_strict(path: "str | Path", algo: str = "sha256",
                     remaining -= len(chunk)
                 f.seek(size - sample_bytes)
                 remaining = sample_bytes
-                while remaining > 0:
+                while remaining > 0:  # 尾
                     chunk = f.read(min(READ_BLOCK, remaining))
                     if not chunk:
                         break
@@ -158,25 +174,44 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
                   cancel_event: "Event | None" = None,
                   catalog_conn: "sqlite3.Connection | None" = None,
                   limit: "int | None" = None,
-                  root: "str | Path | None" = None) -> dict:
+                  root: "str | Path | None" = None,
+                  scope: str = "incremental",
+                  group: "str | None" = None) -> dict:
     """为快照补算文件哈希（可续算）。
 
     conn：**可写**打开的快照库连接（immutable 只读连接无法回写）。
-    遍历 type='file' 且 hash_hex IS NULL 的条目（entry_id 升序）：
-    - 缓存命中（catalog.hash_cache 同 size/mtime/path_norm/algo）→ 直接写回，
-      hash_state=缓存行记录的实际策略（'full'/'sampled'；旧缓存行无 policy
-      时回退本次 policy），不读盘；
+    待哈希条目按 scope/group 选择（entry_id 升序；limit 截断同样按此序）：
+    - scope='incremental'（默认）：type='file' 且 hash_hex IS NULL 的条目；
+    - scope='candidates'：同上，但只取 size_bytes 在"本快照出现 ≥2 次
+      （且 size>0）"集合内的条目（候选集落 TEMP 表再 IN，不拼巨型字面量
+      列表）；meta 记 hash_scope='candidates'；
+    - group=<hash_hex>：只处理当前 hash_hex 命中该值的条目，且**强制
+      policy='full'** 做全量重算（"只精验这一组"，配合 fingerprint 档报告
+      使用）；meta 记 hash_scope='group'。group 与 candidates 互斥。
+
+    其余语义：
+    - 缓存命中（catalog.hash_cache 同 size/mtime/path_norm/algo，且缓存行
+      policy 与本次一致或为旧 NULL 行）→ 直接写回，hash_state=缓存行记录的
+      实际策略，不读盘；
     - 未命中 → 读源文件计算，写回 hash_state='full'|'sampled' 并写缓存；
     - 文件不可读 → hash_state='error'，error 记原因，不中断整体。
     每 BATCH_SIZE 条一个事务提交；结束时写 meta（hash_policy/hash_algo/hash_scope）。
 
-    limit：本次最多处理的条目数（调试/测试用，None=不限）。
+    limit：本次最多处理的条目数（调试/测试用，None=不限；对 group/candidates
+    同样生效，按 entry_id 升序截断）。
     返回统计 dict。
     """
     if algo not in ALLOWED_ALGOS:
         raise HashError(f"不支持的哈希算法：{algo!r}（允许 {'/'.join(ALLOWED_ALGOS)}）")
     if policy not in ALLOWED_POLICIES:
         raise HashError(f"非法哈希策略：{policy!r}（允许 {'/'.join(ALLOWED_POLICIES)}）")
+    if scope not in ("incremental", "candidates"):
+        raise HashError(f"非法哈希范围：{scope!r}（允许 incremental/candidates）")
+    if group is not None and scope == "candidates":
+        raise HashError("group 与 candidates 互斥：group 是对指定哈希组做全量"
+                        "精验，candidates 是批量补算大小候选集")
+    if group is not None:
+        policy = "full"  # 精验一组 = 全量哈希，与指纹档报告的 verified 语义对齐
 
     own_catalog = catalog_conn is None
     cat = catalog_conn if own_catalog is False else connect_catalog(data_root)
@@ -184,8 +219,29 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
         host_path = _resolve_host_path(conn, cat, snapshot_id, root=root,
                                        data_root=data_root)
 
+        # 待哈希条目选择（scope/group）：
+        if group is not None:
+            where = "type='file' AND hash_hex = ?"
+            where_extra: "tuple" = (group,)
+        else:
+            where = "type='file' AND hash_hex IS NULL"
+            where_extra = ()
+            if scope == "candidates":
+                # 候选集落 TEMP 表（size 在本快照出现 ≥2 次且 >0），避免巨型 IN
+                conn.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS cand_sizes("
+                    "size_bytes INTEGER PRIMARY KEY)")
+                conn.execute("DELETE FROM cand_sizes")
+                conn.execute(
+                    "INSERT INTO cand_sizes(size_bytes)"
+                    " SELECT size_bytes FROM entries"
+                    " WHERE type='file' AND size_bytes > 0"
+                    " GROUP BY size_bytes HAVING COUNT(*) > 1")
+                where = ("type='file' AND hash_hex IS NULL AND size_bytes IN"
+                         " (SELECT size_bytes FROM cand_sizes)")
+
         total = conn.execute(
-            "SELECT COUNT(*) FROM entries WHERE type='file' AND hash_hex IS NULL"
+            f"SELECT COUNT(*) FROM entries WHERE {where}", where_extra
         ).fetchone()[0]
         if limit is not None:
             total = min(total, limit)
@@ -200,10 +256,10 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
                 break
             batch = BATCH_SIZE if limit is None else min(BATCH_SIZE, limit - done)
             rows = conn.execute(
-                "SELECT entry_id, path, path_norm, size_bytes, mtime_ns FROM entries"
-                " WHERE type='file' AND hash_hex IS NULL AND entry_id > ?"
-                " ORDER BY entry_id LIMIT ?",
-                (last_id, batch),
+                f"SELECT entry_id, path, path_norm, size_bytes, mtime_ns FROM entries"
+                f" WHERE {where} AND entry_id > ?"
+                f" ORDER BY entry_id LIMIT ?",
+                (*where_extra, last_id, batch),
             ).fetchall()
             if not rows:
                 break
@@ -218,8 +274,10 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
                 done += 1
 
                 cache_hex, cache_policy = _cache_lookup(cat, r, algo)
-                if cache_hex is not None:
-                    # hash_state 记实际策略（旧缓存行 policy 为 NULL 时回退本次 policy）
+                if cache_hex is not None and cache_policy in (None, policy):
+                    # hash_state 记实际策略（旧缓存行 policy 为 NULL 时回退本次
+                    # policy）；缓存行 policy 与本次不同（如曾以 sampled 算过、
+                    # 现在请求 full）视为未命中，读盘重算
                     updates.append((algo, cache_hex, cache_policy or policy,
                                     r["entry_id"]))
                     cached += 1
@@ -250,9 +308,11 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
                 progress_cb("hash", done, total)
 
         elapsed = time.monotonic() - t0
-        # meta 收尾（本次运行正常结束；取消的现场留给下次续算完成时写）
+        # meta 收尾（本次运行正常结束；取消的现场留给下次续算完成时写）。
+        # hash_scope：candidates 批量补算记 'candidates'；group 精验记 'group'；
+        # 默认增量补算记 'incremental'。
         for k, v in (("hash_policy", policy), ("hash_algo", algo),
-                     ("hash_scope", "incremental")):
+                     ("hash_scope", "group" if group is not None else scope)):
             conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?,?)", (k, v))
         conn.commit()
 
@@ -260,6 +320,7 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
             "snapshot_id": snapshot_id,
             "algo": algo,
             "policy": policy,
+            "scope": "group" if group is not None else scope,
             "total": total,
             "computed": computed,
             "cached": cached,
@@ -353,6 +414,8 @@ def run_hash_task(payload: dict, progress_cb: "ProgressCb | None" = None,
                 policy=payload.get("policy") or "full",
                 progress_cb=progress_cb, cancel_event=cancel_event,
                 root=payload.get("root"),
+                scope=payload.get("scope") or "incremental",
+                group=payload.get("group"),
             )
         finally:
             conn.close()

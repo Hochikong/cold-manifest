@@ -93,15 +93,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p_hash.add_argument("--algo", default="sha256", help="哈希算法（默认 sha256）")
     p_hash.add_argument("--policy", choices=["full", "sampled"], default="full",
                         help="哈希策略：full=整文件（默认，diff 内容比对可用）；"
-                             "sampled=首尾 64KB 指纹（不能证明内容等值）")
+                             "sampled=首/中/尾各 64KB 指纹 v2（不能证明内容等值；"
+                             "旧 v1 指纹仍按 sampled 档参与查重）")
+    p_hash.add_argument("--candidates", action="store_true",
+                        help="只哈希『大小在本快照出现 ≥2 次且 >0』的候选文件"
+                             "（配合查重：非候选不哈希；meta 记 hash_scope=candidates）")
+    p_hash.add_argument("--group", default=None, metavar="HASH_HEX",
+                        help="只对当前 hash_hex 命中该值的条目做全量精验"
+                             "（强制 full 策略，配合 duplicates --mode fingerprint；"
+                             "与 --candidates 互斥）")
     p_hash.add_argument("--limit", type=int, default=None,
-                        help="调试：本次最多处理 N 个条目（默认不限）")
+                        help="调试：本次最多处理 N 个选中条目（按 entry_id 升序；"
+                             "对 --group/--candidates 同样适用，默认不限）")
     p_hash.add_argument("--root", default=None,
                         help="显式指定源目录（覆盖 catalog 记录的 host_path，须为目录）")
 
     p_dups = sub.add_parser("duplicates",
-                            help="快照内重复文件报告（按完整哈希分组；要求已 cldm hash --policy full）")
+                            help="快照内重复文件三档查重"
+                                 "（--mode content=完整哈希 / name=同名 /"
+                                 " fingerprint=大小+指纹）")
     p_dups.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_dups.add_argument("--mode", choices=["content", "name", "fingerprint"],
+                        default="content",
+                        help="查重档位：content=完整哈希分组（默认，要求已"
+                             " cldm hash --policy full）；name=同名分组"
+                             "（大小写不敏感，无需哈希，秒级）；fingerprint=按"
+                             " (大小,哈希) 分组（纳入 full/sampled 指纹，未逐字节"
+                             "验证；无任何哈希时报错）")
     p_dups.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_dups.add_argument("--min-size", type=int, default=1048576,
                         help="只统计 ≥ 此字节数的文件（默认 1048576 = 1MiB）")
@@ -408,6 +426,11 @@ def _cmd_hash(args: argparse.Namespace) -> int:
     from .hash import HashError, hash_snapshot
     from .lockfile import DataRootLock, LockBusy
 
+    if args.candidates and args.group:
+        print("错误：--group 与 --candidates 互斥：group 是对指定哈希组做全量"
+              "精验，candidates 是批量补算大小候选集", file=sys.stderr)
+        return 2
+
     data_root = Path(args.data_root)
     db = snapshot_path(data_root, args.snapshot_id)
     cat = connect_catalog(data_root)
@@ -434,17 +457,43 @@ def _cmd_hash(args: argparse.Namespace) -> int:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
         try:
-            pending = conn.execute(
-                "SELECT COUNT(*) FROM entries WHERE type='file' AND hash_hex IS NULL"
-            ).fetchone()[0]
-            if pending == 0:
-                print("所有文件已有哈希，无需补算（如需换算法/策略请先清空 hash 列）")
-                return 0
-            print(f"待哈希条目：{pending:,}  算法：{args.algo}  策略：{args.policy}")
+            # 待哈希条目按选中范围计数（与 hash_snapshot 的选择一致）
+            if args.group:
+                pending = conn.execute(
+                    "SELECT COUNT(*) FROM entries WHERE type='file' AND hash_hex=?",
+                    (args.group,)).fetchone()[0]
+                scope, group = "incremental", args.group
+                if pending == 0:
+                    print(f"没有 hash_hex 命中 {args.group} 的条目，无需精验")
+                    return 0
+                print(f"精验组 {args.group[:16]}…：{pending:,} 个条目  算法：{args.algo}"
+                      f"  策略：full（强制）")
+            else:
+                scope = "candidates" if args.candidates else "incremental"
+                group = None
+                if args.candidates:
+                    pending = conn.execute(
+                        "SELECT COUNT(*) FROM entries WHERE type='file'"
+                        " AND hash_hex IS NULL AND size_bytes > 0 AND size_bytes IN"
+                        " (SELECT size_bytes FROM entries WHERE type='file'"
+                        "  AND size_bytes > 0 GROUP BY size_bytes HAVING COUNT(*)>1)"
+                    ).fetchone()[0]
+                    if pending == 0:
+                        print("候选集（大小出现 ≥2 次且 >0）内没有待哈希条目")
+                        return 0
+                    print(f"候选集待哈希条目：{pending:,}  算法：{args.algo}  策略：{args.policy}")
+                else:
+                    pending = conn.execute(
+                        "SELECT COUNT(*) FROM entries WHERE type='file' AND hash_hex IS NULL"
+                    ).fetchone()[0]
+                    if pending == 0:
+                        print("所有文件已有哈希，无需补算（如需换算法/策略请先清空 hash 列）")
+                        return 0
+                    print(f"待哈希条目：{pending:,}  算法：{args.algo}  策略：{args.policy}")
             result = hash_snapshot(
                 conn, data_root, args.snapshot_id,
                 algo=args.algo, policy=args.policy, limit=args.limit,
-                root=args.root,
+                root=args.root, scope=scope, group=group,
                 progress_cb=lambda phase, done, total: (
                     sys.stdout.write(f"\r  {phase}:{done:,}/{total:,}") or sys.stdout.flush()
                 ),
@@ -458,7 +507,7 @@ def _cmd_hash(args: argparse.Namespace) -> int:
         lock.release()
 
     print()
-    print(f"哈希完成：{result['snapshot_id']}")
+    print(f"哈希完成：{result['snapshot_id']}（范围：{result.get('scope', 'incremental')}）")
     print(f"  计算：{result['computed']:,}  缓存命中：{result['cached']:,}  "
           f"失败：{result['errors']:,}")
     mb = result["bytes_hashed"] / 2**20
@@ -495,7 +544,7 @@ def _cmd_duplicates(args: argparse.Namespace) -> int:
 
     conn = open_snapshot(db)
     try:
-        result = find_duplicates(conn, args.snapshot_id,
+        result = find_duplicates(conn, args.snapshot_id, mode=args.mode,
                                  min_size=args.min_size, limit=args.limit)
     except (DuplicatesError, ValueError) as e:
         print(f"错误：{e}", file=sys.stderr)
@@ -513,11 +562,20 @@ def _cmd_duplicates(args: argparse.Namespace) -> int:
         return 0
 
     # text 摘要
-    print(f"重复文件报告：{result['snapshot_id']}")
-    print(f"  重复组数：{result['duplicate_groups']:,}  "
-          f"可回收空间：{fmt_bytes(result['total_wasted_bytes'])}  "
-          f"已哈希文件：{result['hashed_files']:,}（{result['hash_algo']}，"
-          f"大小下限 {fmt_bytes(result['min_size'])}）")
+    mode = result["mode"]
+    mode_lbl = {"content": "内容级（完整哈希）", "name": "同名级（大小写不敏感）",
+                "fingerprint": "指纹级（大小+抽样指纹）"}[mode]
+    print(f"重复文件报告：{result['snapshot_id']}（模式：{mode_lbl}）")
+    wasted = result.get("total_wasted_bytes")
+    wasted_txt = f"可回收空间：{fmt_bytes(wasted)}  " if wasted is not None else ""
+    print(f"  重复组数：{result['duplicate_groups']:,}  {wasted_txt}"
+          f"参与匹配文件：{result['hashed_files']:,}"
+          f"（大小下限 {fmt_bytes(result['min_size'])}）")
+    if mode == "fingerprint":
+        print("  ⚠ 指纹级：未逐字节验证；对某一组严谨验证："
+              "cldm hash <sid> --group <hash_hex>")
+    elif mode == "name":
+        print("  ⚠ 同名级：同名不代表内容相同。")
     if not result["items"]:
         print("  没有满足条件的重复文件。")
         return 0
@@ -526,8 +584,15 @@ def _cmd_duplicates(args: argparse.Namespace) -> int:
         paths = "、".join(it["paths"][:3])
         if len(it["paths"]) > 3:
             paths += " …"
-        print(f"   {i:>3}. 浪费 {fmt_bytes(it['wasted_bytes']):>10}  "
-              f"{it['count']} × {fmt_bytes(it['size_bytes']):<10} {paths}")
+        if mode == "name":
+            print(f"   {i:>3}. {it['count']} 个同名  "
+                  f"共 {fmt_bytes(it['size_bytes']):<10}  {it['name']}  {paths}")
+        else:
+            ver = ""
+            if mode == "fingerprint":
+                ver = "  已验证" if it["verified"] else "  指纹未验证"
+            print(f"   {i:>3}. 浪费 {fmt_bytes(it['wasted_bytes']):>10}  "
+                  f"{it['count']} × {fmt_bytes(it['size_bytes']):<10} {paths}{ver}")
         if it["paths_truncated"]:
             print("        （路径仅列部分）")
     return 0

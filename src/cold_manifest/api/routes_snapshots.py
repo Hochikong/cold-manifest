@@ -611,6 +611,8 @@ class HashBody(BaseModel):
     algo: str = "sha256"
     policy: str = "full"
     root: str | None = None
+    scope: str = "incremental"      # incremental（默认）| candidates（只算大小候选集）
+    group: str | None = None        # 指定 hash_hex：只对该组做全量精验（与 candidates 互斥）
 
 
 def _run_hash(payload: dict, progress_cb: Any, cancel_event: Any = None) -> dict:
@@ -635,10 +637,18 @@ def submit_hash(snapshot_id: str, body: HashBody, request: Request) -> dict:
     if body.policy not in ALLOWED_POLICIES:
         raise HTTPException(status_code=400,
                             detail=f"非法哈希策略：{body.policy!r}（允许 {'/'.join(ALLOWED_POLICIES)}）")
+    if body.scope not in ("incremental", "candidates"):
+        raise HTTPException(status_code=400,
+                            detail=f"非法 scope：{body.scope!r}（允许 incremental/candidates）")
+    if body.group is not None and body.scope == "candidates":
+        raise HTTPException(status_code=400,
+                            detail="group 与 candidates 互斥：group 是对指定哈希组做"
+                                   "全量精验，candidates 是批量补算大小候选集")
 
     runner: TaskRunner = request.app.state.task_runner
     payload = {"snapshot_id": snapshot_id, "algo": body.algo, "policy": body.policy,
-               "data_root": str(state.data_root), "root": body.root}
+               "data_root": str(state.data_root), "root": body.root,
+               "scope": body.scope, "group": body.group}
     task_id = runner.submit_dedup(_KIND_HASH, payload, field="snapshot_id")
     if task_id is None:
         raise HTTPException(status_code=409, detail="同快照已有 pending/running 的哈希任务")

@@ -311,8 +311,8 @@ def test_cli_text_and_csv(tmp_path: Path, capsys: pytest.CaptureFixture) -> None
     rc = main(["duplicates", SID, "--data-root", str(data), "--output", "csv"])
     assert rc == 0
     lines = capsys.readouterr().out.strip().splitlines()
-    assert lines[0].startswith("hash_hex,size_bytes")
-    assert lines[1].startswith("H1,")
+    assert lines[0].startswith("mode,hash_hex,size_bytes")
+    assert lines[1].startswith("content,H1,")
 
 
 def test_cli_html_and_error(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -338,3 +338,239 @@ def test_cli_html_and_error(tmp_path: Path, capsys: pytest.CaptureFixture) -> No
     # 不存在的快照 → 退出码 2
     assert main(["duplicates", "nope/20260101T000000Z",
                  "--data-root", str(data)]) == 2
+
+
+# ---------------------------------------------------------------- 三档：name / fingerprint
+
+def _row_mixed(eid, path, size, hh, state):
+    """rows 多两列：hash_hex + hash_state（name/fingerprint 夹具用）。"""
+    name = path.rsplit("/", 1)[-1]
+    depth = path.count("/") + 1
+    return (eid, eid - 1, path, name, depth, "file", size, 1111, path,
+            "sha256", hh, state)
+
+
+MIXED_META = {"status": "sealed", "hash_policy": "sampled", "hash_algo": "sha256"}
+
+
+@pytest.fixture()
+def mixed_env(tmp_path: Path) -> sqlite3.Connection:
+    """三档夹具（hash_policy=sampled，content 档应报错）：
+    - name 组 report.txt：3 个成员大小互不相同（100/200/300），NOCASE 同名
+      （report.txt / REPORT.txt / report.TXT），哈希各异；
+    - 独名 other.bin（500）不成组；
+    - fingerprint 组：size 1000×2 同 hash（full+sampled → verified=False，
+      wasted 1000）；size 2000×2 同 hash 全 full（verified=True，wasted 2000）；
+      size 3000×2 不同 hash（不成组）；size 400×2 同 hash 全 sampled
+     （verified=False，wasted 400）。
+    """
+    rows = [
+        (1, 0, ".", "", 0, "dir", None, None, None, None, None, None),
+        _row_mixed(2, "a/report.txt", 100, "HN1", "full"),
+        _row_mixed(3, "b/REPORT.txt", 200, "HN2", "full"),
+        _row_mixed(4, "c/report.TXT", 300, "HN3", "sampled"),
+        _row_mixed(5, "d/other.bin", 500, "HN9", "full"),
+        _row_mixed(6, "e/x1.bin", 1000, "HF1", "full"),
+        _row_mixed(7, "e/x2.bin", 1000, "HF1", "sampled"),
+        _row_mixed(8, "f/y1.bin", 2000, "HF2", "full"),
+        _row_mixed(9, "f/y2.bin", 2000, "HF2", "full"),
+        _row_mixed(10, "g/z1.bin", 3000, "HF3", "full"),
+        _row_mixed(11, "g/z2.bin", 3000, "HF4", "full"),
+        _row_mixed(12, "h/w1.bin", 400, "HF5", "sampled"),
+        _row_mixed(13, "h/w2.bin", 400, "HF5", "sampled"),
+        # 同名档翻页夹具：3 个 count=2 的名字（min_size=0 时 cnt 全为 2）
+        _row_mixed(14, "i/m1.bin", 10, "HM1", "full"),
+        _row_mixed(15, "j/m1.bin", 10, "HM2", "full"),
+        _row_mixed(16, "i/m2.bin", 10, "HM3", "full"),
+        _row_mixed(17, "j/m2.bin", 10, "HM4", "full"),
+        _row_mixed(18, "i/m3.bin", 10, "HM5", "full"),
+        _row_mixed(19, "j/m3.bin", 10, "HM6", "full"),
+    ]
+    _build_snapshot(tmp_path, rows, MIXED_META)
+    conn = sqlite3.connect(f"file:{(tmp_path / 'vol' / '20260101T000000Z' /
+                                    'snapshot.db').as_posix()}?mode=ro&immutable=1",
+                           uri=True)
+    yield conn
+    conn.close()
+
+
+# ---- name 档
+
+def test_name_mode_groups(mixed_env: sqlite3.Connection) -> None:
+    """NOCASE 同名分组：大小互不相同的成员按名字归组；item 形状
+    {name,count,size_bytes(组内字节和),wasted_bytes=None,paths}。"""
+    r = find_duplicates(mixed_env, SID, mode="name", min_size=0)
+    assert r["mode"] == "name"
+    assert r["hash_algo"] is None and r["total_wasted_bytes"] is None
+    assert r["duplicate_groups"] == 4  # report.txt + m1/m2/m3
+    # 参与匹配（≥min_size=0）：全部 18 个 file 行
+    assert r["hashed_files"] == 18
+    # 组名 = MIN(name)（二进制序最小，跨行确定；组与组在 NOCASE 下不可能同名，
+    # 故 ORDER BY / keyset 用 NOCASE 也不会有歧义）
+    rep = next(it for it in r["items"] if it["name"] == "REPORT.txt")
+    assert rep["count"] == 3
+    assert rep["size_bytes"] == 100 + 200 + 300  # 组内字节总和
+    assert rep["wasted_bytes"] is None
+    assert rep["paths"] == ["a/report.txt", "b/REPORT.txt", "c/report.TXT"]
+    assert not rep["paths_truncated"]
+    # 排序：cnt DESC，同 cnt 按 name NOCASE ASC
+    assert [it["name"] for it in r["items"]] == ["REPORT.txt", "m1.bin", "m2.bin", "m3.bin"]
+
+
+def test_name_mode_min_size(mixed_env: sqlite3.Connection) -> None:
+    """min_size 逐文件过滤后重新分组：report 组只剩 2 个成员（200/300）。"""
+    r = find_duplicates(mixed_env, SID, mode="name", min_size=150)
+    rep = next(it for it in r["items"] if it["name"] == "REPORT.txt")
+    assert rep["count"] == 2 and rep["size_bytes"] == 500
+    assert rep["paths"] == ["b/REPORT.txt", "c/report.TXT"]
+    # 参与匹配（≥150）：report×2 + other(500) + x×2 + y×2 + z×2 + w×2 = 11；
+    # m 系（10B）与 report 100B 被滤掉
+    assert r["hashed_files"] == 11
+    # m 系大小 10 < 150 全被滤掉 → 组消失
+    assert [it["name"] for it in r["items"] if it["name"].startswith("m")] == []
+
+
+def test_name_mode_keyset_paging(mixed_env: sqlite3.Connection) -> None:
+    """name 档 keyset 翻页（limit=2）：不重不漏，顺序与一次性查询一致。"""
+    one = find_duplicates(mixed_env, SID, mode="name", min_size=0, limit=1000)
+    expect = [it["name"] for it in one["items"]]
+    assert expect == ["REPORT.txt", "m1.bin", "m2.bin", "m3.bin"]
+    seen, cursor = [], None
+    while True:
+        r = find_duplicates(mixed_env, SID, mode="name", min_size=0,
+                            limit=2, cursor=cursor)
+        seen += [it["name"] for it in r["items"]]
+        if not r["has_more"]:
+            assert r["next_cursor"] is None
+            break
+        cursor = r["next_cursor"]
+    assert seen == expect
+
+
+# ---- fingerprint 档
+
+def test_fingerprint_mode_verified(mixed_env: sqlite3.Connection) -> None:
+    """(size, hash) 分组；verified=组内全 full；sampled 与 full 混合成组。"""
+    r = find_duplicates(mixed_env, SID, mode="fingerprint", min_size=0)
+    assert r["mode"] == "fingerprint"
+    assert r["hash_algo"] == "sha256"
+    assert r["duplicate_groups"] == 3
+    assert r["total_wasted_bytes"] == 2000 + 1000 + 400
+    # hashed_files = 参与指纹匹配的文件数（含不成组的单文件，与 content 档
+    # "已哈希文件" 口径一致：18 个 file 行全部有可用哈希且 ≥ min_size）
+    assert r["hashed_files"] == 18
+    by = {(it["hash_hex"], it["size_bytes"]): it for it in r["items"]}
+    assert by[("HF2", 2000)]["verified"] is True    # 全 full
+    assert by[("HF1", 1000)]["verified"] is False   # full + sampled 混合
+    assert by[("HF5", 400)]["verified"] is False    # 全 sampled
+    # 同 size 不同 hash（z1/z2, 3000）不成组
+    assert all(sz != 3000 for (_, sz) in by)
+    assert [it["wasted_bytes"] for it in r["items"]] == [2000, 1000, 400]
+
+
+def test_fingerprint_mode_min_size_and_paging(mixed_env: sqlite3.Connection) -> None:
+    """min_size 生效；keyset 翻页（三元组游标）不重不漏。"""
+    r = find_duplicates(mixed_env, SID, mode="fingerprint", min_size=500)
+    assert [(it["hash_hex"], it["size_bytes"]) for it in r["items"]] == [
+        ("HF2", 2000), ("HF1", 1000)]  # HF5(400) 被滤掉；wasted 降序
+    one = find_duplicates(mixed_env, SID, mode="fingerprint", min_size=0, limit=1000)
+    expect = [(it["hash_hex"], it["size_bytes"], it["verified"]) for it in one["items"]]
+    seen, cursor = [], None
+    while True:
+        r = find_duplicates(mixed_env, SID, mode="fingerprint", min_size=0,
+                            limit=2, cursor=cursor)
+        seen += [(it["hash_hex"], it["size_bytes"], it["verified"]) for it in r["items"]]
+        if not r["has_more"]:
+            break
+        cursor = r["next_cursor"]
+    assert seen == expect
+
+
+def test_fingerprint_no_usable_hash_400(tmp_path: Path) -> None:
+    """完全没有可用哈希（NULL/error）→ DuplicatesError 提示跑 sampled/full。"""
+    rows = [(1, 0, ".", "", 0, "dir", None, None, None, None, None, None),
+            _row_mixed(2, "a.bin", 2**20, "HX", "full")]
+    rows[1] = (2, 1, "a.bin", "a.bin", 1, "file", 2**20, 1111, "a.bin",
+               None, None, None)
+    _build_snapshot(tmp_path, rows, MIXED_META)
+    conn = sqlite3.connect(f"file:{(tmp_path / 'vol' / '20260101T000000Z' /
+                                    'snapshot.db').as_posix()}?mode=ro&immutable=1",
+                           uri=True)
+    try:
+        with pytest.raises(DuplicatesError, match="sampled"):
+            find_duplicates(conn, SID, mode="fingerprint", min_size=0)
+    finally:
+        conn.close()
+
+
+def test_content_mode_still_requires_full(mixed_env: sqlite3.Connection) -> None:
+    """content 档现状不变：hash_policy=sampled → DuplicatesError。"""
+    with pytest.raises(DuplicatesError, match="policy full"):
+        find_duplicates(mixed_env, SID, mode="content", min_size=0)
+
+
+def test_bad_mode_rejected(mixed_env: sqlite3.Connection) -> None:
+    with pytest.raises(DuplicatesError, match="mode"):
+        find_duplicates(mixed_env, SID, mode="nope")
+
+
+# ---- CSV / HTML 标注 mode
+
+def test_csv_html_mode_annotated(mixed_env: sqlite3.Connection, tmp_path: Path) -> None:
+    from cold_manifest.duplicates import duplicates_csv, render_duplicates_html
+    # content 档另建一套 FULL_META（与 mixed_env 共享 tmp_path 会撞 entry_id）
+    full_dir = tmp_path / "fullcopy"
+    rows_full = [(1, 0, ".", "", 0, "dir", None, None, None, None, None, None),
+                 _row_mixed(2, "a1.bin", 2**20, "H1", "full"),
+                 _row_mixed(3, "a2.bin", 2**20, "H1", "full")]
+    _build_snapshot(full_dir, rows_full, FULL_META)
+    fc = sqlite3.connect(f"file:{(full_dir / 'vol' / '20260101T000000Z' /
+                                 'snapshot.db').as_posix()}?mode=ro&immutable=1",
+                         uri=True)
+    try:
+        # content 档在 FULL_META 上跑；name/fingerprint 在 sampled 夹具上跑
+        for src, mode in ((fc, "content"), (mixed_env, "name"),
+                          (mixed_env, "fingerprint")):
+            r = find_duplicates(src, SID, mode=mode, min_size=0)
+            lines = duplicates_csv(r).strip().splitlines()
+            assert lines[0].startswith("mode,"), lines[0]
+            assert all(line.startswith(mode + ",") for line in lines[1:])
+            page = render_duplicates_html(r, "2026-01-01")
+            assert "模式：" in page
+    finally:
+        fc.close()
+    r = find_duplicates(mixed_env, SID, mode="fingerprint", min_size=0)
+    page = render_duplicates_html(r)
+    assert "未逐字节验证" in page
+    r = find_duplicates(mixed_env, SID, mode="name", min_size=0)
+    assert "同名级" in render_duplicates_html(r)
+
+# ---- API 三档
+
+def test_api_modes(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+    from cold_manifest.server import create_app
+    rows = [
+        (1, 0, ".", "", 0, "dir", None, None, None, None, None, None),
+        _row_mixed(2, "a1.bin", 2**20, "H1", "full"),
+        _row_mixed(3, "sub/a1.bin", 2**20, "H1", "sampled"),
+        _row_mixed(4, "b1.bin", 3**20, "H2", "full"),
+        _row_mixed(5, "b2.bin", 3**20, "H2", "full"),
+    ]
+    _build_snapshot(tmp_path, rows, MIXED_META)
+    app = create_app(str(tmp_path))
+    with TestClient(app, raise_server_exceptions=False) as c:
+        # 默认 content → 400（policy sampled）；显式 content 同样
+        assert c.get(f"/api/snapshots/{SID}/duplicates").status_code == 400
+        r = c.get(f"/api/snapshots/{SID}/duplicates",
+                  params={"mode": "name", "min_size": 0})
+        assert r.status_code == 200 and r.json()["mode"] == "name"
+        assert r.json()["items"][0]["name"] == "a1.bin"
+        assert r.json()["items"][0]["count"] == 2
+        r = c.get(f"/api/snapshots/{SID}/duplicates",
+                  params={"mode": "fingerprint", "min_size": 0})
+        assert r.status_code == 200 and r.json()["mode"] == "fingerprint"
+        items = {it["hash_hex"]: it for it in r.json()["items"]}
+        assert items["H2"]["verified"] is True and items["H1"]["verified"] is False
+        assert c.get(f"/api/snapshots/{SID}/duplicates",
+                     params={"mode": "nope"}).status_code == 400
