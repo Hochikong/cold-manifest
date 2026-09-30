@@ -9,7 +9,7 @@ if not exist ".venv-win\Scripts\cldm.exe" (
     exit /b 1
 )
 
-if "%CLDM_DATA_ROOT%"=="" set "CLDM_DATA_ROOT=%~dp0data"
+if "%CLDM_DATA_ROOT%"=="" set "CLDM_DATA_ROOT=%~dp0..\..\data"
 echo Data root: %CLDM_DATA_ROOT%
 echo Serving on http://0.0.0.0:8765  ^(local: http://localhost:8765, Ctrl+C to stop^)
 ".venv-win\Scripts\cldm.exe" serve --host 0.0.0.0 --port 8765

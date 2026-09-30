@@ -223,7 +223,9 @@ def verify_snapshot_copy(data_root: "str | Path", snapshot_id: str, *,
     try:
         cat_row = find_snapshot(cat, snapshot_id)
         if cat_row is None:
-            raise VerifyError(f"快照未注册：{snapshot_id}")
+            raise VerifyError(
+                f"快照未注册：{snapshot_id}（数据根：{Path(data_root).resolve()}）；"
+                "若与 Web 服务的数据根不同，请用 --data-root 指定（或设 CLDM_DATA_ROOT）")
         row = cat.execute(
             "SELECT sha256 FROM on_disk_copies WHERE snapshot_id=?",
             (snapshot_id,)).fetchone()

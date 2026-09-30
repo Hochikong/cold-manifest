@@ -23,6 +23,13 @@ packaging\windows\cldm.cmd collect D:\photo-archive --data-root D:\cldm-data --n
 
 采集完成后，Web 页面（快照页）即可看到该卷。
 
+## 数据根约定
+
+- 默认数据根为**包根下的 `data\`**。`start.cmd` 与 `cldm.cmd` 在 `CLDM_DATA_ROOT` 未设置时都会使用它，因此 Web 服务采集的快照，直接在包根跑 CLI 就能看到，无需额外参数。
+- 所有 CLI 子命令的 `--data-root` 也遵循同一优先级：**显式 `--data-root` 参数 > 环境变量 `CLDM_DATA_ROOT` > `./data`**。
+- 若你在其他目录执行 CLI（此时默认 `.\data` 与服务的数据根不同），请加 `--data-root <包根>\data`，或先 `set CLDM_DATA_ROOT=<包根>\data`。
+- 「快照未注册」类报错会显示实际使用的数据根——若与 Web 服务的不一致，按上面方式指定即可。
+
 其他常用命令（在包根执行；`packaging\windows\cldm.cmd <子命令> --help` 可看全部子命令）：
 
 ```bat

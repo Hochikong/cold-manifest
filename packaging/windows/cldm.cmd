@@ -7,5 +7,8 @@ if not exist "%HERE%\.venv-win\Scripts\cldm.exe" (
     echo ERROR: .venv-win\Scripts\cldm.exe not found. Run packaging\windows\setup.cmd first.
     exit /b 1
 )
+rem Default data root: <package root>\data (same as start.cmd); an explicit
+rem --data-root argument always wins.
+if "%CLDM_DATA_ROOT%"=="" set "CLDM_DATA_ROOT=%HERE%\data"
 "%HERE%\.venv-win\Scripts\cldm.exe" %*
 endlocal

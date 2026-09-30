@@ -17,6 +17,7 @@ import { FileTextOutlined } from '@ant-design/icons'
 import ErrorAlert from './ErrorAlert'
 import { formatFileSize, formatNumber } from '../utils/format'
 import { getDuplicates, type DuplicateItem, type DuplicatesResponse } from '../api/client'
+import { useSettings } from '../api/hooks'
 
 const { Text } = Typography
 
@@ -37,6 +38,7 @@ function isPolicyError(error: unknown): boolean {
 }
 
 export default function DuplicateReport({ snapshotId }: { snapshotId: string }) {
+  const { data: settings } = useSettings()
   const [minSize, setMinSize] = useState<number>(1024 * 1024)
   const [data, setData] = useState<DuplicatesResponse | null>(null)
   const [allItems, setAllItems] = useState<DuplicateItem[]>([])
@@ -97,6 +99,8 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
     const detail =
       (error as { response?: { data?: { detail?: string } } }).response?.data?.detail ||
       '该快照未使用完整哈希策略，无法生成重复文件报告。'
+    const dataRoot = settings?.data_root || ''
+    const hashCommand = `cldm hash ${snapshotId} --policy full${dataRoot ? ` --data-root "${dataRoot}"` : ''}`
     return (
       <div>
         <Card title="重复文件" size="small" style={{ marginBottom: 16 }}>
@@ -111,7 +115,7 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
               可执行命令启用完整哈希后重新查看：
             </Text>
             <Text code>
-              cldm hash {snapshotId} --policy full
+              {hashCommand}
             </Text>
           </Space>
         </Card>

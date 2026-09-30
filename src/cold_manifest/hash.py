@@ -104,7 +104,8 @@ def hash_file(path: "str | Path", algo: str = "sha256", policy: str = "full",
 
 def _resolve_host_path(snapshot_conn: sqlite3.Connection,
                        catalog_conn: sqlite3.Connection, snapshot_id: str,
-                       root: "str | Path | None" = None) -> Path:
+                       root: "str | Path | None" = None,
+                       data_root: "str | Path | None" = None) -> Path:
     """定位快照源目录。
 
     优先级：显式 root 覆盖 > catalog.snapshots.host_path（须为目录）>
@@ -127,7 +128,10 @@ def _resolve_host_path(snapshot_conn: sqlite3.Connection,
 
     row = find_snapshot(catalog_conn, snapshot_id)
     if row is None:
-        raise HashError(f"快照未注册：{snapshot_id}")
+        raise HashError(
+            f"快照未注册：{snapshot_id}"
+            + (f"（数据根：{Path(data_root).resolve()}）" if data_root is not None else "")
+            + "；若与 Web 服务的数据根不同，请用 --data-root 指定（或设 CLDM_DATA_ROOT）")
     host_path = Path(row["host_path"]) if row["host_path"] else None
     if host_path is not None and host_path.is_dir():
         return host_path
@@ -177,7 +181,8 @@ def hash_snapshot(conn: sqlite3.Connection, data_root: "str | Path", snapshot_id
     own_catalog = catalog_conn is None
     cat = catalog_conn if own_catalog is False else connect_catalog(data_root)
     try:
-        host_path = _resolve_host_path(conn, cat, snapshot_id, root=root)
+        host_path = _resolve_host_path(conn, cat, snapshot_id, root=root,
+                                       data_root=data_root)
 
         total = conn.execute(
             "SELECT COUNT(*) FROM entries WHERE type='file' AND hash_hex IS NULL"

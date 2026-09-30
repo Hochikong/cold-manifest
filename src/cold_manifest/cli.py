@@ -14,6 +14,15 @@ from .exporter import export_v1_csv as _export_v1_csv
 from .exporter import open_snapshot_rwcheck as _open_snapshot_rwcheck
 
 
+def _default_data_root() -> str:
+    """--data-root 默认值：环境变量 CLDM_DATA_ROOT 优先，否则 ./data。
+
+    与 serve / start.cmd / cldm.cmd 的口径保持一致，保证包内 CLI 与
+    Web 服务默认使用同一个数据根（<包根>\\data）。
+    """
+    return os.environ.get("CLDM_DATA_ROOT") or "./data"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cldm",
@@ -29,7 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_collect = sub.add_parser("collect", help="采集一个卷：probe → 扫描 → 封库 → 盘上副本 → 注册")
     p_collect.add_argument("root", help="扫描根目录（卷挂载点/盘符）")
-    p_collect.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_collect.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_collect.add_argument("--volume-id", default=None, help="手动指定卷 ID（默认 {serial}_P{index}）")
     p_collect.add_argument("--serial", default=None, help="手动指定磁盘序列号（USB 桥兜底）")
     p_collect.add_argument("--exclude-glob", action="append", default=[], dest="exclude_globs",
@@ -46,7 +55,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_import = sub.add_parser("import-legacy", help="导入 v1 旧版快照目录（metadata.csv）")
     p_import.add_argument("snapshot_dir", help="旧版快照目录路径")
-    p_import.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_import.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_import.add_argument("--volume-id", default=None, help="手动指定卷 ID（默认从元数据推断）")
     p_import.add_argument("--force", action="store_true", help="目标已存在封库快照时删除重建")
 
@@ -57,30 +66,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("--hash", choices=["none", "sha256"], default="none",
                         help="内容比对模式：sha256 需两快照已 cldm hash，可识别 content_changed / moved_or_renamed")
     p_diff.add_argument("--output", default=None, help="diff 结果写 CSV（category,path,type,size_a,size_b,mtime_a,mtime_b）")
-    p_diff.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_diff.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
     p_export = sub.add_parser("export", help="导出快照为 CSV")
     p_export.add_argument("snapshot", help="快照 ID 或路径")
     p_export.add_argument("--format", choices=["csv", "v1_csv"], default="csv", help="导出格式（默认 csv）")
     p_export.add_argument("--output", default=None,
                           help="csv：输出文件路径；v1_csv：输出目录（产出 metadata/tree/warnings 三件套）")
-    p_export.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_export.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
     p_fts = sub.add_parser("build-fts",
                            help="为已有封库快照就地补建 FTS5 全文索引（显式升级动作）")
     p_fts.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
-    p_fts.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_fts.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
     p_stats = sub.add_parser("build-stats",
                              help="为已有封库快照就地补建 stats 预计算表（显式升级动作）")
     p_stats.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
-    p_stats.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_stats.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
     p_hash = sub.add_parser("hash",
                             help="为快照补算文件哈希（按需，可续算，跨快照缓存复用；"
                                  "缓存键不含 volume_id，跨盘同名同大小同 mtime 可能复用旧哈希）")
     p_hash.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
-    p_hash.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_hash.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_hash.add_argument("--algo", default="sha256", help="哈希算法（默认 sha256）")
     p_hash.add_argument("--policy", choices=["full", "sampled"], default="full",
                         help="哈希策略：full=整文件（默认，diff 内容比对可用）；"
@@ -93,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_dups = sub.add_parser("duplicates",
                             help="快照内重复文件报告（按完整哈希分组；要求已 cldm hash --policy full）")
     p_dups.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
-    p_dups.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_dups.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_dups.add_argument("--min-size", type=int, default=1048576,
                         help="只统计 ≥ 此字节数的文件（默认 1048576 = 1MiB）")
     p_dups.add_argument("--limit", type=int, default=100, help="列出前 N 组（默认 100，上限 1000）")
@@ -104,7 +113,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_verify = sub.add_parser("verify-copy",
                               help="校验快照盘上副本与源文件完整性（只读；退出码 0 一致 / 1 不一致 / 2 错误）")
     p_verify.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
-    p_verify.add_argument("--data-root", default="./data", help="数据根目录（默认 ./data）")
+    p_verify.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_verify.add_argument("--sample", type=int, default=0,
                           help="源文件随机抽检条数（需快照已 cldm hash --policy full；默认 0 = 只对副本）")
     p_verify.add_argument("--full", action="store_true",
@@ -404,7 +413,9 @@ def _cmd_hash(args: argparse.Namespace) -> int:
     cat = connect_catalog(data_root)
     try:
         if find_snapshot(cat, args.snapshot_id) is None:
-            print(f"错误：快照未注册：{args.snapshot_id}", file=sys.stderr)
+            print(f"错误：快照未注册：{args.snapshot_id}（数据根：{Path(args.data_root).resolve()}）\n"
+                  f"若与 Web 服务的数据根不同，请用 --data-root 指定（或设 CLDM_DATA_ROOT）。",
+                  file=sys.stderr)
             return 2
     finally:
         cat.close()
