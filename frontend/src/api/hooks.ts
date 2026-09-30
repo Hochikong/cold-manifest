@@ -25,6 +25,11 @@ import {
   getTask,
   getBatch,
   getSettings,
+  listDisks,
+  getDisk,
+  getDiskSmartHistory,
+  collectPreflight,
+  deleteSnapshot,
   type ListEntriesParams,
   type SearchParams,
   type DiffEntriesParams,
@@ -112,6 +117,55 @@ export function useVolumes() {
     queryKey: ['volumes'],
     queryFn: listVolumes,
     staleTime: 60_000,
+  })
+}
+
+export function useDisks() {
+  return useQuery({
+    queryKey: ['disks'],
+    queryFn: listDisks,
+    staleTime: 60_000,
+  })
+}
+
+export function useDisk(disk_id: string | undefined) {
+  return useQuery({
+    queryKey: ['disk', disk_id],
+    queryFn: () => getDisk(disk_id!),
+    enabled: !!disk_id,
+    staleTime: 60_000,
+  })
+}
+
+export function useDiskSmartHistory(disk_id: string | undefined) {
+  return useQuery({
+    queryKey: ['disk-smart', disk_id],
+    queryFn: () => getDiskSmartHistory(disk_id!),
+    enabled: !!disk_id,
+    staleTime: 60_000,
+  })
+}
+
+export function useCollectPreflight(path: string) {
+  const trimmed = path.trim()
+  return useQuery({
+    queryKey: ['collect-preflight', trimmed],
+    queryFn: () => collectPreflight({ path: trimmed }),
+    enabled: trimmed.length > 0,
+    staleTime: 30_000,
+  })
+}
+
+export function useDeleteSnapshot() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ snapshot_id, on_disk, force }: { snapshot_id: string; on_disk: 'keep' | 'delete'; force: boolean }) =>
+      deleteSnapshot(snapshot_id, { on_disk, force }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['snapshots'] })
+      qc.invalidateQueries({ queryKey: ['disks'] })
+      qc.invalidateQueries({ queryKey: ['volumes'] })
+    },
   })
 }
 

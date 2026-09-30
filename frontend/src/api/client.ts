@@ -245,6 +245,142 @@ export async function listVolumes(): Promise<VolumesResponse> {
   return data
 }
 
+export interface LatestSmart {
+  health: string
+  temperature_c: number | null
+  power_on_hours: number | null
+  reallocated_ct: number | null
+  pending_ct: number | null
+  collected_at: string
+}
+
+export interface Disk {
+  disk_id: string
+  physical_model: string | null
+  physical_serial: string | null
+  bridge_model: string | null
+  capacity_bytes: number
+  interface_type: string | null
+  first_seen: string
+  last_seen: string
+  volume_count: number
+  snapshot_count: number
+  latest_smart: LatestSmart | null
+}
+
+export interface DisksResponse {
+  items: Disk[]
+  count: number
+}
+
+export async function listDisks(): Promise<DisksResponse> {
+  const { data } = await client.get('/disks')
+  return data
+}
+
+export interface DiskVolume {
+  volume_id: string
+  disk_id: string
+  partition_index: number | null
+  partition_uuid: string | null
+  volume_serial_hex: string | null
+  filesystem: string
+  label: string | null
+  capacity_bytes: number
+  notes: string | null
+}
+
+export interface DiskSnapshot {
+  snapshot_id: string
+  volume_id: string
+  collected_at: string
+  status: string
+  file_count: number
+  dir_count: number
+  total_bytes: number
+  skipped_count: number
+}
+
+export interface DiskDetail extends Disk {
+  notes: string | null
+  volumes: DiskVolume[]
+  snapshots: DiskSnapshot[]
+}
+
+export async function getDisk(disk_id: string): Promise<DiskDetail> {
+  const { data } = await client.get(`/disks/${encodeURIComponent(disk_id)}`)
+  return data
+}
+
+export interface SmartItem {
+  disk_id: string
+  snapshot_id: string
+  collected_at: string
+  health: string
+  temperature_c: number | null
+  power_on_hours: number | null
+  reallocated_ct: number | null
+  pending_ct: number | null
+  start_stop_ct: number | null
+  spin_up_ms: number | null
+  device_type: string | null
+  raw_json: string | null
+  source: string
+}
+
+export interface SmartHistoryResponse {
+  disk_id: string
+  items: SmartItem[]
+  count: number
+}
+
+export async function getDiskSmartHistory(disk_id: string): Promise<SmartHistoryResponse> {
+  const { data } = await client.get(`/disks/${encodeURIComponent(disk_id)}/smart`)
+  return data
+}
+
+export interface PreflightBody {
+  path: string
+}
+
+export interface PreflightResponse {
+  path: string
+  writable: boolean
+  smartctl_available: boolean
+  smartctl_path: string | null
+  device_type_hint: string
+  is_smart_capable: boolean
+  warnings: string[]
+}
+
+export async function collectPreflight(body: PreflightBody): Promise<PreflightResponse> {
+  const { data } = await client.post('/collect/preflight', body)
+  return data
+}
+
+export interface DeleteSnapshotResponse {
+  snapshot_id: string
+  deleted_host: boolean
+  deleted_disk: boolean | null
+  freed_bytes: number
+  diffs_removed: string[]
+  warnings: string[]
+}
+
+export interface DeleteSnapshotBlocked {
+  message: string
+  diffs: string[]
+  tasks: string[]
+}
+
+export async function deleteSnapshot(
+  snapshot_id: string,
+  params: { on_disk: 'keep' | 'delete'; force: boolean }
+): Promise<DeleteSnapshotResponse> {
+  const { data } = await client.delete(`/snapshots/${encodeURIComponent(snapshot_id)}`, { params })
+  return data
+}
+
 export interface VolumeTrendItem {
   snapshot_id: string
   collect_time: string

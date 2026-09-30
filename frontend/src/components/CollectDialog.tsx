@@ -23,9 +23,11 @@ import {
   CloudSyncOutlined,
   PartitionOutlined,
   ReloadOutlined,
+  SafetyOutlined,
+  WarningOutlined,
 } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
-import { useCreateCollect, useCancelTask, useTaskEvents, useBatch } from '../api/hooks'
+import { useCreateCollect, useCancelTask, useTaskEvents, useBatch, useCollectPreflight } from '../api/hooks'
 import { isBatchCollectResponse, type BatchCollectCreateResponse, type Task, type Batch } from '../api/client'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatFileSize, formatNumber } from '../utils/format'
@@ -161,8 +163,10 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
     navigate(`/snapshots?snapshot=${encodeURIComponent(snapshotId)}`)
   }
 
+  const { data: preflight } = useCollectPreflight(path)
+
   const canStart =
-    !createCollectMutation.isPending && path.trim().length > 0
+    !createCollectMutation.isPending && path.trim().length > 0 && preflight?.writable !== false
 
   const singleTask = taskId ? task : null
   const isSingleActive = singleTask && (singleTask.status === 'pending' || singleTask.status === 'running')
@@ -196,6 +200,8 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
                 prefix={<FolderOpenOutlined />}
               />
             </Form.Item>
+
+            <PreflightSection path={path} />
 
             <Form.Item
               label="磁盘序列号"
@@ -579,6 +585,107 @@ function DoneDescription({ task }: { task: Task }) {
   if (typeof r.dirs === 'number') parts.push(`${formatNumber(r.dirs)} 个目录`)
   if (typeof r.total_bytes === 'number') parts.push(formatFileSize(r.total_bytes))
   return parts.length ? parts.join(' · ') : '采集任务已完成'
+}
+
+function PreflightSection({ path }: { path: string }) {
+  const { data: preflight, isLoading, error } = useCollectPreflight(path)
+
+  if (!path.trim()) {
+    return (
+      <Alert
+        type="info"
+        showIcon
+        icon={<SafetyOutlined />}
+        title="依赖检查"
+        description="输入采集路径后将自动检查写权限与 smartctl 可用性。"
+      />
+    )
+  }
+
+  if (isLoading) {
+    return (
+      <Alert
+        type="info"
+        showIcon
+        icon={<SafetyOutlined />}
+        title="依赖检查"
+        description="正在检查…"
+      />
+    )
+  }
+
+  if (error) {
+    return (
+      <Alert
+        type="warning"
+        showIcon
+        icon={<WarningOutlined />}
+        title="依赖检查失败"
+        description={error instanceof Error ? error.message : String(error)}
+      />
+    )
+  }
+
+  if (!preflight) {
+    return null
+  }
+
+  const items = [
+    {
+      ok: preflight.writable,
+      label: '写权限',
+      okText: '可写',
+      failText: '不可写',
+    },
+    {
+      ok: preflight.smartctl_available,
+      label: 'smartctl',
+      okText: preflight.smartctl_path ? `可用（${preflight.smartctl_path}）` : '可用',
+      failText: '不可用',
+    },
+  ]
+
+  return (
+    <Alert
+      type={preflight.writable ? 'success' : 'error'}
+      showIcon
+      icon={<SafetyOutlined />}
+      title="依赖检查"
+      description={
+        <Space orientation="vertical" style={{ width: '100%' }} size="small">
+          <Space wrap>
+            {items.map((item) => (
+              <Tag
+                key={item.label}
+                color={item.ok ? 'success' : 'error'}
+                icon={item.ok ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
+              >
+                {item.label}：{item.ok ? item.okText : item.failText}
+              </Tag>
+            ))}
+          </Space>
+          {!preflight.writable && (
+            <Text type="danger">路径不可写，无法开始采集。请检查路径是否存在以及当前用户是否有写入权限。</Text>
+          )}
+          {!preflight.smartctl_available && (
+            <Text type="secondary">
+              smartctl 不可用。如需采集 SMART，请安装 smartmontools，或设置环境变量 <Text code>CLDM_SMARTCTL</Text> 指向 smartctl 路径。
+              USB 桥接盘通常需要加 <Text code>-d sat</Text> 参数。
+            </Text>
+          )}
+          {preflight.warnings.length > 0 && (
+            <Space orientation="vertical" size={0}>
+              {preflight.warnings.map((w, idx) => (
+                <Text key={idx} type="warning">
+                  <WarningOutlined /> {w}
+                </Text>
+              ))}
+            </Space>
+          )}
+        </Space>
+      }
+    />
+  )
 }
 
 function isTerminal(status: Task['status']): boolean {

@@ -20,6 +20,9 @@ import {
   Alert,
   Drawer,
   Tooltip,
+  Modal,
+  Checkbox,
+  App,
 } from 'antd'
 import {
   FolderOutlined,
@@ -29,6 +32,8 @@ import {
   SearchOutlined,
   ArrowLeftOutlined,
   HomeOutlined,
+  DeleteOutlined,
+  ExclamationCircleOutlined,
 } from '@ant-design/icons'
 import type { DataNode } from 'antd/es/tree'
 import ReactECharts from 'echarts-for-react'
@@ -40,11 +45,13 @@ import {
   useTree,
   useDu,
   useSearch,
+  useDeleteSnapshot,
 } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import DuplicateReport from '../components/DuplicateReport'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
-import { exportSnapshotUrl, type Entry, type TreeDir, type SearchItem } from '../api/client'
+import { exportSnapshotUrl, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked } from '../api/client'
+import axios from 'axios'
 
 const { Title, Text } = Typography
 const { Option } = Select
@@ -67,10 +74,18 @@ function sortArrow(order: Order) {
 export default function SnapshotsPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
+  const { message } = App.useApp()
   const snapshotId = searchParams.get('snapshot') || undefined
   const activeTab = searchParams.get('tab') || 'overview'
 
-  const { data: snapshots, isLoading: listLoading, error: listError } = useSnapshots()
+  const { data: snapshots, isLoading: listLoading, error: listError, refetch: refetchSnapshots } = useSnapshots()
+  const deleteMutation = useDeleteSnapshot()
+
+  const [deleteTarget, setDeleteTarget] = useState<{ snapshot_id: string; displayName: string } | null>(null)
+  const [deleteOnDisk, setDeleteOnDisk] = useState(false)
+  const [deleteForce, setDeleteForce] = useState(false)
+  const [deleteBlocked, setDeleteBlocked] = useState<DeleteSnapshotBlocked | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
 
   const setTab = (tab: string) => {
     const next = new URLSearchParams(searchParams)
@@ -78,19 +93,84 @@ export default function SnapshotsPage() {
     setSearchParams(next, { replace: true })
   }
 
+  const openDelete = (id: string) => {
+    setDeleteTarget({ snapshot_id: id, displayName: getSnapshotDisplayName(id) })
+    setDeleteOnDisk(false)
+    setDeleteForce(false)
+    setDeleteBlocked(null)
+    setDeleteError(null)
+  }
+
+  const closeDelete = () => {
+    setDeleteTarget(null)
+    setDeleteBlocked(null)
+    setDeleteError(null)
+  }
+
+  const doDelete = async () => {
+    if (!deleteTarget) return
+    setDeleteError(null)
+    try {
+      const res = await deleteMutation.mutateAsync({
+        snapshot_id: deleteTarget.snapshot_id,
+        on_disk: deleteOnDisk ? 'delete' : 'keep',
+        force: deleteForce,
+      })
+      const parts: string[] = ['快照已删除']
+      if (res.deleted_host) parts.push('主机目录已清理')
+      if (res.deleted_disk === true) parts.push('盘上副本已清理')
+      if (res.freed_bytes > 0) parts.push(`释放 ${formatFileSize(res.freed_bytes)}`)
+      if (res.diffs_removed.length > 0) parts.push(`级联删除 ${res.diffs_removed.length} 个对比`)
+      message.success(parts.join(' · '))
+      closeDelete()
+      await refetchSnapshots()
+      if (snapshotId === deleteTarget.snapshot_id) {
+        navigate('/snapshots')
+      }
+    } catch (e) {
+      if (axios.isAxiosError(e) && e.response?.status === 409) {
+        const detail = e.response.data
+        if (detail && typeof detail === 'object' && 'message' in detail) {
+          const blocked = detail as DeleteSnapshotBlocked
+          setDeleteBlocked(blocked)
+          setDeleteError(blocked.message)
+        } else {
+          setDeleteError(typeof detail === 'string' ? detail : '删除被阻塞，请确认相关任务或对比')
+        }
+      } else {
+        setDeleteError(e instanceof Error ? e.message : String(e))
+      }
+    }
+  }
+
   if (!snapshotId) {
     return (
-      <SnapshotListView
-        snapshots={snapshots?.items}
-        loading={listLoading}
-        error={listError}
-        onSelect={(id) => {
-          const next = new URLSearchParams()
-          next.set('snapshot', id)
-          next.set('tab', 'overview')
-          setSearchParams(next)
-        }}
-      />
+      <>
+        <SnapshotListView
+          snapshots={snapshots?.items}
+          loading={listLoading}
+          error={listError}
+          onSelect={(id) => {
+            const next = new URLSearchParams()
+            next.set('snapshot', id)
+            next.set('tab', 'overview')
+            setSearchParams(next)
+          }}
+          onDelete={openDelete}
+        />
+        <DeleteSnapshotModal
+          target={deleteTarget}
+          onDisk={deleteOnDisk}
+          onDiskChange={setDeleteOnDisk}
+          force={deleteForce}
+          forceChange={setDeleteForce}
+          blocked={deleteBlocked}
+          error={deleteError}
+          loading={deleteMutation.isPending}
+          onCancel={closeDelete}
+          onConfirm={doDelete}
+        />
+      </>
     )
   }
 
@@ -108,12 +188,24 @@ export default function SnapshotsPage() {
         activeKey={activeTab}
         onChange={setTab}
         items={[
-          { key: 'overview', label: '概览', children: <SnapshotOverview snapshotId={snapshotId} /> },
+          { key: 'overview', label: '概览', children: <SnapshotOverview snapshotId={snapshotId} onDelete={() => openDelete(snapshotId)} /> },
           { key: 'browse', label: '浏览', children: <DirectoryBrowser snapshotId={snapshotId} /> },
           { key: 'duplicates', label: '重复文件', children: <DuplicateReport snapshotId={snapshotId} /> },
           { key: 'search', label: '搜索', children: <SearchPanel snapshotId={snapshotId} /> },
           { key: 'export', label: '导出', children: <ExportPanel snapshotId={snapshotId} /> },
         ]}
+      />
+      <DeleteSnapshotModal
+        target={deleteTarget}
+        onDisk={deleteOnDisk}
+        onDiskChange={setDeleteOnDisk}
+        force={deleteForce}
+        forceChange={setDeleteForce}
+        blocked={deleteBlocked}
+        error={deleteError}
+        loading={deleteMutation.isPending}
+        onCancel={closeDelete}
+        onConfirm={doDelete}
       />
     </div>
   )
@@ -124,11 +216,13 @@ function SnapshotListView({
   loading,
   error,
   onSelect,
+  onDelete,
 }: {
   snapshots?: { snapshot_id: string; volume_id: string; collected_at: string; file_count: number; total_bytes: number }[]
   loading: boolean
   error: unknown
   onSelect: (id: string) => void
+  onDelete: (id: string) => void
 }) {
   const columns = [
     { title: '快照 ID', dataIndex: 'snapshot_id', key: 'snapshot_id', ellipsis: true },
@@ -140,9 +234,14 @@ function SnapshotListView({
       title: '操作',
       key: 'action',
       render: (_: unknown, record: { snapshot_id: string }) => (
-        <Button type="primary" onClick={() => onSelect(record.snapshot_id)}>
-          查看
-        </Button>
+        <Space>
+          <Button type="primary" onClick={() => onSelect(record.snapshot_id)}>
+            查看
+          </Button>
+          <Button danger icon={<DeleteOutlined />} onClick={() => onDelete(record.snapshot_id)}>
+            删除
+          </Button>
+        </Space>
       ),
     },
   ]
@@ -163,7 +262,7 @@ function SnapshotListView({
   )
 }
 
-function SnapshotOverview({ snapshotId }: { snapshotId: string }) {
+function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDelete: () => void }) {
   const { data: snapshot, isLoading: detailLoading, error: detailError } = useSnapshot(snapshotId)
   const { data: stats, isLoading: statsLoading, error: statsError } = useSnapshotStats(snapshotId)
   const { data: du, isLoading: duLoading, error: duError } = useDu(snapshotId, 0, 20)
@@ -248,7 +347,15 @@ function SnapshotOverview({ snapshotId }: { snapshotId: string }) {
         </Col>
       </Row>
 
-      <Card title="元数据" style={{ marginTop: 16 }}>
+      <Card
+        title="元数据"
+        style={{ marginTop: 16 }}
+        extra={
+          <Button danger icon={<DeleteOutlined />} onClick={onDelete}>
+            删除快照
+          </Button>
+        }
+      >
         <Space orientation="vertical" style={{ width: '100%' }}>
           <Text>快照 ID：<Text code>{snapshot?.snapshot_id}</Text></Text>
           <Text>卷 ID：<Text code>{snapshot?.volume_id}</Text></Text>
@@ -799,6 +906,87 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
         />
       )}
     </div>
+  )
+}
+
+function DeleteSnapshotModal({
+  target,
+  onDisk,
+  onDiskChange,
+  force,
+  forceChange,
+  blocked,
+  error,
+  loading,
+  onCancel,
+  onConfirm,
+}: {
+  target: { snapshot_id: string; displayName: string } | null
+  onDisk: boolean
+  onDiskChange: (v: boolean) => void
+  force: boolean
+  forceChange: (v: boolean) => void
+  blocked: DeleteSnapshotBlocked | null
+  error: string | null
+  loading: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  if (!target) return null
+
+  const hasForceRequirement = !!blocked && (blocked.diffs.length > 0 || blocked.tasks.length > 0)
+  const canConfirm = !hasForceRequirement || force
+
+  return (
+    <Modal
+      title={
+        <Space>
+          <ExclamationCircleOutlined style={{ color: '#ff4d4f' }} />
+          <span>删除快照</span>
+        </Space>
+      }
+      open={!!target}
+      onCancel={onCancel}
+      onOk={onConfirm}
+      confirmLoading={loading}
+      okButtonProps={{ danger: true, disabled: !canConfirm }}
+      okText="确认删除"
+      cancelText="取消"
+    >
+      <Space orientation="vertical" style={{ width: '100%' }}>
+        <Text>即将删除快照：<Text code>{target.displayName}</Text></Text>
+        <Text type="secondary">快照 ID：<Text code>{target.snapshot_id}</Text></Text>
+        <Text>该操作会删除主机上的快照目录，且不可恢复。</Text>
+
+        <Checkbox checked={onDisk} onChange={(e) => onDiskChange(e.target.checked)}>
+          同时删除盘上副本（<Text code>on_disk=delete</Text>）
+        </Checkbox>
+
+        {hasForceRequirement && (
+          <Alert
+            type="warning"
+            showIcon
+            title="删除被阻塞"
+            description={
+              <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+                <Text>{blocked!.message}</Text>
+                {blocked!.diffs.length > 0 && (
+                  <Text type="secondary">关联对比：{blocked!.diffs.join(', ')}</Text>
+                )}
+                {blocked!.tasks.length > 0 && (
+                  <Text type="secondary">活跃任务：{blocked!.tasks.join(', ')}</Text>
+                )}
+                <Checkbox checked={force} onChange={(e) => forceChange(e.target.checked)}>
+                  我已确认，同时删除相关对比（<Text code>force=true</Text>）
+                </Checkbox>
+              </Space>
+            }
+          />
+        )}
+
+        {error && !hasForceRequirement && <Alert type="error" showIcon message={error} />}
+      </Space>
+    </Modal>
   )
 }
 
