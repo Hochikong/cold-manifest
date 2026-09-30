@@ -1,5 +1,6 @@
-"""snapshots 相关只读端点（§6.2）：列表/详情/stats/entries/tree/du/search/skipped。"""
+"""snapshots 相关只读端点（§6.2）：列表/详情/stats/entries/tree/du/search/skipped/report。"""
 
+import io
 import sqlite3
 from typing import Any, Literal
 
@@ -623,6 +624,50 @@ def delete_snapshot_ep(
         raise HTTPException(status_code=409, detail=detail) from None
     finally:
         lock.release()
+
+
+# ---------------------------------------------------------------- 报告（P4-⑦）
+# 注意：必须位于文件底部 catch-all 详情端点之前，否则 /report 会被吞
+
+
+@router.get("/{snapshot_id:path}/report")
+def snapshot_report(
+    snapshot_id: str,
+    request: Request,
+    format: str = Query(default="html"),
+    max_rows: int = Query(default=1000, ge=1, le=10000),
+):
+    """快照自包含 HTML 报告：format=html（其他值 → 400）。
+
+    头部元信息/SMART 摘要取自 catalog；聚合段优先 stats_precomputed 直读
+    （旧库回退实时聚合，响应内容一致）。
+    """
+    from ..report import generate_snapshot_report
+    from fastapi.responses import HTMLResponse
+
+    if format != "html":
+        raise HTTPException(status_code=400,
+                            detail=f"非法 format：{format!r}（当前仅支持 html）")
+    state = get_state(request)
+    row = _require_snapshot(state, snapshot_id)
+    conn = _snap_db(request, snapshot_id)
+    vol = state.catalog.execute(
+        "SELECT v.*, d.physical_model FROM volumes v"
+        " LEFT JOIN disks d ON d.disk_id = v.disk_id WHERE v.volume_id=?",
+        (row["volume_id"],),
+    ).fetchone()
+    smart_row = None
+    if vol is not None:
+        smart_row = state.catalog.execute(
+            "SELECT * FROM disk_smart WHERE disk_id=?"
+            " ORDER BY collected_at DESC LIMIT 1",
+            (vol["disk_id"],),
+        ).fetchone()
+    buf = io.StringIO()
+    generate_snapshot_report(conn, buf, snapshot_id=snapshot_id,
+                             snapshot_row=row, volume_row=vol,
+                             smart_row=smart_row, max_rows_per_section=max_rows)
+    return HTMLResponse(content=buf.getvalue(), media_type="text/html")
 
 
 # ---------------------------------------------------------------- 详情（最后注册：:path 转换器会吞子路径）

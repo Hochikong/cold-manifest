@@ -159,6 +159,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--root", default=None,
                           help="显式指定扫描根（覆盖 meta/catalog 记录，须为目录）")
 
+    p_report = sub.add_parser("report", help="生成快照自包含 HTML 报告（无 JS，单文件）")
+    p_report.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_report.add_argument("--html", "--output", dest="html", default=None,
+                          metavar="PATH", help="报告输出路径（.html）")
+    p_report.add_argument("--max-rows", type=int, default=1000,
+                          help="每节最大行数（默认 1000，超限标注截断）")
+    p_report.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+
+    p_rebuild = sub.add_parser("rebuild-catalog",
+                               help="扫描 data/*/*/snapshot.db 的 meta 补建/回填"
+                                    " catalog 注册行（幂等，不覆盖已有值，不动 diff_runs）")
+    p_rebuild.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+    p_rebuild.add_argument("--dry-run", action="store_true",
+                           help="只输出将补/将修的行数，不写任何东西")
+
+    p_impdb = sub.add_parser("import-db",
+                             help="把一个已封库的 snapshot.db 就地登记进 catalog"
+                                  "（仅就地登记，不拷贝文件）")
+    p_impdb.add_argument("db_path", help="snapshot.db 路径（须为 <volume_id>/<ts>/snapshot.db 布局）")
+    p_impdb.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+    p_impdb.add_argument("--in-place", action="store_true",
+                         help="默认行为即就地登记（占位参数，保持与文档口径一致）")
+    p_impdb.add_argument("--copy", action="store_true",
+                         help="未实现：当前仅支持就地登记（--copy 会被拒绝）")
+
     return parser
 
 
@@ -732,6 +757,109 @@ def _cmd_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- report / rebuild-catalog / import-db -----------------------------------
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    """快照自包含 HTML 报告（P4-⑦）：快照 ID 或库路径均可。"""
+    import io
+
+    from .db import open_snapshot
+    from .report import generate_snapshot_report
+
+    if not args.html:
+        print("错误：需要 --html <path>（或 --output）指定报告输出路径", file=sys.stderr)
+        return 2
+    if args.max_rows < 1:
+        print("错误：--max-rows 须 ≥ 1", file=sys.stderr)
+        return 2
+
+    db = Path(args.snapshot_id)
+    catalog_row = vol_row = smart_row = None
+    if not db.is_file():
+        from .catalog import connect_catalog, snapshot_path
+        db = snapshot_path(args.data_root, args.snapshot_id)
+        if not db.is_file():
+            print(f"错误：快照不存在：{args.snapshot_id}（{db}）", file=sys.stderr)
+            return 2
+        try:
+            cat = None
+            cat = connect_catalog(args.data_root)
+            catalog_row = cat.execute(
+                "SELECT * FROM snapshots WHERE snapshot_id=?",
+                (args.snapshot_id,)).fetchone()
+            if catalog_row is not None:
+                vol_row = cat.execute(
+                    "SELECT * FROM volumes WHERE volume_id=?",
+                    (catalog_row["volume_id"],)).fetchone()
+                if vol_row is not None:
+                    smart_row = cat.execute(
+                        "SELECT * FROM disk_smart WHERE disk_id=?"
+                        " ORDER BY collected_at DESC LIMIT 1",
+                        (vol_row["disk_id"],)).fetchone()
+        finally:
+            if cat is not None:
+                cat.close()
+
+    conn = open_snapshot(db)
+    try:
+        summary = generate_snapshot_report(
+            conn, args.html, snapshot_id=args.snapshot_id,
+            snapshot_row=catalog_row, volume_row=vol_row, smart_row=smart_row,
+            max_rows_per_section=args.max_rows)
+    finally:
+        conn.close()
+    print(f"HTML 报告：{args.html}")
+    print(f"  文件：{summary['file_count']:,}  目录：{summary['dir_count']:,}"
+          f"  总大小：{summary['total_bytes']:,} B  最大深度：{summary['max_depth']}"
+          f"  跳过：{summary['skipped_total']:,}")
+    return 0
+
+
+def _cmd_rebuild_catalog(args: argparse.Namespace) -> int:
+    """catalog 重建（P4-⑥）：扫描快照库 meta 补建/回填注册行。"""
+    from .rebuild import RebuildError, rebuild_catalog
+
+    try:
+        result = rebuild_catalog(args.data_root, dry_run=args.dry_run)
+    except RebuildError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+
+    tag = "（dry-run，未写入）" if args.dry_run else ""
+    print(f"catalog 重建完成{tag}：扫描 {result['scanned']} 个快照库")
+    print(f"  新增：磁盘 {result['disks_added']}  卷 {result['volumes_added']}"
+          f"  快照 {result['snapshots_added']}  盘上副本行 {result['copies_added']}")
+    print(f"  回填字段：{result['fields_backfilled']}"
+          f"  跳过（已完整）：{result['snapshots_skipped']} 个快照")
+    for w in result["warnings"]:
+        print(f"  警告：{w}")
+    return 0
+
+
+def _cmd_import_db(args: argparse.Namespace) -> int:
+    """就地登记 snapshot.db（P4-⑧）：幂等；未实现 --copy。"""
+    from .import_db import ImportDbError, import_snapshot_db
+
+    if args.copy:
+        print("错误：--copy 未实现，当前仅支持就地登记（不加 --copy 即可）",
+              file=sys.stderr)
+        return 2
+
+    try:
+        result = import_snapshot_db(args.db_path, args.data_root)
+    except ImportDbError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+
+    print(f"{'登记完成' if result['created'] else '已登记（更新字段）'}："
+          f"{result['snapshot_id']}")
+    print(f"  库：{result['db_path']}")
+    print(f"  数据根：{Path(args.data_root).resolve()}")
+    for w in result["warnings"]:
+        print(f"  警告：{w}")
+    return 0
+
+
 # ---- main -------------------------------------------------------------------
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -789,6 +917,15 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "verify-copy":
         return _cmd_verify_copy(args)
+
+    if args.command == "report":
+        return _cmd_report(args)
+
+    if args.command == "rebuild-catalog":
+        return _cmd_rebuild_catalog(args)
+
+    if args.command == "import-db":
+        return _cmd_import_db(args)
 
     if args.command == "hash":
         return _cmd_hash(args)
