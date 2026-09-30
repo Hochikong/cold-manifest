@@ -270,18 +270,25 @@ class TestDispatch:
         return lin.probe_path_linux("/tmp")
 
     def test_smartctl_missing_not_blocking(self, monkeypatch):
-        """smartctl 未安装（FileNotFoundError→ProbeError）不阻断，status=unavailable。"""
+        """smartctl 未安装（FileNotFoundError）不阻断，status=unavailable。
+
+        P4-② 起 smartctl 调用走 smart.read_smart（smart._run_cmd），不再复用
+        probe.linux._run。
+        """
         import subprocess as sp
 
         calls = []
 
         def fake_run(cmd, *, check=True):
             calls.append(cmd[0])
-            if cmd[0] == "smartctl":
-                raise ProbeError("外部工具不可用：smartctl（FileNotFoundError）")
             assert cmd[0] == "lsblk"
             return sp.CompletedProcess(cmd, 0, stdout=LSBLK_JSON, stderr="")
 
+        def fake_smart_run(cmd):
+            calls.append(cmd[0])
+            return None  # smartctl 不可用（_run_cmd 把 OSError/超时折叠为 None）
+
+        monkeypatch.setattr("cold_manifest.smart._run_cmd", fake_smart_run)
         vol, disk = self._run_probe_linux(monkeypatch, fake_run)
         assert "smartctl" in calls
         assert disk.smart_status == "unavailable"
@@ -296,6 +303,10 @@ class TestDispatch:
                 raise ProbeError("外部工具超时：smartctl")
             return sp.CompletedProcess(cmd, 0, stdout=LSBLK_JSON, stderr="")
 
+        def fake_smart_run(cmd):
+            return None  # 超时折叠为 None
+
+        monkeypatch.setattr("cold_manifest.smart._run_cmd", fake_smart_run)
         vol, disk = self._run_probe_linux(monkeypatch, fake_run)
         assert disk.smart_status == "unavailable"
 
@@ -304,11 +315,15 @@ class TestDispatch:
         import subprocess as sp
 
         def fake_run(cmd, *, check=True):
-            if cmd[0] == "smartctl":
-                assert cmd[:3] == ["smartctl", "-i", "-H"]
-                return sp.CompletedProcess(cmd, 0, stdout=SMARTCTL_JSON, stderr="")
+            assert cmd[0] == "lsblk"
             return sp.CompletedProcess(cmd, 0, stdout=LSBLK_JSON, stderr="")
 
+        def fake_smart_run(cmd):
+            assert cmd[0] == "smartctl"
+            assert cmd[1:3] == ["-i", "-H"]
+            return sp.CompletedProcess(cmd, 0, stdout=SMARTCTL_JSON, stderr="")
+
+        monkeypatch.setattr("cold_manifest.smart._run_cmd", fake_smart_run)
         vol, disk = self._run_probe_linux(monkeypatch, fake_run)
         assert disk.smart_status == "passed"
         assert disk.smart_raw == SMARTCTL_JSON

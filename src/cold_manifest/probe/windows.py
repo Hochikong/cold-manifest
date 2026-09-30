@@ -266,6 +266,32 @@ def probe_path_win(
 
     text = run_powershell(build_powershell_command(letter))
     volume, info = parse_windows_json(text, letter)
+
+    # smartctl 可选增强（P4-②）：拿不到不阻断；设备用 PhysicalDrive<N>（盘符在
+    # Windows 版 smartctl 下对 USB 桥盘常无效）
+    if smartctl:
+        try:
+            from ..smart import parse_smart, read_smart
+
+            data = json.loads(text)
+            idx = (data.get("disk") or {}).get("index")
+            device = f"\\\\.\\PhysicalDrive{idx}" if isinstance(idx, int) else f"{letter}:"
+            res = read_smart(device)
+            if res is not None:
+                info.smart_raw = res["raw"]
+                info.smart_device_type = res["device_type"]
+                parsed = parse_smart(res["raw"])
+                info.physical_model = parsed.get("model") or info.physical_model
+                if parsed.get("serial"):
+                    info.physical_serial = parsed["serial"]
+                    if info.serial_source != "manual":
+                        info.disk_serial = parsed["serial"]
+                        info.serial_source = "smartctl"
+                info.firmware = info.firmware or (parsed.get("firmware") or "")
+                info.smart_status = parsed.get("health") or "unavailable"
+        except Exception:  # noqa: BLE001 — SMART 拿不到绝不阻断采集
+            pass
+
     if manual_serial:
         info.disk_serial = manual_serial.strip()
         info.serial_source = "manual"

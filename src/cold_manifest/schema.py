@@ -144,6 +144,23 @@ CREATE TABLE IF NOT EXISTS hash_cache (
   created_at TEXT,
   PRIMARY KEY (size_bytes, mtime_ns, path_norm, algo)
 );
+
+-- SMART 历史（P4-②）：每次采集（或回填）落一行；读写函数在 smart.py（不动 catalog.py）。
+CREATE TABLE IF NOT EXISTS disk_smart (
+  disk_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  collected_at TEXT,
+  health TEXT,                           -- passed | failed | unavailable
+  temperature_c INTEGER,
+  power_on_hours INTEGER,
+  reallocated_ct INTEGER,
+  pending_ct INTEGER,
+  start_stop_ct INTEGER,
+  spin_up_ms INTEGER,
+  device_type TEXT,                      -- smartctl -d 生效类型（sat/ata/...）
+  raw_json TEXT,
+  PRIMARY KEY (disk_id, snapshot_id)
+);
 """
 
 # §5.3 diff 物化库

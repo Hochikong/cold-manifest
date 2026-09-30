@@ -167,6 +167,15 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
         return None if v is None or v == "" else str(v)
 
     smart_raw = getattr(disk, "smart_raw", None)
+    smart_struct: dict = {}
+    if smart_raw:
+        raw_text = smart_raw if isinstance(smart_raw, str) else json.dumps(smart_raw)
+        try:
+            from .smart import parse_smart
+
+            smart_struct = parse_smart(raw_text)
+        except Exception:  # noqa: BLE001 — 结构化字段失败不阻断采集
+            smart_struct = {}
     meta: dict[str, str | None] = {
         "volume_id": volume_id,
         "disk_serial": s(disk.disk_serial),
@@ -204,6 +213,12 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
     }
     if smart_raw:
         meta["smart_raw_json"] = smart_raw if isinstance(smart_raw, str) else json.dumps(smart_raw)
+        # 结构化字段（P4-②）：smart_* 前缀；缺失/None 不写键
+        for key in ("health", "temperature_c", "power_on_hours", "reallocated_ct",
+                    "pending_ct", "start_stop_ct", "spin_up_ms", "device_type"):
+            v = smart_struct.get(key)
+            if v is not None:
+                meta[f"smart_{key}"] = str(v)
     if serial_fallback:
         # 序列号回退时的原始探测值（诊断用：说明为何 volume_id 用了卷序列号）
         meta["probe_serial_raw"] = probe_serial_raw
@@ -376,6 +391,17 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
                  on_disk_sha256,
                  collected_at if on_disk_path else None,
                  "ok" if on_disk_path else "skipped_no_space"))
+        # SMART 历史落库（P4-②）：失败只 warning，不阻断注册
+        try:
+            from .smart import parse_smart, record_smart
+
+            smart_raw = getattr(disk, "smart_raw", None)
+            if smart_raw:
+                raw_text = smart_raw if isinstance(smart_raw, str) else json.dumps(smart_raw)
+                record_smart(cat, disk_id, snapshot_id, parse_smart(raw_text),
+                             collected_at=collected_at, raw_json=raw_text)
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"smart_record=failed({e})")
         cat.commit()
     finally:
         cat.close()

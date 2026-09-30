@@ -41,6 +41,7 @@ class DiskInfo:
     firmware: str = ""
     smart_status: str = "unavailable"  # passed / failed / unavailable
     smart_raw: str | None = None  # smartctl -A -j 原始 stdout（拿不到为 None）
+    smart_device_type: str = ""  # smartctl -d 生效类型（"" = 默认参数即成功，"sat" = 重试生效）
 
 
 @dataclass

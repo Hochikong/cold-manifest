@@ -241,23 +241,21 @@ def probe_path_linux(
     smart_status = "unavailable"
     smart_serial = ""
     smart_raw: str | None = None
+    smart_device_type = ""
     if smartctl:
         disk_dev = disk_node.get("path") or os.path.basename(source_dev)
-        try:
-            proc = _run(["smartctl", "-i", "-H", "-A", "-j", disk_dev], check=False)
-        except ProbeError:
-            # smartctl 未安装（FileNotFoundError）或超时（TimeoutExpired）：
-            # 不阻断采集，smart_status 维持 unavailable
-            proc = None
-        if proc is not None and proc.returncode != 0 and not proc.stdout.lstrip().startswith("{"):
-            proc = None  # smartctl 不可用/不支持该盘：不阻断
-        if proc is not None:
+        # smart.py：CLDM_SMARTCTL 可配置 + CLDM_SMARTCTL_ARGS 透传 + -d sat 自动重试；
+        # 拿不到 SMART（未安装/超时/不支持）返回 None：不阻断采集
+        from ..smart import read_smart
+
+        res = read_smart(disk_dev)
+        if res is not None:
+            smart_raw = res["raw"]
+            smart_device_type = res["device_type"]
             try:
-                sj = parse_smartctl(proc.stdout)
+                sj = parse_smartctl(smart_raw)
             except ProbeError:
                 sj = {}
-            else:
-                smart_raw = proc.stdout
             physical_model = sj.get("model_name") or sj.get("device_model") or ""
             smart_serial = (sj.get("serial_number") or "").strip()
             firmware = sj.get("firmware_version") or ""
@@ -286,5 +284,6 @@ def probe_path_linux(
         firmware=firmware,
         smart_status=smart_status,
         smart_raw=smart_raw,
+        smart_device_type=smart_device_type,
     )
     return volume, disk_info
