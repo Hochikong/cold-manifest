@@ -40,7 +40,9 @@ cp -r src "$STAGE/src"
 cp pyproject.toml README.md "$STAGE/"
 cp -r frontend/dist "$STAGE/frontend/dist"
 cp packaging/windows/*.cmd "$STAGE/packaging/windows/"
-cp "docs/Windows-运行说明.md" "$STAGE/docs/"
+mkdir -p "$STAGE/packaging/linux"
+cp packaging/linux/*.sh "$STAGE/packaging/linux/"
+cp "docs/Windows-运行说明.md" "docs/Linux-运行说明.md" "$STAGE/docs/"
 # 清掉开发产物，包内只留干净源码
 find "$STAGE/src" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 rm -rf "$STAGE/src/cold_manifest.egg-info" 2>/dev/null || true
