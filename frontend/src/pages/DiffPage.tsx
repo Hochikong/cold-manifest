@@ -8,8 +8,10 @@ import {
   Select,
   Button,
   Space,
+  Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Empty,
   Spin,
@@ -32,6 +34,15 @@ import { exportDiffUrl, diffReportUrl, type DiffEntry } from '../api/client'
 
 const { Title, Text } = Typography
 
+const EVIDENCE_LABELS: Record<string, string> = {
+  hash: '哈希级',
+  'size+mtime': '大小+时间',
+  unavailable: '不可用',
+  size: '文件大小',
+  mtime: '修改时间',
+  type: '类型',
+}
+
 const CATEGORY_LABELS: Record<string, { label: string; color: string }> = {
   added: { label: '新增', color: 'green' },
   removed: { label: '删除', color: 'red' },
@@ -44,6 +55,31 @@ const CATEGORY_LABELS: Record<string, { label: string; color: string }> = {
 }
 
 const ALL_CATEGORIES = ['added', 'removed', 'size_changed', 'mtime_changed', 'content_changed', 'type_changed', 'moved_or_renamed']
+
+function EvidenceTag({ level, evidence }: { level?: string; evidence?: Record<string, string> }) {
+  if (!level) return <Tag>未知</Tag>
+  const isHash = level === 'hash'
+  const tooltip = (
+    <Space direction="vertical" size={0}>
+      <Text>{isHash ? '哈希级＝内容变更由完整哈希判定，可信。' : '大小+时间＝未启用哈希时的退化口径，同名同大小同时间的改写可能漏判。'}</Text>
+      {evidence && (
+        <div>
+          {Object.entries(evidence).map(([key, value]) => (
+            <div key={key}>
+              <Text strong>{CATEGORY_LABELS[key]?.label || key}：</Text>
+              <Text>{EVIDENCE_LABELS[value] || value}</Text>
+            </div>
+          ))}
+        </div>
+      )}
+    </Space>
+  )
+  return (
+    <Tooltip title={tooltip}>
+      <Tag color={isHash ? 'success' : 'default'}>{isHash ? '哈希级' : '大小+时间'}</Tag>
+    </Tooltip>
+  )
+}
 
 export default function DiffPage() {
   const [searchParams] = useSearchParams()
@@ -76,6 +112,10 @@ function DiffSelector() {
   const [a, setA] = useState<string | undefined>(undefined)
   const [b, setB] = useState<string | undefined>(undefined)
   const [hash, setHash] = useState<'none' | 'sha256'>('none')
+  const [caseInsensitive, setCaseInsensitive] = useState(false)
+  const [ignoreMtime, setIgnoreMtime] = useState(false)
+  const [ignoreSize, setIgnoreSize] = useState(false)
+  const [showIdentical, setShowIdentical] = useState(false)
 
   const snapshotOptions = useMemo(
     () =>
@@ -89,7 +129,17 @@ function DiffSelector() {
   const start = () => {
     if (!a || !b) return
     create.mutate(
-      { a, b, options: { hash } },
+      {
+        a,
+        b,
+        options: {
+          hash,
+          case_insensitive: caseInsensitive,
+          ignore_mtime: ignoreMtime,
+          ignore_size: ignoreSize,
+          show_identical: showIdentical,
+        },
+      },
       {
         onSuccess: (res) => {
           navigate(`/diff?id=${res.diff_id}`)
@@ -142,6 +192,52 @@ function DiffSelector() {
           >
             开始对比
           </Button>
+        </Space>
+        <Space wrap style={{ marginTop: 12 }}>
+          <Tooltip title="路径比较时忽略大小写差异">
+            <Space>
+              <Switch
+                size="small"
+                checked={caseInsensitive}
+                onChange={setCaseInsensitive}
+                id="diff-case-insensitive"
+              />
+              <label htmlFor="diff-case-insensitive" style={{ cursor: 'pointer' }}>大小写不敏感</label>
+            </Space>
+          </Tooltip>
+          <Tooltip title="只看大小/内容差异，修改时间不同不视为变更">
+            <Space>
+              <Switch
+                size="small"
+                checked={ignoreMtime}
+                onChange={setIgnoreMtime}
+                id="diff-ignore-mtime"
+              />
+              <label htmlFor="diff-ignore-mtime" style={{ cursor: 'pointer' }}>忽略修改时间</label>
+            </Space>
+          </Tooltip>
+          <Tooltip title="只比较路径/mtime/内容差异，文件大小不同不视为变更">
+            <Space>
+              <Switch
+                size="small"
+                checked={ignoreSize}
+                onChange={setIgnoreSize}
+                id="diff-ignore-size"
+              />
+              <label htmlFor="diff-ignore-size" style={{ cursor: 'pointer' }}>忽略大小</label>
+            </Space>
+          </Tooltip>
+          <Tooltip title="将 identical 条目写入对比库，大快照会显著增大对比库">
+            <Space>
+              <Switch
+                size="small"
+                checked={showIdentical}
+                onChange={setShowIdentical}
+                id="diff-show-identical"
+              />
+              <label htmlFor="diff-show-identical" style={{ cursor: 'pointer' }}>记录相同项</label>
+            </Space>
+          </Tooltip>
         </Space>
         {hash === 'sha256' && (
           <Typography.Text type="secondary" style={{ display: 'block', marginTop: 8 }}>
@@ -226,6 +322,10 @@ function DiffDetail({ diffId }: { diffId: string }) {
             <Text>B：<Text code>{diff.b}</Text></Text>
             <Text>创建时间：{formatDateTime(diff.created_at)}</Text>
             <Text>耗时：{(diff.duration_ms / 1000).toFixed(1)} 秒</Text>
+            <Space>
+              <Text>证据等级：</Text>
+              <EvidenceTag level={diff.evidence_level} evidence={diff.evidence} />
+            </Space>
             <Text>选项：{JSON.stringify(diff.options)}</Text>
           </Space>
         </Card>

@@ -434,6 +434,18 @@ export async function getDuplicates(
   return data
 }
 
+export type EvidenceLevel = 'hash' | 'size+mtime'
+
+export interface DiffEvidence {
+  content_changed: 'hash' | 'unavailable'
+  moved_or_renamed: 'hash' | 'unavailable'
+  size_changed: 'size' | 'unavailable'
+  mtime_changed: 'mtime' | 'unavailable'
+  type_changed: 'type' | 'unavailable'
+  identical: 'hash' | 'size+mtime'
+  [key: string]: string
+}
+
 export interface DiffRun {
   diff_id: string
   a: string
@@ -443,8 +455,10 @@ export interface DiffRun {
   duration_ms: number
   status: string
   result_path: string
-  options: { hash: string }
+  options: { hash: string; case_insensitive?: boolean; ignore_mtime?: boolean; ignore_size?: boolean; show_identical?: boolean }
   summary: Record<string, number | null>
+  evidence_level?: EvidenceLevel
+  evidence?: DiffEvidence
 }
 
 export interface DiffsResponse {
@@ -460,7 +474,13 @@ export async function listDiffs(): Promise<DiffsResponse> {
 export interface DiffCreateBody {
   a: string
   b: string
-  options?: { hash: 'none' | 'sha256' }
+  options?: {
+    hash: 'none' | 'sha256'
+    case_insensitive?: boolean
+    ignore_mtime?: boolean
+    ignore_size?: boolean
+    show_identical?: boolean
+  }
 }
 
 export interface DiffCreateResponse {
@@ -469,6 +489,8 @@ export interface DiffCreateResponse {
   counts: Record<string, number | null>
   reused: boolean
   elapsed_s: number
+  evidence_level?: EvidenceLevel
+  evidence?: DiffEvidence
 }
 
 export async function createDiff(body: DiffCreateBody): Promise<DiffCreateResponse> {
