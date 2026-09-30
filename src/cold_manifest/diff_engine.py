@@ -12,14 +12,36 @@
   (hash_hex, size_bytes) 配对，A/B 路径不同 → 合并为一行 moved_or_renamed
   （path 取 A 侧，b_path 记 B 侧新路径）；配不上的仍归 removed / added。
   配对走 diff_entries 上的 SQL join + 临时表，不整表载入内存。
-- identical 不落库只计数；hash=none 时 content_changed / moved_or_renamed
-  恒为 NULL（不造假）。
+- identical 默认不落库只计数（show_identical=true 时 identical 也落 diff_entries，
+  结果库会随相同条目数膨胀——大库慎用）；hash=none 时 content_changed /
+  moved_or_renamed 恒为 NULL（不造假）。
 - 按 path 精确 join：两个快照库各按 uq_entries_path 索引流式归并，内存 O(1)。
+
+口径开关（§6.3 options，全部进 options_hash，各组合天然隔离、各自幂等复用）：
+- case_insensitive=true：按 path_norm（casefold）配对而非精确 path。要求两侧
+  entries.path_norm 全部非空非 ''，否则抛 DiffError（路由层转 400，提示该快照
+  不支持大小写不敏感比对）。实现走 Python 归并（按 path_norm 排序的流式
+  分组配对，同组内按 path 序一对一配对、多余拷贝归 removed/added），性能弱于
+  SQL 快路径——大库 + case_insensitive 预期明显变慢。
+- ignore_mtime=true：mtime 差异不再判 mtime_changed（无其他差异归 identical）。
+  与 hash 组合：hash 不同 → content_changed（不受影响）；hash 相同 → 直接
+  identical（mtime 被忽略）。
+- ignore_size=true：大小差异不再判 size_changed。hash 分支本就忽略 size，
+  因此只影响非 hash 回退分支。
+- show_identical=true：identical 条目也落 diff_entries（默认只计数）。
+  与 hash 组合：hash 相同 → identical 落库。
+- evidence / evidence_level：物化完成时写入 diff_meta（evidence_level /
+  evidence_json）。content_changed / moved_or_renamed 的证据为 "hash"（hash
+  启用且两侧快照各至少有一条 full 哈希）或 "unavailable"；identical 的证据
+  在有哈希证据时为 "hash" 否则 "size+mtime"；evidence_level 为本次对比整体
+  依据："hash" 或 "size+mtime"。旧结果库无这两个键，read_evidence 返回
+  (None, None)，由调用方回退展示。
 
 写入风格与导入一致：journal_mode=OFF、批量事务、封库时建 DIFF_DDL 索引。
 """
 
 import hashlib
+import itertools
 import json
 import sqlite3
 import time
@@ -50,25 +72,41 @@ class DiffResult:
     options_json: str
     options_hash: str
     counts: dict = field(default_factory=dict)   # 含 content_changed/moved_or_renamed=None
+    evidence_level: "str | None" = None          # "hash" | "size+mtime"
+    evidence: "dict | None" = None               # 各分类的判定依据
     reused: bool = False
     elapsed_s: float = 0.0
 
 
 def canonical_options(options: "dict | None") -> dict:
-    """选项白名单：{"hash": "none" | "sha256"}（§4.5 哈希联动 diff）。
+    """选项白名单（§6.3 diff 口径开关）。
+
+    - hash: "none" | "sha256"
+    - case_insensitive / ignore_mtime / ignore_size / show_identical: bool（默认 false）
 
     未知键或非法值抛 DiffError（路由层转 400）——静默接受会让非 canonical
-    options 污染幂等键，产生永不复用的重复 diff 库。hash 进入 options_hash，
-    因此 hash=none 与 hash=sha256 的 diff_id 天然隔离、各自幂等复用。
+    options 污染幂等键，产生永不复用的重复 diff 库。全部开关进入 options_hash，
+    因此每种组合的 diff_id 天然隔离、各自幂等复用。取值 false 的布尔开关从
+    canonical 形式中剔除（false 与缺省同键）。depth 是查询期过滤，不进 options。
     """
     opts = dict(options or {})
-    unknown = set(opts) - {"hash"}
+    allowed = {"hash", "case_insensitive", "ignore_mtime", "ignore_size", "show_identical"}
+    unknown = set(opts) - allowed
     if unknown:
-        raise DiffError(f"不支持的 diff 选项：{sorted(unknown)}（当前仅支持 hash）")
+        raise DiffError(f"不支持的 diff 选项：{sorted(unknown)}"
+                        f"（支持 {sorted(allowed)}）")
     algo = opts.get("hash", "none")
     if algo not in ("none", "sha256"):
         raise DiffError(f"不支持的 hash 选项值：{algo!r}（允许 'none' / 'sha256'）")
     opts["hash"] = algo
+    for key in ("case_insensitive", "ignore_mtime", "ignore_size", "show_identical"):
+        val = opts.get(key, False)
+        if not isinstance(val, bool):
+            raise DiffError(f"选项 {key} 需为布尔值，得到 {val!r}")
+        if val:
+            opts[key] = True
+        else:
+            opts.pop(key, None)
     return opts
 
 
@@ -103,17 +141,19 @@ def _sealed_snapshot(data_root: "str | Path", snapshot_id: str) -> Path:
     return db
 
 
-def _iter_entries(db: Path):
-    """按 path 有序流式产出 (path, entry_id, path_norm, depth, type, size, mtime,
+def _iter_entries(db: Path, order: str = "path"):
+    """按指定顺序流式产出 (path, entry_id, path_norm, depth, type, size, mtime,
     hash_hex, hash_state)。
 
-    依赖封库时建的 uq_entries_path 索引做索引扫描，不排序、不整表载入。
+    order="path"（默认）依赖封库时建的 uq_entries_path 索引做索引扫描，不排序、
+    不整表载入；order="path_norm" 需 SQLite 临时排序（case_insensitive 归并专用）。
     """
     conn = open_snapshot(db)
     try:
+        order_sql = "path_norm, path" if order == "path_norm" else "path"
         cur = conn.execute(
             "SELECT path, entry_id, path_norm, depth, type, size_bytes, mtime_ns,"
-            " hash_hex, hash_state FROM entries ORDER BY path"
+            f" hash_hex, hash_state FROM entries ORDER BY {order_sql}"
         )
         while True:
             rows = cur.fetchmany(8192)
@@ -133,16 +173,19 @@ def _hash_usable(row) -> bool:
     return bool(row[7]) and row[8] == "full"
 
 
-def _classify(ra, rb, hash_enabled: bool) -> str:
+def _classify(ra, rb, hash_enabled: bool, ignore_mtime: bool = False,
+              ignore_size: bool = False) -> str:
     if ra[4] != rb[4]:
         return "type_changed"
     if hash_enabled and _hash_usable(ra) and _hash_usable(rb):
         if ra[7] != rb[7]:
             return "content_changed"      # 同尺寸同 mtime 改写也逃不掉
-        return "mtime_changed" if ra[6] != rb[6] else "identical"
-    if ra[5] != rb[5]:
+        if not ignore_mtime and ra[6] != rb[6]:
+            return "mtime_changed"
+        return "identical"
+    if not ignore_size and ra[5] != rb[5]:
         return "size_changed"
-    if ra[6] != rb[6]:
+    if not ignore_mtime and ra[6] != rb[6]:
         return "mtime_changed"
     return "identical"
 
@@ -228,8 +271,9 @@ def _pair_moved(conn: sqlite3.Connection, counts: dict) -> None:
 def _cls_expr(alias_a: str, alias_b: str, colmap: "dict | None" = None) -> str:
     """分类 CASE 表达式（与 _classify 逐分支等价）。
 
-    :hashp 参数为 1/0（hash 是否启用）。NULL 比较统一用 IS / IS NOT——
-    Python 的 None != None 为 False（视为相等），IS 语义一致。
+    :hashp/?2/?3 参数为 1/0（hash 是否启用、ignore_size、ignore_mtime）。
+    NULL 比较统一用 IS / IS NOT——Python 的 None != None 为 False（视为相等），
+    IS 语义一致。
     colmap：B 侧别名列名映射（bside 紧凑副本的列名与 entries 不同）。
     """
     A, B = alias_a, alias_b
@@ -244,10 +288,10 @@ CASE
   WHEN ?1 AND {A}.hash_hex IS NOT NULL AND {A}.hash_state = 'full'
        AND {B_hash} IS NOT NULL AND {B_state} = 'full'
     THEN CASE WHEN {A}.hash_hex IS NOT {B_hash} THEN 'content_changed'
-              WHEN {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
+              WHEN NOT ?3 AND {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
               ELSE 'identical' END
-  WHEN {A}.size_bytes IS NOT {B_size} THEN 'size_changed'
-  WHEN {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
+  WHEN NOT ?2 AND {A}.size_bytes IS NOT {B_size} THEN 'size_changed'
+  WHEN NOT ?3 AND {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
   ELSE 'identical'
 END"""
 
@@ -263,7 +307,8 @@ _INSERT_COLS = (
 
 
 def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
-                     hash_enabled: bool) -> dict:
+                     hash_enabled: bool, ignore_mtime: bool = False,
+                     ignore_size: bool = False, show_identical: bool = False) -> dict:
     """SQL 下推归并（全顺序 IO 版）。
 
     朴素「A LEFT JOIN B + 逐行取行数据」在 10M×2 上受随机行读支配
@@ -297,6 +342,7 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
     counts["content_changed"] = 0 if hash_enabled else None
     counts["moved_or_renamed"] = 0 if hash_enabled else None
     h = 1 if hash_enabled else 0
+    ig_s, ig_m = (1 if ignore_size else 0), (1 if ignore_mtime else 0)
     cls = _cls_expr("sa", "bs", _BSIDE_COLS)
     conn.execute("PRAGMA temp_store=FILE")
     conn.execute("PRAGMA cache_size=-65536")
@@ -331,7 +377,8 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
                      ' SELECT entry_id, path, "type", size_bytes, mtime_ns, hash_hex,'
                      " hash_state, path_norm, depth FROM snb.entries")
 
-        # 3. matched 分类落库（identical 不落库）
+        # 3. matched 分类落库（identical 默认不落库，show_identical 时全落）
+        where = "" if show_identical else f"WHERE {cls} <> 'identical'"
         conn.execute(
             f"""
             {_INSERT_COLS}
@@ -346,8 +393,8 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
             FROM sna.entries sa
             CROSS JOIN pairs p INDEXED BY ix_pairs_aid ON p.aid = sa.entry_id
             CROSS JOIN bside bs ON bs.id = p.bid
-            WHERE {cls} <> 'identical'
-            """, (h,))
+            {where}
+            """, (h, ig_s, ig_m))
 
         # 4. removed（顺序扫 A）与 added（bside 热页）
         conn.execute(
@@ -381,14 +428,18 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
             """, (h,))
         conn.commit()
 
-        # 5. 计数：已落库各类走 GROUP BY；identical = 对总数 − matched 已落库之和
+        # 5. 计数：已落库各类走 GROUP BY；identical 在默认（不落库）模式下
+        # 用算术：identical = 对总数 − matched 已落库各类之和
         for ct, n in conn.execute(
                 "SELECT change_type, COUNT(*) FROM diff_entries GROUP BY change_type"):
             counts[ct] = n
-        pairs_total = conn.execute("SELECT COUNT(*) FROM pairs").fetchone()[0]
-        matched_stored = (counts["type_changed"] + counts["size_changed"]
-                          + counts["mtime_changed"] + (counts["content_changed"] or 0))
-        counts["identical"] = pairs_total - matched_stored
+        if show_identical:
+            counts["identical"] = counts.get("identical", 0)
+        else:
+            pairs_total = conn.execute("SELECT COUNT(*) FROM pairs").fetchone()[0]
+            matched_stored = (counts["type_changed"] + counts["size_changed"]
+                              + counts["mtime_changed"] + (counts["content_changed"] or 0))
+            counts["identical"] = pairs_total - matched_stored
 
         conn.executescript(
             "DROP INDEX ix_pairs_aid;"
@@ -406,7 +457,9 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
 
 
 def _materialize_python(conn: sqlite3.Connection, db_a: Path, db_b: Path,
-                        hash_enabled: bool) -> dict:
+                        hash_enabled: bool, ignore_mtime: bool = False,
+                        ignore_size: bool = False,
+                        show_identical: bool = False) -> dict:
     """旧 Python 逐行归并（path_norm 缺失时的回退路径，语义冻结）。"""
     counts = {k: 0 for k in _COUNTED}
     counts["content_changed"] = 0 if hash_enabled else None
@@ -442,9 +495,9 @@ def _materialize_python(conn: sqlite3.Connection, db_a: Path, db_b: Path,
                         rb[0]))
             rb = next(it_b, None)
         else:                                                      # 两侧都有
-            ct = _classify(ra, rb, hash_enabled)
+            ct = _classify(ra, rb, hash_enabled, ignore_mtime, ignore_size)
             counts[ct] += 1
-            if ct != "identical":
+            if ct != "identical" or show_identical:
                 buf.append((ct, ra[0], ra[2] or ra[0].casefold(), ra[3],
                             ra[1], rb[1], ra[5], rb[5], ra[6], rb[6], ra[4], rb[4],
                             ra[7] if hash_enabled else None,
@@ -457,6 +510,115 @@ def _materialize_python(conn: sqlite3.Connection, db_a: Path, db_b: Path,
     flush()
     conn.commit()
     return counts
+
+
+def _materialize_python_ci(conn: sqlite3.Connection, db_a: Path, db_b: Path,
+                           hash_enabled: bool, ignore_mtime: bool = False,
+                           ignore_size: bool = False,
+                           show_identical: bool = False) -> dict:
+    """case_insensitive 归并：按 path_norm（casefold）分组配对（§6.3）。
+
+    两侧各按 (path_norm, path) 排序流式分组；path_norm 相同的组内按 path 序
+    一对一配对，多出的拷贝归 removed / added。物化前 materialize_diff 已保证
+    两侧 path_norm 全部非空非 ''（否则抛 DiffError，不支持降级）。
+    落库行的 path 取 A 侧原路径（added/removed 取各自侧）；moved_or_renamed
+    配对沿用 _pair_moved（哈希相等，与大小写无关）。
+    """
+    counts = {k: 0 for k in _COUNTED}
+    counts["content_changed"] = 0 if hash_enabled else None
+    counts["moved_or_renamed"] = 0 if hash_enabled else None
+    ga = itertools.groupby(_iter_entries(db_a, order="path_norm"), key=lambda r: r[2])
+    gb = itertools.groupby(_iter_entries(db_b, order="path_norm"), key=lambda r: r[2])
+    cur_a = next(ga, None)
+    cur_b = next(gb, None)
+    buf: "list[tuple]" = []
+
+    def flush() -> None:
+        if buf:
+            conn.executemany(
+                "INSERT INTO diff_entries(change_type,path,path_norm,depth,a_entry_id,b_entry_id,"
+                "a_size,b_size,a_mtime_ns,b_mtime_ns,a_type,b_type,a_hash,b_hash,b_path)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", buf)
+            buf.clear()
+
+    while cur_a is not None or cur_b is not None:
+        if cur_b is None or (cur_a is not None and cur_a[0] < cur_b[0]):
+            for ra in cur_a[1]:                                    # 仅 A 有该折叠名
+                counts["removed"] += 1
+                buf.append(("removed", ra[0], ra[2], ra[3],
+                            ra[1], None, ra[5], None, ra[6], None, ra[4], None,
+                            ra[7] if hash_enabled and _hash_usable(ra) else None,
+                            None, None))
+            cur_a = next(ga, None)
+        elif cur_a is None or cur_b[0] < cur_a[0]:                 # 仅 B 有该折叠名
+            for rb in cur_b[1]:
+                counts["added"] += 1
+                buf.append(("added", rb[0], rb[2], rb[3],
+                            None, rb[1], None, rb[5], None, rb[6], None, rb[4],
+                            None,
+                            rb[7] if hash_enabled and _hash_usable(rb) else None,
+                            rb[0]))
+            cur_b = next(gb, None)
+        else:                                                      # 两侧同折叠名
+            rows_a = list(cur_a[1])
+            rows_b = list(cur_b[1])
+            for ra, rb in zip(rows_a, rows_b):
+                ct = _classify(ra, rb, hash_enabled, ignore_mtime, ignore_size)
+                counts[ct] += 1
+                if ct != "identical" or show_identical:
+                    buf.append((ct, ra[0], ra[2], ra[3],
+                                ra[1], rb[1], ra[5], rb[5], ra[6], rb[6],
+                                ra[4], rb[4],
+                                ra[7] if hash_enabled else None,
+                                rb[7] if hash_enabled else None, None))
+            for ra in rows_a[len(rows_b):]:                        # A 侧多余拷贝
+                counts["removed"] += 1
+                buf.append(("removed", ra[0], ra[2], ra[3],
+                            ra[1], None, ra[5], None, ra[6], None, ra[4], None,
+                            ra[7] if hash_enabled and _hash_usable(ra) else None,
+                            None, None))
+            for rb in rows_b[len(rows_a):]:                        # B 侧多余拷贝
+                counts["added"] += 1
+                buf.append(("added", rb[0], rb[2], rb[3],
+                            None, rb[1], None, rb[5], None, rb[6], None, rb[4],
+                            None,
+                            rb[7] if hash_enabled and _hash_usable(rb) else None,
+                            rb[0]))
+            cur_a = next(ga, None)
+            cur_b = next(gb, None)
+        if len(buf) >= _BATCH_SIZE:
+            flush()
+            conn.commit()
+    flush()
+    conn.commit()
+    return counts
+
+
+def _has_full_hash(db: Path) -> bool:
+    """该快照是否至少存在一条可用于内容等值比对的 full 哈希（evidence 依据）。"""
+    conn = open_snapshot(db)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM entries WHERE hash_hex IS NOT NULL AND hash_state='full' LIMIT 1"
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def _build_evidence(db_a: Path, db_b: Path, hash_enabled: bool) -> "tuple[str, dict]":
+    """(evidence_level, evidence)：本次对比各分类结论的判定依据（§6.3）。"""
+    content_ev = ("hash" if hash_enabled and _has_full_hash(db_a) and _has_full_hash(db_b)
+                  else "unavailable")
+    evidence = {
+        "content_changed": content_ev,
+        "moved_or_renamed": content_ev,
+        "size_changed": "size",
+        "mtime_changed": "mtime",
+        "type_changed": "type",
+        "identical": "hash" if content_ev == "hash" else "size+mtime",
+    }
+    return ("hash" if content_ev == "hash" else "size+mtime"), evidence
 
 
 def _all_path_norm_present(db: Path) -> bool:
@@ -484,13 +646,34 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
 
     if not force and _read_existing_status(out_db) == "done":
         counts = _read_summary(out_db)
+        ev_level, ev = _read_evidence(out_db)
+        if ev is None:   # 旧库无 evidence 键：按 options/counts 推导（best effort）
+            ev_level = "hash" if counts.get("content_changed") is not None else "size+mtime"
+            content_ev = "hash" if ev_level == "hash" else "unavailable"
+            ev = {"content_changed": content_ev, "moved_or_renamed": content_ev,
+                  "size_changed": "size", "mtime_changed": "mtime",
+                  "type_changed": "type",
+                  "identical": "hash" if content_ev == "hash" else "size+mtime"}
         return DiffResult(diff_id=did, a=a, b=b, db_path=out_db, options_json=ojson,
-                          options_hash=ohash, counts=counts, reused=True,
+                          options_hash=ohash, counts=counts, evidence_level=ev_level,
+                          evidence=ev, reused=True,
                           elapsed_s=time.monotonic() - t0)
 
     db_a = _sealed_snapshot(data_root, a)
     db_b = _sealed_snapshot(data_root, b)
     hash_enabled = opts["hash"] != "none"
+    ci = opts.get("case_insensitive", False)
+    ig_m = opts.get("ignore_mtime", False)
+    ig_s = opts.get("ignore_size", False)
+    show_id = opts.get("show_identical", False)
+
+    # case_insensitive 前置校验：path_norm 缺失即报错（不静默降级到精确 path）
+    if ci:
+        for sid, db in ((a, db_a), (b, db_b)):
+            if not _all_path_norm_present(db):
+                raise DiffError(
+                    f"快照 {sid} 存在 path_norm 缺失的条目，"
+                    "不支持大小写不敏感比对（请用新版采集重建该快照）")
 
     out_db.parent.mkdir(parents=True, exist_ok=True)
     # 未封库残留（上次运行崩溃）一律删除重建
@@ -512,19 +695,26 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
             " a_hash TEXT, b_hash TEXT, b_path TEXT);"
         )
 
-        if _all_path_norm_present(db_a) and _all_path_norm_present(db_b):
-            counts = _materialize_sql(conn, db_a, db_b, hash_enabled)
+        if ci:
+            counts = _materialize_python_ci(conn, db_a, db_b, hash_enabled,
+                                            ig_m, ig_s, show_id)
+        elif _all_path_norm_present(db_a) and _all_path_norm_present(db_b):
+            counts = _materialize_sql(conn, db_a, db_b, hash_enabled, ig_m, ig_s, show_id)
         else:
-            counts = _materialize_python(conn, db_a, db_b, hash_enabled)
+            counts = _materialize_python(conn, db_a, db_b, hash_enabled, ig_m, ig_s, show_id)
 
         if hash_enabled:
             _pair_moved(conn, counts)
+
+        evidence_level, evidence = _build_evidence(db_a, db_b, hash_enabled)
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         meta_rows = [
             ("a", a), ("b", b), ("options_json", ojson), ("options_hash", ohash),
             ("created_at", now), ("status", "done"),
             ("summary_json", json.dumps(counts, sort_keys=True)),
+            ("evidence_level", evidence_level),
+            ("evidence_json", json.dumps(evidence, sort_keys=True)),
         ]
         conn.executemany("INSERT OR REPLACE INTO diff_meta(key, value) VALUES(?, ?)", meta_rows)
         conn.commit()
@@ -550,7 +740,8 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
         cat.close()
 
     return DiffResult(diff_id=did, a=a, b=b, db_path=out_db, options_json=ojson,
-                      options_hash=ohash, counts=counts, reused=False, elapsed_s=elapsed)
+                      options_hash=ohash, counts=counts, evidence_level=evidence_level,
+                      evidence=evidence, reused=False, elapsed_s=elapsed)
 
 
 def _read_summary(db: Path) -> dict:
@@ -560,6 +751,28 @@ def _read_summary(db: Path) -> dict:
         return json.loads(row[0]) if row else {}
     finally:
         conn.close()
+
+
+def _read_evidence(db: Path) -> "tuple[str | None, dict | None]":
+    """读 diff_meta 的 evidence_level / evidence_json；旧库返回 (None, None)。"""
+    if not db.is_file():
+        return None, None
+    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        try:
+            rows = dict(conn.execute(
+                "SELECT key, value FROM diff_meta WHERE key IN"
+                " ('evidence_level', 'evidence_json')").fetchall())
+        except sqlite3.Error:
+            return None, None
+    finally:
+        conn.close()
+    if "evidence_level" not in rows or "evidence_json" not in rows:
+        return None, None
+    try:
+        return rows["evidence_level"], json.loads(rows["evidence_json"])
+    except json.JSONDecodeError:
+        return None, None
 
 
 def iter_diff_csv(db: Path, depth: "int | None" = None):

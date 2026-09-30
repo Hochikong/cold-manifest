@@ -65,6 +65,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("--depth", type=int, default=None, help="结果按目录深度过滤（查询期，不影响物化）")
     p_diff.add_argument("--hash", choices=["none", "sha256"], default="none",
                         help="内容比对模式：sha256 需两快照已 cldm hash，可识别 content_changed / moved_or_renamed")
+    p_diff.add_argument("--case-insensitive", action="store_true",
+                        help="按 path_norm（casefold）配对（快照含 path_norm 缺失条目时报错；大库走慢速归并）")
+    p_diff.add_argument("--ignore-mtime", action="store_true",
+                        help="mtime 差异不算变更（无其他差异时归 identical）")
+    p_diff.add_argument("--ignore-size", action="store_true",
+                        help="大小差异不算变更")
+    p_diff.add_argument("--show-identical", action="store_true",
+                        help="identical 条目也落结果库/CSV（大库会显著膨胀，慎用）")
     p_diff.add_argument("--output", default=None, help="diff 结果写 CSV（category,path,type,size_a,size_b,mtime_a,mtime_b）")
     p_diff.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
@@ -170,9 +178,18 @@ def _print_diff_summary(counts: dict) -> None:
 def _cmd_diff(args: argparse.Namespace) -> int:
     from .diff_engine import DiffError, iter_diff_csv, materialize_diff
 
+    options = {"hash": args.hash}
+    if args.case_insensitive:
+        options["case_insensitive"] = True
+    if args.ignore_mtime:
+        options["ignore_mtime"] = True
+    if args.ignore_size:
+        options["ignore_size"] = True
+    if args.show_identical:
+        options["show_identical"] = True
+
     try:
-        result = materialize_diff(args.data_root, args.a, args.b,
-                                  options={"hash": args.hash})
+        result = materialize_diff(args.data_root, args.a, args.b, options=options)
     except DiffError as e:
         print(f"错误：{e}", file=sys.stderr)
         return 2
@@ -182,6 +199,10 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     print(f"  A：{args.a}")
     print(f"  B：{args.b}")
     print(f"  耗时：{result.elapsed_s:.1f}s  结果库：{result.db_path}")
+    ev = result.evidence or {}
+    print(f"  证据等级：{result.evidence_level or '—'}"
+          f"（content_changed 依据 {ev.get('content_changed', '—')}，"
+          f"identical 依据 {ev.get('identical', '—')}）")
     _print_diff_summary(result.counts)
 
     if args.output is not None:

@@ -14,7 +14,8 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..diff_engine import DiffError, diff_db_path, iter_diff_csv, materialize_diff
+from ..diff_engine import (DiffError, diff_db_path, iter_diff_csv, materialize_diff,
+                           _read_evidence)
 from ..report import generate_diff_report
 from .pagination import decode_cursor, encode_cursor
 from .state import AppState, get_state
@@ -69,6 +70,10 @@ class DiffCreateBody(BaseModel):
     b: str
     options: "dict | None" = None
     hash: "str | None" = None     # 便捷字段：等价 options={"hash": ...}
+    case_insensitive: "bool | None" = None    # 按 path_norm（casefold）配对
+    ignore_mtime: "bool | None" = None        # mtime 差异不算变更
+    ignore_size: "bool | None" = None         # 大小差异不算变更
+    show_identical: "bool | None" = None      # identical 也落库（大库膨胀，慎用）
 
 
 @router.post("")
@@ -79,6 +84,10 @@ def create_diff(body: DiffCreateBody, request: Request) -> dict:
     options = dict(body.options or {})
     if body.hash is not None:
         options["hash"] = body.hash
+    for flag in ("case_insensitive", "ignore_mtime", "ignore_size", "show_identical"):
+        val = getattr(body, flag)
+        if val is not None:
+            options[flag] = val
     state = get_state(request)
     try:
         result = materialize_diff(state.data_root, body.a, body.b, options=options)
@@ -90,6 +99,8 @@ def create_diff(body: DiffCreateBody, request: Request) -> dict:
         "diff_id": result.diff_id,
         "status": "done",
         "counts": result.counts,
+        "evidence_level": result.evidence_level,
+        "evidence": result.evidence,
         "reused": result.reused,
         "elapsed_s": round(result.elapsed_s, 3),
     }
@@ -110,6 +121,10 @@ def diff_detail(diff_id: str, request: Request) -> dict:
                 detail[key.removesuffix("_json")] = json.loads(detail.pop(key))
             except json.JSONDecodeError:
                 detail.pop(key)
+    ev_level, ev = _read_evidence(diff_db_path(state.data_root, diff_id))
+    if ev is not None:
+        detail["evidence_level"] = ev_level
+        detail["evidence"] = ev
     return detail
 
 
@@ -118,6 +133,7 @@ def diff_summary(diff_id: str, request: Request,
                  top: int = Query(default=50, ge=1, le=500)) -> dict:
     """分类计数 + 按父目录聚合的变更 top-N（数量、size 增减）+ 总 size 变化。"""
     conn = _open_diff_ro(get_state(request), diff_id)
+    state = get_state(request)
     try:
         total = conn.execute(
             "SELECT COUNT(*) AS n,"
@@ -140,7 +156,7 @@ def diff_summary(diff_id: str, request: Request,
             """,
             (top,),
         ).fetchall()
-        return {
+        payload = {
             "diff_id": diff_id,
             "total_changes": total["n"],
             "total_size_delta": total["size_delta"] or 0,
@@ -150,6 +166,11 @@ def diff_summary(diff_id: str, request: Request,
                 for r in by_dir
             ],
         }
+        ev_level, ev = _read_evidence(diff_db_path(state.data_root, diff_id))
+        if ev is not None:
+            payload["evidence_level"] = ev_level
+            payload["evidence"] = ev
+        return payload
     finally:
         conn.close()
 

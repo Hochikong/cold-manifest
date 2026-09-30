@@ -184,10 +184,20 @@ def generate_diff_report(diff_db_path: "str | Path", out: "str | Path | IO[str]"
     h.append(f"<h1>冷备份对比报告 <span class='muted'>{_esc(db.stem)}</span></h1>")
 
     # 头部元信息
+    ev_level = raw.get("evidence_level")
+    ev_cell = _esc(ev_level or "—")
+    try:
+        ev = json.loads(raw.get("evidence_json", "") or "{}")
+    except json.JSONDecodeError:
+        ev = {}
+    if ev:
+        detail = "，".join(f"{k}={v}" for k, v in sorted(ev.items()))
+        ev_cell += f"<span class='muted'>（{_esc(detail)}）</span>"
     meta_rows = [
         ["快照 A", _esc(a_id) + _meta_suffix(sm.get("a"))],
         ["快照 B", _esc(b_id) + _meta_suffix(sm.get("b"))],
         ["参数", _esc(json.dumps(meta["options"], ensure_ascii=False, sort_keys=True))],
+        ["证据等级", ev_cell],
         ["diff 生成时间", _esc(raw.get("created_at", "—"))],
         ["报告生成时间", _esc(gen_at)],
     ]
