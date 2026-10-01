@@ -6,6 +6,8 @@ export const TASK_TYPE_LABELS: Record<TaskType | string, string> = {
   import: '导入',
   hash: '哈希',
   diff: '对比',
+  build_fts: '全文索引',
+  build_stats: '统计缓存',
 }
 
 export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
@@ -110,6 +112,24 @@ export function getTaskSummary(task: Task): string {
     if (total !== undefined) parts.push(`差异 ${formatNumber(total)}`)
     if (elapsed !== undefined) parts.push(`耗时 ${formatDuration(elapsed)}`)
     return parts.length ? parts.join(' / ') : '对比完成'
+  }
+
+  if (type === 'build_fts') {
+    const count = typeof result.count === 'number' ? result.count : undefined
+    const seconds = typeof result.seconds === 'number' ? result.seconds : undefined
+    const parts: string[] = []
+    if (count !== undefined) parts.push(`已索引 ${formatNumber(count)} 条`)
+    if (seconds !== undefined) parts.push(`耗时 ${formatDuration(seconds * 1000)}`)
+    return parts.length ? parts.join(' / ') : '全文索引构建完成'
+  }
+
+  if (type === 'build_stats') {
+    const keys = typeof result.keys === 'number' ? result.keys : undefined
+    const seconds = typeof result.seconds === 'number' ? result.seconds : undefined
+    const parts: string[] = []
+    if (keys !== undefined) parts.push(`重建 ${formatNumber(keys)} 个统计段`)
+    if (seconds !== undefined) parts.push(`耗时 ${formatDuration(seconds * 1000)}`)
+    return parts.length ? parts.join(' / ') : '统计缓存重建完成'
   }
 
   return '任务完成'

@@ -50,6 +50,92 @@ export async function listSnapshots(volume_id?: string): Promise<SnapshotsRespon
   return data
 }
 
+/** 置顶 / 备注（PATCH /snapshots/{sid}）；两者都缺 → 400，notes ≤ 2000 字符。 */
+export interface SnapshotPatchBody {
+  pinned?: boolean
+  notes?: string
+}
+
+/** 快照详情（GET /snapshots/{sid}）：catalog 全行 + volume/disk + 盘上副本 + meta。 */
+export interface SnapshotDetail extends Snapshot {
+  /** 0 | 1 */
+  pinned: number
+  notes: string | null
+  volume: Record<string, unknown>
+  on_disk_copy: OnDiskCopy | null
+  meta: Record<string, string>
+}
+
+/** 更新置顶 / 备注；后端返回更新后的完整详情。 */
+export async function patchSnapshot(snapshot_id: string, body: SnapshotPatchBody): Promise<SnapshotDetail> {
+  const { data } = await client.patch<SnapshotDetail>(`/snapshots/${encodeURIComponent(snapshot_id)}`, body)
+  return data
+}
+
+/** 副本校验请求：scope=sample 抽检（默认 200）/ full 全量重算。 */
+export interface VerifyCopyBody {
+  scope: 'sample' | 'full'
+  sample_size?: number
+  seed?: number
+}
+
+export interface VerifyCopySample {
+  path: string
+  expected: string | null
+  actual: string | null
+  status: 'match' | 'mismatch' | 'missing' | 'unreadable'
+}
+
+export interface VerifyCopyReport {
+  snapshot_id: string
+  host_db: string
+  disk_db: string
+  copy: {
+    /** ok | mismatch | missing_disk | not_recorded */
+    status: string
+    recorded_sha256: string | null
+    disk_sha256: string | null
+    host_sha256: string | null
+    /** unchanged | modified_since_collection */
+    host_status: string
+  }
+  sidecar: {
+    /** ok | missing | problems */
+    status: string
+    problems: string[]
+  }
+  source: {
+    available: boolean
+    checked: number
+    match: number
+    mismatch: number
+    missing: number
+    unreadable: number
+    /** available=false 时的原因 */
+    error?: string
+    samples: VerifyCopySample[]
+  }
+  ok: boolean
+}
+
+/** 同步校验盘上副本（+ 可选源文件抽检），返回与 CLI verify-copy 同源的报告。 */
+export async function verifySnapshotCopy(snapshot_id: string, body: VerifyCopyBody): Promise<VerifyCopyReport> {
+  const { data } = await client.post<VerifyCopyReport>(
+    `/snapshots/${encodeURIComponent(snapshot_id)}/verify-copy`,
+    body,
+  )
+  return data
+}
+
+/** build-fts / build-stats 提交返回：{ task_id, status }，重复提交 409。 */
+export type BuildIndexKind = 'build_fts' | 'build_stats'
+
+export async function submitBuildIndexTask(snapshot_id: string, kind: BuildIndexKind): Promise<HashTaskResponse> {
+  const suffix = kind === 'build_fts' ? 'build-fts' : 'build-stats'
+  const { data } = await client.post<HashTaskResponse>(`/snapshots/${encodeURIComponent(snapshot_id)}/${suffix}`)
+  return data
+}
+
 /** 盘上副本登记（catalog.on_disk_copies 行）。 */
 export interface OnDiskCopy {
   snapshot_id: string
@@ -61,8 +147,8 @@ export interface OnDiskCopy {
   status: string
 }
 
-export async function getSnapshot(snapshot_id: string): Promise<Snapshot & { volume: Record<string, unknown>; on_disk_copy: OnDiskCopy | null; meta: Record<string, string> }> {
-  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}`)
+export async function getSnapshot(snapshot_id: string): Promise<SnapshotDetail> {
+  const { data } = await client.get<SnapshotDetail>(`/snapshots/${encodeURIComponent(snapshot_id)}`)
   return data
 }
 
@@ -595,9 +681,20 @@ export function exportSnapshotUrl(snapshot_id: string, format: 'csv' | 'v1_csv' 
   return `/api/snapshots/${encodeURIComponent(snapshot_id)}/export?format=${format}`
 }
 
-/** 快照自包含 HTML 报告（GET /report?format=html）。 */
-export function snapshotReportUrl(snapshot_id: string): string {
-  return `/api/snapshots/${encodeURIComponent(snapshot_id)}/report?format=html`
+/** 快照自包含 HTML 报告（GET /report?format=html），可按节过滤（默认全节）。 */
+export const REPORT_SECTIONS = [
+  { value: 'overview', label: '总览' },
+  { value: 'extensions', label: '扩展名' },
+  { value: 'sizes', label: '大小分布' },
+  { value: 'depth', label: '深度' },
+  { value: 'topdirs', label: '顶层目录' },
+  { value: 'skipped', label: '跳过项' },
+] as const
+
+export function snapshotReportUrl(snapshot_id: string, sections?: readonly string[]): string {
+  const base = `/api/snapshots/${encodeURIComponent(snapshot_id)}/report?format=html`
+  if (!sections || sections.length === 0) return base
+  return `${base}&sections=${sections.map(encodeURIComponent).join(',')}`
 }
 
 export interface SkippedItem {
@@ -781,7 +878,7 @@ export async function cancelTask(id: string): Promise<CancelTaskResponse> {
   return data
 }
 
-export type TaskType = 'import' | 'collect' | 'hash' | 'diff'
+export type TaskType = 'import' | 'collect' | 'hash' | 'diff' | 'build_fts' | 'build_stats'
 export type TaskStatus = 'pending' | 'running' | 'cancelling' | 'cancelled' | 'done' | 'error'
 
 export interface CollectResult {

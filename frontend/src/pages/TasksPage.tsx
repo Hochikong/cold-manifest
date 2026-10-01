@@ -25,6 +25,8 @@ const typeMap: Record<Task['type'], string> = {
   collect: '采集',
   hash: '哈希',
   diff: '对比',
+  build_fts: '全文索引',
+  build_stats: '统计缓存',
 }
 
 const batchStatusMap: Record<Batch['status'], { label: string; color: string }> = {

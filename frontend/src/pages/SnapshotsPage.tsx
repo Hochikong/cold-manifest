@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, useCallback } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   Card,
   Row,
@@ -24,6 +25,7 @@ import {
   Tooltip,
   Modal,
   Checkbox,
+  Progress,
   App,
 } from 'antd'
 import {
@@ -38,17 +40,37 @@ import {
   DeleteOutlined,
   ExclamationCircleOutlined,
   FilterOutlined,
+  StarFilled,
+  StarOutlined,
+  SyncOutlined,
+  EditOutlined,
+  LinkOutlined,
 } from '@ant-design/icons'
 import type { DataNode } from 'antd/es/tree'
 import ReactECharts from 'echarts-for-react'
-import { useSnapshots, useSnapshot, useSnapshotStats, useEntries, useTree, useDu, useSearch, useDeleteSnapshot, useVolumes } from '../api/hooks'
+import {
+  useSnapshots,
+  useSnapshot,
+  useSnapshotStats,
+  useEntries,
+  useTree,
+  useDu,
+  useSearch,
+  useDeleteSnapshot,
+  useVolumes,
+  useSnapshotPins,
+  usePatchSnapshot,
+  useBuildIndexTask,
+  useTaskEvents,
+} from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import DuplicateReport from '../components/DuplicateReport'
 import HashPanel from '../components/HashPanel'
 import SkippedPanel from '../components/SkippedPanel'
 import OnDiskCopyBadge from '../components/OnDiskCopyBadge'
+import { VerifyCopyButton, VerifyCopyResultCard } from '../components/VerifyCopyCard'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
-import { exportSnapshotUrl, snapshotReportUrl, listEntries, searchEntries, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked } from '../api/client'
+import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, listEntries, searchEntries, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport } from '../api/client'
 import axios from 'axios'
 
 const { Title, Text } = Typography
@@ -80,7 +102,28 @@ export default function SnapshotsPage() {
   const { data: snapshots, isLoading: listLoading, error: listError, refetch: refetchSnapshots } = useSnapshots(volumeFilter)
   const deleteMutation = useDeleteSnapshot()
 
-  const [deleteTarget, setDeleteTarget] = useState<{ snapshot_id: string; displayName: string } | null>(null)
+  // 置顶 / 备注（列表端点不带 pinned，这里统一取一份给列表与删除确认框用）
+  const snapshotIds = useMemo(() => snapshots?.items.map((s) => s.snapshot_id), [snapshots])
+  const { data: pins, isLoading: pinsLoading } = useSnapshotPins(snapshotIds)
+  const patchSnapshotMutation = usePatchSnapshot()
+  const [pinPendingId, setPinPendingId] = useState<string | null>(null)
+
+  const togglePin = async (sid: string, pinned: boolean) => {
+    setPinPendingId(sid)
+    try {
+      await patchSnapshotMutation.mutateAsync({ snapshot_id: sid, body: { pinned } })
+      message.success(pinned ? '已置顶' : '已取消置顶')
+    } catch (e) {
+      const detail = axios.isAxiosError(e)
+        ? (typeof e.response?.data === 'string' ? e.response.data : (e.response?.data as { detail?: string } | undefined)?.detail)
+        : undefined
+      message.error(detail || (e instanceof Error ? e.message : '操作失败'))
+    } finally {
+      setPinPendingId(null)
+    }
+  }
+
+  const [deleteTarget, setDeleteTarget] = useState<{ snapshot_id: string; displayName: string; pinned: boolean } | null>(null)
   const [deleteOnDisk, setDeleteOnDisk] = useState(false)
   const [deleteForce, setDeleteForce] = useState(false)
   const [deleteBlocked, setDeleteBlocked] = useState<DeleteSnapshotBlocked | null>(null)
@@ -93,7 +136,11 @@ export default function SnapshotsPage() {
   }
 
   const openDelete = (id: string) => {
-    setDeleteTarget({ snapshot_id: id, displayName: getSnapshotDisplayName(id) })
+    setDeleteTarget({
+      snapshot_id: id,
+      displayName: getSnapshotDisplayName(id),
+      pinned: !!pins?.[id]?.pinned,
+    })
     setDeleteOnDisk(false)
     setDeleteForce(false)
     setDeleteBlocked(null)
@@ -151,6 +198,10 @@ export default function SnapshotsPage() {
           error={listError}
           volumeFilter={volumeFilter}
           onVolumeFilterChange={setVolumeFilter}
+          pins={pins}
+          pinsLoading={pinsLoading}
+          pinPendingId={pinPendingId}
+          onTogglePin={togglePin}
           onSelect={(id) => {
             const next = new URLSearchParams()
             next.set('snapshot', id)
@@ -219,6 +270,10 @@ function SnapshotListView({
   error,
   volumeFilter,
   onVolumeFilterChange,
+  pins,
+  pinsLoading,
+  pinPendingId,
+  onTogglePin,
   onSelect,
   onDelete,
 }: {
@@ -227,15 +282,50 @@ function SnapshotListView({
   error: unknown
   volumeFilter: string | undefined
   onVolumeFilterChange: (v: string | undefined) => void
+  pins?: Record<string, { pinned: boolean; notes: string | null }>
+  pinsLoading: boolean
+  pinPendingId: string | null
+  onTogglePin: (sid: string, pinned: boolean) => void
   onSelect: (id: string) => void
   onDelete: (id: string) => void
 }) {
   const { data: volumes } = useVolumes()
+  const [pinnedOnly, setPinnedOnly] = useState(false)
   const volumeOptions = (volumes?.items ?? [])
     .map((v) => ({ value: v.volume_id, label: `${v.volume_id}（${v.snapshot_count} 个快照）` }))
     .sort((a, b) => a.value.localeCompare(b.value))
 
+  const visibleRows = useMemo(() => {
+    if (!pinnedOnly || !snapshots) return snapshots
+    return snapshots.filter((s) => pins?.[s.snapshot_id]?.pinned)
+  }, [snapshots, pinnedOnly, pins])
+
   const columns = [
+    {
+      title: '',
+      key: 'pin',
+      width: 48,
+      render: (_: unknown, record: { snapshot_id: string }) => {
+        const pinned = pins?.[record.snapshot_id]?.pinned
+        return (
+          <Tooltip title={pinned ? '取消置顶' : '置顶快照'}>
+            <Button
+              type="text"
+              size="small"
+              loading={pinPendingId === record.snapshot_id}
+              icon={
+                pinned ? (
+                  <StarFilled style={{ color: '#faad14' }} />
+                ) : (
+                  <StarOutlined style={{ color: '#bfbfbf' }} />
+                )
+              }
+              onClick={() => onTogglePin(record.snapshot_id, !pinned)}
+            />
+          </Tooltip>
+        )
+      },
+    },
     { title: '快照 ID', dataIndex: 'snapshot_id', key: 'snapshot_id', ellipsis: true },
     { title: '卷', dataIndex: 'volume_id', key: 'volume_id', ellipsis: true },
     { title: '采集时间', dataIndex: 'collected_at', key: 'collected_at', render: (v: string) => formatDateTime(v) },
@@ -271,6 +361,16 @@ function SnapshotListView({
           onChange={(v) => onVolumeFilterChange(v)}
           options={volumeOptions}
         />
+        <Tooltip title={pinsLoading ? '置顶状态加载中' : '只显示已置顶的快照'}>
+          <Checkbox
+            checked={pinnedOnly}
+            disabled={pinsLoading}
+            onChange={(e) => setPinnedOnly(e.target.checked)}
+          >
+            <StarFilled style={{ color: '#faad14', marginRight: 4 }} />
+            只看置顶
+          </Checkbox>
+        </Tooltip>
         {volumeFilter && (
           <Text type="secondary">
             只显示卷 <Text code>{volumeFilter}</Text> 的快照
@@ -280,10 +380,10 @@ function SnapshotListView({
       {!!error && <ErrorAlert error={error} />}
       {loading && <Spin style={{ display: 'block', margin: '32px auto' }} />}
       <Card>
-        {snapshots?.length ? (
-          <Table rowKey="snapshot_id" size="small" columns={columns} dataSource={snapshots} pagination={{ pageSize: 10 }} />
+        {visibleRows?.length ? (
+          <Table rowKey="snapshot_id" size="small" columns={columns} dataSource={visibleRows} pagination={{ pageSize: 10 }} />
         ) : (
-          <Empty description={volumeFilter ? '该卷暂无快照' : '暂无快照'} />
+          <Empty description={pinnedOnly ? '暂无置顶快照' : volumeFilter ? '该卷暂无快照' : '暂无快照'} />
         )}
       </Card>
     </div>
@@ -291,12 +391,72 @@ function SnapshotListView({
 }
 
 function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDelete: () => void }) {
+  const { message } = App.useApp()
+  const qc = useQueryClient()
   const { data: snapshot, isLoading: detailLoading, error: detailError } = useSnapshot(snapshotId)
   const { data: stats, isLoading: statsLoading, error: statsError } = useSnapshotStats(snapshotId)
   const [duLimit, setDuLimit] = useState<number>(50)
   const [extLimit, setExtLimit] = useState<number>(10)
   const [topFilesLimit, setTopFilesLimit] = useState<number>(50)
   const { data: du, isLoading: duLoading, error: duError } = useDu(snapshotId, 0, duLimit)
+
+  // 副本校验
+  const [verifyReport, setVerifyReport] = useState<VerifyCopyReport | null>(null)
+  const handleVerifyResult = (report: VerifyCopyReport) => {
+    setVerifyReport(report)
+    qc.invalidateQueries({ queryKey: ['snapshot', snapshotId] })
+    message.success(report.ok ? '校验完成：副本与源文件一致' : '校验完成：发现异常，请查看结果')
+  }
+
+  // 重建统计缓存（任务化）
+  const buildStats = useBuildIndexTask()
+  const [statsTaskId, setStatsTaskId] = useState<string | null>(null)
+  const { task: statsTask } = useTaskEvents(statsTaskId ?? undefined, !!statsTaskId)
+  const statsTaskActive = !!statsTask && (statsTask.status === 'pending' || statsTask.status === 'running' || statsTask.status === 'cancelling')
+
+  useEffect(() => {
+    if (!statsTask) return
+    if (statsTask.status === 'done') {
+      message.success('统计缓存重建完成，图表已刷新')
+      qc.invalidateQueries({ queryKey: ['snapshot-stats', snapshotId] })
+    } else if (statsTask.status === 'error') {
+      message.error(`统计缓存重建失败：${statsTask.error ?? '未知错误'}`)
+    }
+  }, [statsTask, message, qc, snapshotId])
+
+  const submitBuildStats = async () => {
+    try {
+      const res = await buildStats.mutateAsync({ snapshot_id: snapshotId, kind: 'build_stats' })
+      setStatsTaskId(res.task_id)
+      message.success(`统计缓存重建任务已提交（${res.task_id.slice(0, 12)}…）`)
+    } catch (e) {
+      if (axios.isAxiosError(e)) {
+        const detail = e.response?.data
+        const text = typeof detail === 'string' ? detail : (detail as { detail?: string } | undefined)?.detail
+        message.warning(text || '提交失败，请稍后重试')
+      } else {
+        message.error(e instanceof Error ? e.message : String(e))
+      }
+    }
+  }
+
+  // 备注（≤2000 字）
+  const patchNotes = usePatchSnapshot()
+  const [notesEditing, setNotesEditing] = useState(false)
+  const [notesDraft, setNotesDraft] = useState('')
+
+  const saveNotes = async () => {
+    try {
+      await patchNotes.mutateAsync({ snapshot_id: snapshotId, body: { notes: notesDraft } })
+      message.success('备注已保存')
+      setNotesEditing(false)
+    } catch (e) {
+      const detail = axios.isAxiosError(e)
+        ? (typeof e.response?.data === 'string' ? e.response.data : (e.response?.data as { detail?: string } | undefined)?.detail)
+        : undefined
+      message.error(detail || (e instanceof Error ? e.message : '保存失败'))
+    }
+  }
 
   const error = detailError || statsError || duError
 
@@ -378,9 +538,32 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
         </Col>
       </Row>
 
+      <Row justify="end" align="middle" style={{ marginTop: 8 }}>
+        <Space size={12}>
+          {statsTaskActive && (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              统计缓存重建进行中，完成后自动刷新…
+            </Text>
+          )}
+          <Tooltip title="重建快照库内的预计算统计缓存。仅在数据异常（图表与实际不符）时使用，正常情况无需点击。">
+            <span>
+              <Button
+                size="small"
+                icon={<SyncOutlined />}
+                loading={buildStats.isPending}
+                disabled={statsTaskActive}
+                onClick={submitBuildStats}
+              >
+                重建统计缓存
+              </Button>
+            </span>
+          </Tooltip>
+        </Space>
+      </Row>
+
       <Card
         title="元数据"
-        style={{ marginTop: 16 }}
+        style={{ marginTop: 8 }}
         extra={
           <Button danger icon={<DeleteOutlined />} onClick={onDelete}>
             删除快照
@@ -396,9 +579,64 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
           <div>
             <Text style={{ marginRight: 8 }}>盘上副本：</Text>
             {detailLoading ? <Skeleton.Input size="small" active /> : <OnDiskCopyBadge copy={snapshot?.on_disk_copy ?? null} />}
+            {!detailLoading && (
+              <VerifyCopyButton
+                snapshotId={snapshotId}
+                onResult={handleVerifyResult}
+              />
+            )}
+          </div>
+          <div>
+            <Text style={{ marginRight: 8, verticalAlign: 'top' }}>备注：</Text>
+            {notesEditing ? (
+              <Space orientation="vertical" style={{ display: 'inline-flex', width: 'calc(100% - 56px)', maxWidth: 560, verticalAlign: 'top' }} size="small">
+                <Input.TextArea
+                  rows={4}
+                  maxLength={2000}
+                  showCount
+                  value={notesDraft}
+                  onChange={(e) => setNotesDraft(e.target.value)}
+                  placeholder="记录这块盘的存放位置、备份策略等（最多 2000 字）"
+                />
+                <Space>
+                  <Button type="primary" size="small" loading={patchNotes.isPending} onClick={saveNotes}>
+                    保存
+                  </Button>
+                  <Button size="small" onClick={() => setNotesEditing(false)}>
+                    取消
+                  </Button>
+                </Space>
+              </Space>
+            ) : (
+              <Space size={8} wrap>
+                {snapshot?.notes ? (
+                  <Text style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{snapshot.notes}</Text>
+                ) : (
+                  <Text type="secondary">暂无备注</Text>
+                )}
+                <Button
+                  size="small"
+                  icon={<EditOutlined />}
+                  onClick={() => {
+                    setNotesDraft(snapshot?.notes ?? '')
+                    setNotesEditing(true)
+                  }}
+                >
+                  {snapshot?.notes ? '编辑备注' : '添加备注'}
+                </Button>
+              </Space>
+            )}
           </div>
         </Space>
       </Card>
+
+      {verifyReport && (
+        <VerifyCopyResultCard
+          snapshotId={snapshotId}
+          report={verifyReport}
+          onClose={() => setVerifyReport(null)}
+        />
+      )}
 
       <HashPanel snapshotId={snapshotId} />
 
@@ -907,7 +1145,22 @@ const MODE_LABELS: Record<SearchMode, string> = {
   fulltext: '全文',
 }
 
+/** 探测快照是否已建全文索引（不碰 React 状态）；null = 探测失败。 */
+async function fetchFulltextAvailable(snapshotId: string): Promise<boolean | null> {
+  try {
+    const res = await fetch(`/api/snapshots/${encodeURIComponent(snapshotId)}/search?q=%20&mode=prefix&limit=1`)
+    if (!res.ok) return null
+    const data = await res.json()
+    return typeof data?.fulltext_available === 'boolean' ? data.fulltext_available : null
+  } catch {
+    return null
+  }
+}
+
 function SearchPanel({ snapshotId }: { snapshotId: string }) {
+  const { message } = App.useApp()
+  const navigate = useNavigate()
+  const qc = useQueryClient()
   const [q, setQ] = useState('')
   const [mode, setMode] = useState<SearchMode>('prefix')
   const [typeFilter, setTypeFilter] = useState<string | undefined>(undefined)
@@ -924,20 +1177,64 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   useEffect(() => {
     let cancelled = false
     setFulltextAvailable(null)
-    fetch(`/api/snapshots/${encodeURIComponent(snapshotId)}/search?q=%20&mode=prefix&limit=1`)
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (!cancelled && data && typeof data.fulltext_available === 'boolean') {
-          setFulltextAvailable(data.fulltext_available)
-        }
-      })
-      .catch(() => {
-        // 探测失败时不阻塞搜索
-      })
+    void fetchFulltextAvailable(snapshotId).then((v) => {
+      if (!cancelled && v !== null) setFulltextAvailable(v)
+    })
     return () => {
       cancelled = true
     }
   }, [snapshotId])
+
+  // 补建全文索引（任务化）：完成后重探测、失效搜索缓存，并在有关键词时自动重试搜索
+  const buildFts = useBuildIndexTask()
+  const [buildTaskId, setBuildTaskId] = useState<string | null>(null)
+  const { task: buildTaskState } = useTaskEvents(buildTaskId ?? undefined, !!buildTaskId)
+  const buildTaskActive = !!buildTaskState && (buildTaskState.status === 'pending' || buildTaskState.status === 'running' || buildTaskState.status === 'cancelling')
+
+  useEffect(() => {
+    if (!buildTaskState) return
+    if (buildTaskState.status === 'done') {
+      message.success('全文索引构建完成')
+      qc.invalidateQueries({ queryKey: ['search', snapshotId] })
+      void fetchFulltextAvailable(snapshotId).then((v) => {
+        if (v === null) return
+        setFulltextAvailable(v)
+        if (v && q.trim().length >= 3) {
+          setMode('fulltext')
+          setHasSearched(true)
+        }
+      })
+    } else if (buildTaskState.status === 'error') {
+      message.error(`全文索引构建失败：${buildTaskState.error ?? '未知错误'}`)
+    }
+  }, [buildTaskState, message, qc, snapshotId, q])
+
+  const submitBuildFts = async () => {
+    try {
+      const res = await buildFts.mutateAsync({ snapshot_id: snapshotId, kind: 'build_fts' })
+      setBuildTaskId(res.task_id)
+      message.success({
+        content: (
+          <span>
+            全文索引构建任务已提交，<Button type="link" size="small" style={{ padding: 0 }} icon={<LinkOutlined />} onClick={() => navigate('/tasks')}>到任务页查看进度</Button>
+          </span>
+        ),
+        duration: 5,
+      })
+    } catch (e) {
+      if (axios.isAxiosError(e)) {
+        if (e.response?.status === 409) {
+          message.info('该快照已有构建任务在执行中，请等它完成')
+        } else {
+          const detail = e.response?.data
+          const text = typeof detail === 'string' ? detail : (detail as { detail?: string } | undefined)?.detail
+          message.warning(text || '提交失败，请稍后重试')
+        }
+      } else {
+        message.error(e instanceof Error ? e.message : String(e))
+      }
+    }
+  }
 
   // 如果当前选的是全文但快照无索引，自动切回前缀
   useEffect(() => {
@@ -1050,7 +1347,40 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
             style={{ marginTop: 16, marginBottom: 0 }}
             type="warning"
             showIcon
-            title="该快照未构建全文索引，可用 CLDM 命令 build-fts 补建"
+            title="该快照未构建全文索引，全文搜索不可用"
+            description={
+              buildTaskActive
+                ? '索引构建任务进行中，完成后将自动切换到全文模式并重试搜索。'
+                : '可在后台补建索引（构建完成后自动重试搜索）。'
+            }
+            action={
+              <Button
+                size="small"
+                type="primary"
+                ghost
+                loading={buildFts.isPending}
+                disabled={buildTaskActive}
+                onClick={submitBuildFts}
+              >
+                立即补建全文索引
+              </Button>
+            }
+          />
+        )}
+        {buildTaskActive && buildTaskState && (
+          <Alert
+            style={{ marginTop: 8, marginBottom: 0 }}
+            type="info"
+            showIcon
+            title={`全文索引构建中（${buildTaskState.status === 'running' ? '运行中' : '排队中'}）`}
+            description={
+              <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+                <Progress percent={buildTaskState.progress != null ? Math.round(buildTaskState.progress * 100) : 0} size="small" status="active" />
+                <Button type="link" size="small" style={{ padding: 0 }} icon={<LinkOutlined />} onClick={() => navigate('/tasks')}>
+                  到任务页管理
+                </Button>
+              </Space>
+            }
           />
         )}
         {mode === 'fulltext' && q.length > 0 && q.length < 3 && (
@@ -1104,7 +1434,7 @@ function DeleteSnapshotModal({
   onCancel,
   onConfirm,
 }: {
-  target: { snapshot_id: string; displayName: string } | null
+  target: { snapshot_id: string; displayName: string; pinned: boolean } | null
   onDisk: boolean
   onDiskChange: (v: boolean) => void
   force: boolean
@@ -1139,6 +1469,14 @@ function DeleteSnapshotModal({
       <Space orientation="vertical" style={{ width: '100%' }}>
         <Text>即将删除快照：<Text code>{target.displayName}</Text></Text>
         <Text type="secondary">快照 ID：<Text code>{target.snapshot_id}</Text></Text>
+        {target.pinned && (
+          <Alert
+            type="warning"
+            showIcon
+            title="这是置顶快照"
+            description="置顶只是标记，不影响删除；删除后置顶与备注会随快照一并消失。"
+          />
+        )}
         <Text>该操作会删除主机上的快照目录，且不可恢复。</Text>
 
         <Checkbox checked={onDisk} onChange={(e) => onDiskChange(e.target.checked)}>
@@ -1174,28 +1512,64 @@ function DeleteSnapshotModal({
 }
 
 function ExportPanel({ snapshotId }: { snapshotId: string }) {
+  const [sections, setSections] = useState<string[]>(REPORT_SECTIONS.map((s) => s.value))
+
+  const allSelected = sections.length === REPORT_SECTIONS.length
+  const reportUrl = snapshotReportUrl(snapshotId, sections)
+  const reportFileName = `cldm_${snapshotId.replace(/\//g, '_')}_report.html`
+
   return (
     <Card title="导出快照数据">
-      <Space orientation="vertical" style={{ width: '100%' }}>
+      <Space orientation="vertical" style={{ width: '100%' }} size="middle">
         <Alert
           type="info"
           showIcon
           title="导出格式说明"
           description="CSV：entries 全表；V1 CSV：兼容旧版的三件套 zip；HTML 报告：自包含的单文件网页，含统计图表与跳过项汇总。"
         />
+
+        <Card
+          type="inner"
+          title="HTML 报告分节"
+          extra={
+            <Button
+              type="link"
+              size="small"
+              onClick={() => setSections(allSelected ? [] : REPORT_SECTIONS.map((s) => s.value))}
+            >
+              {allSelected ? '全不选' : '全选'}
+            </Button>
+          }
+        >
+          <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
+            <Checkbox.Group
+              options={REPORT_SECTIONS.map((s) => ({ label: s.label, value: s.value }))}
+              value={sections}
+              onChange={(v) => setSections(v as string[])}
+            />
+            <Space wrap>
+              <Button
+                type="primary"
+                icon={<FileTextOutlined />}
+                href={reportUrl}
+                download={reportFileName}
+                disabled={sections.length === 0}
+              >
+                生成 HTML 报告（{sections.length}/{REPORT_SECTIONS.length} 节）
+              </Button>
+              {sections.length === 0 && (
+                <Text type="secondary">至少勾选一个分节才能生成报告</Text>
+              )}
+            </Space>
+          </Space>
+        </Card>
+
         <Space wrap>
           <Button icon={<DownloadOutlined />} href={exportSnapshotUrl(snapshotId, 'csv')}>
             导出 CSV
           </Button>
           <Button icon={<DownloadOutlined />} href={exportSnapshotUrl(snapshotId, 'v1_csv')}>
             导出 V1 CSV（zip）
-          </Button>
-          <Button
-            icon={<FileTextOutlined />}
-            href={snapshotReportUrl(snapshotId)}
-            download={`cldm_${snapshotId.replace(/\//g, '_')}_report.html`}
-          >
-            HTML 报告
           </Button>
         </Space>
       </Space>
