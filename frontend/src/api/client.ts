@@ -29,6 +29,8 @@ export interface Snapshot {
   max_depth: number
   skipped_count: number
   host_path: string
+  /** 列表与详情均返回；列表为 bool，详情接口历史上返回 0|1（按真值使用） */
+  pinned: boolean
   disk_id: string
   filesystem: string
   label: string | null
@@ -58,8 +60,6 @@ export interface SnapshotPatchBody {
 
 /** 快照详情（GET /snapshots/{sid}）：catalog 全行 + volume/disk + 盘上副本 + meta。 */
 export interface SnapshotDetail extends Snapshot {
-  /** 0 | 1 */
-  pinned: number
   notes: string | null
   volume: Record<string, unknown>
   on_disk_copy: OnDiskCopy | null

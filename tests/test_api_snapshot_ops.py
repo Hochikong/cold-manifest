@@ -319,3 +319,19 @@ def test_patch_snapshot_400_404(client: TestClient) -> None:
     assert client.patch(f"{BASE}/nope/123", json={"pinned": True}).status_code == 404
     # 非法 sid（volume 段含非法字符）→ 400
     assert client.patch(f"{BASE}/!bad/123", json={"pinned": True}).status_code == 400
+
+
+# ---------------------------------------------------------------- 列表携带 pinned
+
+
+def test_list_snapshots_include_pinned(client: TestClient) -> None:
+    """列表行自带 pinned；PATCH pinned=true 后列表反映为 true。"""
+    items = client.get(BASE).json()["items"]
+    row = next(i for i in items if i["snapshot_id"] == SID)
+    assert row["pinned"] is False
+
+    assert client.patch(f"{BASE}/{SID}", json={"pinned": True}).status_code == 200
+
+    items = client.get(BASE).json()["items"]
+    row = next(i for i in items if i["snapshot_id"] == SID)
+    assert row["pinned"] is True

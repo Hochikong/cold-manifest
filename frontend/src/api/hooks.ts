@@ -181,30 +181,9 @@ export function useDeleteSnapshot() {
   })
 }
 
-/** 快照列表的置顶/备注状态：列表端点不带 pinned，逐个取详情（快照总数 ≤20，可接受）。 */
-export interface SnapshotPin {
-  pinned: boolean
-  notes: string | null
-}
+/** 快照列表行自带 pinned（列表端点已返回），无需再扇出详情请求。 */
 
-export function useSnapshotPins(ids: string[] | undefined) {
-  const key = ids ? ids.join('|') : ''
-  return useQuery({
-    queryKey: ['snapshot-pins', key],
-    queryFn: async () => {
-      const details = await Promise.all(ids!.map((sid) => getSnapshot(sid)))
-      const map: Record<string, SnapshotPin> = {}
-      for (const d of details) {
-        map[d.snapshot_id] = { pinned: !!d.pinned, notes: d.notes ?? null }
-      }
-      return map
-    },
-    enabled: !!ids && ids.length > 0,
-    staleTime: 60_000,
-  })
-}
-
-/** 更新置顶 / 备注；后端返回完整详情，直接写回详情与置顶缓存。 */
+/** 更新置顶 / 备注；后端返回完整详情，直接写回详情缓存并刷新列表。 */
 export function usePatchSnapshot() {
   const qc = useQueryClient()
   return useMutation({
@@ -212,7 +191,7 @@ export function usePatchSnapshot() {
       patchSnapshot(snapshot_id, body),
     onSuccess: (detail, vars) => {
       qc.setQueryData(['snapshot', vars.snapshot_id], detail)
-      qc.invalidateQueries({ queryKey: ['snapshot-pins'] })
+      qc.invalidateQueries({ queryKey: ['snapshots'] })
     },
   })
 }

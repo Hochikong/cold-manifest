@@ -58,7 +58,6 @@ import {
   useSearch,
   useDeleteSnapshot,
   useVolumes,
-  useSnapshotPins,
   usePatchSnapshot,
   useBuildIndexTask,
   useTaskEvents,
@@ -102,9 +101,7 @@ export default function SnapshotsPage() {
   const { data: snapshots, isLoading: listLoading, error: listError, refetch: refetchSnapshots } = useSnapshots(volumeFilter)
   const deleteMutation = useDeleteSnapshot()
 
-  // 置顶 / 备注（列表端点不带 pinned，这里统一取一份给列表与删除确认框用）
-  const snapshotIds = useMemo(() => snapshots?.items.map((s) => s.snapshot_id), [snapshots])
-  const { data: pins, isLoading: pinsLoading } = useSnapshotPins(snapshotIds)
+  // 置顶状态由列表行自带的 pinned 字段提供（PATCH 后 invalidate ['snapshots'] 刷新）
   const patchSnapshotMutation = usePatchSnapshot()
   const [pinPendingId, setPinPendingId] = useState<string | null>(null)
 
@@ -139,7 +136,7 @@ export default function SnapshotsPage() {
     setDeleteTarget({
       snapshot_id: id,
       displayName: getSnapshotDisplayName(id),
-      pinned: !!pins?.[id]?.pinned,
+      pinned: !!snapshots?.items.find((s) => s.snapshot_id === id)?.pinned,
     })
     setDeleteOnDisk(false)
     setDeleteForce(false)
@@ -198,8 +195,6 @@ export default function SnapshotsPage() {
           error={listError}
           volumeFilter={volumeFilter}
           onVolumeFilterChange={setVolumeFilter}
-          pins={pins}
-          pinsLoading={pinsLoading}
           pinPendingId={pinPendingId}
           onTogglePin={togglePin}
           onSelect={(id) => {
@@ -270,20 +265,16 @@ function SnapshotListView({
   error,
   volumeFilter,
   onVolumeFilterChange,
-  pins,
-  pinsLoading,
   pinPendingId,
   onTogglePin,
   onSelect,
   onDelete,
 }: {
-  snapshots?: { snapshot_id: string; volume_id: string; collected_at: string; file_count: number; total_bytes: number }[]
+  snapshots?: { snapshot_id: string; volume_id: string; collected_at: string; file_count: number; total_bytes: number; pinned: boolean }[]
   loading: boolean
   error: unknown
   volumeFilter: string | undefined
   onVolumeFilterChange: (v: string | undefined) => void
-  pins?: Record<string, { pinned: boolean; notes: string | null }>
-  pinsLoading: boolean
   pinPendingId: string | null
   onTogglePin: (sid: string, pinned: boolean) => void
   onSelect: (id: string) => void
@@ -297,16 +288,16 @@ function SnapshotListView({
 
   const visibleRows = useMemo(() => {
     if (!pinnedOnly || !snapshots) return snapshots
-    return snapshots.filter((s) => pins?.[s.snapshot_id]?.pinned)
-  }, [snapshots, pinnedOnly, pins])
+    return snapshots.filter((s) => s.pinned)
+  }, [snapshots, pinnedOnly])
 
   const columns = [
     {
       title: '',
       key: 'pin',
       width: 48,
-      render: (_: unknown, record: { snapshot_id: string }) => {
-        const pinned = pins?.[record.snapshot_id]?.pinned
+      render: (_: unknown, record: { snapshot_id: string; pinned: boolean }) => {
+        const pinned = record.pinned
         return (
           <Tooltip title={pinned ? '取消置顶' : '置顶快照'}>
             <Button
@@ -361,10 +352,9 @@ function SnapshotListView({
           onChange={(v) => onVolumeFilterChange(v)}
           options={volumeOptions}
         />
-        <Tooltip title={pinsLoading ? '置顶状态加载中' : '只显示已置顶的快照'}>
+        <Tooltip title="只显示已置顶的快照">
           <Checkbox
             checked={pinnedOnly}
-            disabled={pinsLoading}
             onChange={(e) => setPinnedOnly(e.target.checked)}
           >
             <StarFilled style={{ color: '#faad14', marginRight: 4 }} />

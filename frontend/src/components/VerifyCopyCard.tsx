@@ -94,7 +94,7 @@ export function VerifyCopyButton({
         title="校验盘上副本"
         open={open}
         onCancel={() => (verify.isPending ? undefined : setOpen(false))}
-        maskClosable={!verify.isPending}
+        mask={{ closable: !verify.isPending }}
         cancelButtonProps={{ disabled: verify.isPending }}
         onOk={run}
         okText="开始校验"

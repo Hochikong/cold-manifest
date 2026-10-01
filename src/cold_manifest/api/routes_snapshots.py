@@ -86,7 +86,7 @@ def list_snapshots(
     sql = """
     SELECT s.snapshot_id, s.volume_id, s.batch_id, s.collected_at, s.status,
            s.hash_policy, s.file_count, s.dir_count, s.total_bytes, s.total_alloc,
-           s.zero_byte_count, s.max_depth, s.skipped_count, s.host_path,
+           s.zero_byte_count, s.max_depth, s.skipped_count, s.host_path, s.pinned,
            v.disk_id, v.filesystem, v.label, v.capacity_bytes AS volume_capacity_bytes,
            d.physical_model, d.physical_serial, d.capacity_bytes AS disk_capacity_bytes
     FROM snapshots s
@@ -99,6 +99,8 @@ def list_snapshots(
         params.append(volume_id)
     sql += " ORDER BY s.volume_id, s.collected_at"
     items = [_rowget(r) for r in state.catalog.execute(sql, params)]
+    for item in items:
+        item["pinned"] = bool(item.get("pinned"))
     return {"items": items, "count": len(items)}
 
 
