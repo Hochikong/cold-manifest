@@ -50,7 +50,18 @@ export async function listSnapshots(volume_id?: string): Promise<SnapshotsRespon
   return data
 }
 
-export async function getSnapshot(snapshot_id: string): Promise<Snapshot & { volume: Record<string, unknown>; on_disk_copy: Record<string, unknown> | null; meta: Record<string, string> }> {
+/** 盘上副本登记（catalog.on_disk_copies 行）。 */
+export interface OnDiskCopy {
+  snapshot_id: string
+  disk_path: string | null
+  copied_at: string | null
+  sha256: string | null
+  verified_at: string | null
+  /** ok | skipped_no_space | missing | stale */
+  status: string
+}
+
+export async function getSnapshot(snapshot_id: string): Promise<Snapshot & { volume: Record<string, unknown>; on_disk_copy: OnDiskCopy | null; meta: Record<string, string> }> {
   const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}`)
   return data
 }
@@ -448,6 +459,8 @@ export interface HashTaskBody {
   policy: 'full' | 'sampled'
   root?: string
   scope?: 'incremental' | 'candidates'
+  /** 指定 hash_hex（可只给前缀）：只对该组做完整哈希精验（与 scope=candidates 互斥） */
+  group?: string
 }
 
 export interface HashTaskResponse {
@@ -580,6 +593,66 @@ export async function listDiffEntries(diff_id: string, params: DiffEntriesParams
 
 export function exportSnapshotUrl(snapshot_id: string, format: 'csv' | 'v1_csv' = 'csv'): string {
   return `/api/snapshots/${encodeURIComponent(snapshot_id)}/export?format=${format}`
+}
+
+/** 快照自包含 HTML 报告（GET /report?format=html）。 */
+export function snapshotReportUrl(snapshot_id: string): string {
+  return `/api/snapshots/${encodeURIComponent(snapshot_id)}/report?format=html`
+}
+
+export interface SkippedItem {
+  path: string
+  warning_type: string
+  stage: string
+  detail: string | null
+}
+
+export interface SkippedResponse {
+  snapshot_id: string
+  items: SkippedItem[]
+  next_cursor: string | null
+  has_more: boolean
+}
+
+export interface SkippedParams {
+  cursor?: string
+  limit?: number
+  stage?: string
+  warning_type?: string
+}
+
+/** 未采集项（skipped 表），keyset 分页，支持 stage / warning_type 过滤。 */
+export async function getSkipped(snapshot_id: string, params: SkippedParams = {}): Promise<SkippedResponse> {
+  const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}/skipped`, { params })
+  return data
+}
+
+export interface AttachedVolume {
+  path: string
+  device: string
+  filesystem: string
+  label: string
+}
+
+export interface AttachedDisk {
+  device: string
+  model: string
+  serial: string
+  size_bytes: number | null
+  volumes: AttachedVolume[]
+}
+
+export interface AttachedDisksResponse {
+  available: boolean
+  reason?: string
+  items: AttachedDisk[]
+  count?: number
+}
+
+/** 本机可见盘（lsblk / WMI 枚举）；不可用时 available=false + reason，不抛错。 */
+export async function getAttachedDisks(): Promise<AttachedDisksResponse> {
+  const { data } = await client.get('/disks/attached')
+  return data
 }
 
 export function exportDiffUrl(diff_id: string): string {

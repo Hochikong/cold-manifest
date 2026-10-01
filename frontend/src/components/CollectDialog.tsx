@@ -7,6 +7,7 @@ import {
   Checkbox,
   Progress,
   Alert,
+  Select,
   Space,
   Typography,
   Tag,
@@ -27,8 +28,8 @@ import {
   WarningOutlined,
 } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
-import { useCreateCollect, useCancelTask, useTaskEvents, useBatch, useCollectPreflight } from '../api/hooks'
-import { isBatchCollectResponse, type BatchCollectCreateResponse, type Task, type Batch } from '../api/client'
+import { useAttachedDisks, useCreateCollect, useCancelTask, useTaskEvents, useBatch, useCollectPreflight } from '../api/hooks'
+import { isBatchCollectResponse, type BatchCollectCreateResponse, type Task, type Batch, type AttachedDisk } from '../api/client'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatFileSize, formatNumber } from '../utils/format'
 
@@ -191,6 +192,13 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
 
         {mode === 'form' && (
           <Form layout="vertical">
+            <AttachedDiskQuickPick
+              onPick={(pickedPath, pickedSerial) => {
+                setPath(pickedPath)
+                if (pickedSerial && !serial.trim()) setSerial(pickedSerial)
+              }}
+            />
+
             <Form.Item label={allPartitions ? '盘 / 挂载点路径' : '采集路径'} required>
               <Input
                 placeholder={allPartitions ? '例如 /tmp/opencode/collect-demo' : '例如 /tmp/opencode/collect-demo'}
@@ -690,4 +698,78 @@ function PreflightSection({ path }: { path: string }) {
 
 function isTerminal(status: Task['status']): boolean {
   return status === 'done' || status === 'error' || status === 'cancelled'
+}
+
+/**
+ * 本机盘/卷快选（GET /api/disks/attached）：
+ * - 枚举成功且有已挂载卷 → 下拉选择，选中自动填采集路径（并回填序列号）；
+ * - 枚举成功但无挂载卷 → 列出磁盘（禁用项）并提示手输路径；
+ * - 枚举失败（available=false）→ 保持手输，展示原因。
+ */
+function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: string) => void }) {
+  const { data, isLoading } = useAttachedDisks(true)
+
+  if (isLoading) {
+    return (
+      <Form.Item label="本机磁盘">
+        <Select loading placeholder="正在枚举本机磁盘…" style={{ width: '100%' }} />
+      </Form.Item>
+    )
+  }
+
+  if (!data) return null
+
+  if (!data.available) {
+    return (
+      <Form.Item label="本机磁盘">
+        <Alert
+          type="info"
+          showIcon
+          title={`无法枚举本机磁盘（${data.reason ?? '未知原因'}），请手动输入采集路径。`}
+        />
+      </Form.Item>
+    )
+  }
+
+  // 盘 → 已挂载卷的级联选项；整盘无挂载点的以禁用项呈现
+  const options = data.items.map((disk: AttachedDisk) => ({
+    label: `${disk.device} · ${disk.model || '未知型号'} · ${formatFileSize(disk.size_bytes)}`,
+    title: disk.serial || undefined,
+    options:
+      disk.volumes.length > 0
+        ? disk.volumes.map((v) => ({
+            value: `${disk.device}\u0000${v.path}`,
+            label: `${v.path}（${v.filesystem || '未知文件系统'}${v.label ? ` · ${v.label}` : ''}）`,
+          }))
+        : [{ value: `${disk.device}\u0000__none__`, label: '（无已挂载分区）', disabled: true }],
+  }))
+  const mountedCount = data.items.reduce((n, d) => n + d.volumes.length, 0)
+
+  return (
+    <Form.Item
+      label="本机磁盘快选"
+      extra={
+        mountedCount > 0
+          ? '选择已挂载的卷后自动填入下方路径；也可直接手输。'
+          : '本机磁盘已枚举，但没有发现已挂载的卷（如 WSL 裸盘）；请手动输入采集路径。'
+      }
+    >
+      <Select
+        placeholder="选择本机磁盘 / 挂载点…"
+        style={{ width: '100%' }}
+        allowClear
+        showSearch
+        optionFilterProp="label"
+        options={options}
+        value={undefined}
+        onChange={(value: unknown) => {
+          if (!value) return
+          const found = data.items
+            .flatMap((d) => d.volumes.map((v) => ({ key: `${d.device}\u0000${v.path}`, path: v.path, serial: d.serial || undefined })))
+            .find((o) => o.key === value)
+          if (found) onPick(found.path, found.serial)
+        }}
+      />
+    </Form.Item>
+  )
 }

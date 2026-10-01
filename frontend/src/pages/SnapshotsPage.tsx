@@ -12,7 +12,9 @@ import {
   Button,
   Space,
   Input,
+  InputNumber,
   Select,
+  Segmented,
   Typography,
   Empty,
   Spin,
@@ -29,28 +31,24 @@ import {
   FileOutlined,
   ReloadOutlined,
   DownloadOutlined,
+  FileTextOutlined,
   SearchOutlined,
   ArrowLeftOutlined,
   HomeOutlined,
   DeleteOutlined,
   ExclamationCircleOutlined,
+  FilterOutlined,
 } from '@ant-design/icons'
 import type { DataNode } from 'antd/es/tree'
 import ReactECharts from 'echarts-for-react'
-import {
-  useSnapshots,
-  useSnapshot,
-  useSnapshotStats,
-  useEntries,
-  useTree,
-  useDu,
-  useSearch,
-  useDeleteSnapshot,
-} from '../api/hooks'
+import { useSnapshots, useSnapshot, useSnapshotStats, useEntries, useTree, useDu, useSearch, useDeleteSnapshot, useVolumes } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import DuplicateReport from '../components/DuplicateReport'
+import HashPanel from '../components/HashPanel'
+import SkippedPanel from '../components/SkippedPanel'
+import OnDiskCopyBadge from '../components/OnDiskCopyBadge'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
-import { exportSnapshotUrl, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked } from '../api/client'
+import { exportSnapshotUrl, snapshotReportUrl, listEntries, searchEntries, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked } from '../api/client'
 import axios from 'axios'
 
 const { Title, Text } = Typography
@@ -78,7 +76,8 @@ export default function SnapshotsPage() {
   const snapshotId = searchParams.get('snapshot') || undefined
   const activeTab = searchParams.get('tab') || 'overview'
 
-  const { data: snapshots, isLoading: listLoading, error: listError, refetch: refetchSnapshots } = useSnapshots()
+  const [volumeFilter, setVolumeFilter] = useState<string | undefined>(undefined)
+  const { data: snapshots, isLoading: listLoading, error: listError, refetch: refetchSnapshots } = useSnapshots(volumeFilter)
   const deleteMutation = useDeleteSnapshot()
 
   const [deleteTarget, setDeleteTarget] = useState<{ snapshot_id: string; displayName: string } | null>(null)
@@ -150,6 +149,8 @@ export default function SnapshotsPage() {
           snapshots={snapshots?.items}
           loading={listLoading}
           error={listError}
+          volumeFilter={volumeFilter}
+          onVolumeFilterChange={setVolumeFilter}
           onSelect={(id) => {
             const next = new URLSearchParams()
             next.set('snapshot', id)
@@ -192,6 +193,7 @@ export default function SnapshotsPage() {
           { key: 'browse', label: '浏览', children: <DirectoryBrowser snapshotId={snapshotId} /> },
           { key: 'duplicates', label: '重复文件', children: <DuplicateReport snapshotId={snapshotId} /> },
           { key: 'search', label: '搜索', children: <SearchPanel snapshotId={snapshotId} /> },
+          { key: 'skipped', label: '跳过项', children: <SkippedPanel snapshotId={snapshotId} /> },
           { key: 'export', label: '导出', children: <ExportPanel snapshotId={snapshotId} /> },
         ]}
       />
@@ -215,15 +217,24 @@ function SnapshotListView({
   snapshots,
   loading,
   error,
+  volumeFilter,
+  onVolumeFilterChange,
   onSelect,
   onDelete,
 }: {
   snapshots?: { snapshot_id: string; volume_id: string; collected_at: string; file_count: number; total_bytes: number }[]
   loading: boolean
   error: unknown
+  volumeFilter: string | undefined
+  onVolumeFilterChange: (v: string | undefined) => void
   onSelect: (id: string) => void
   onDelete: (id: string) => void
 }) {
+  const { data: volumes } = useVolumes()
+  const volumeOptions = (volumes?.items ?? [])
+    .map((v) => ({ value: v.volume_id, label: `${v.volume_id}（${v.snapshot_count} 个快照）` }))
+    .sort((a, b) => a.value.localeCompare(b.value))
+
   const columns = [
     { title: '快照 ID', dataIndex: 'snapshot_id', key: 'snapshot_id', ellipsis: true },
     { title: '卷', dataIndex: 'volume_id', key: 'volume_id', ellipsis: true },
@@ -248,14 +259,31 @@ function SnapshotListView({
 
   return (
     <div>
-      <Title level={4} style={{ marginTop: 0 }}>快照</Title>
+      <Space align="center" style={{ marginTop: 0, marginBottom: 16 }} wrap>
+        <Title level={4} style={{ margin: 0 }}>快照</Title>
+        <Select
+          placeholder="按卷筛选"
+          allowClear
+          showSearch
+          optionFilterProp="label"
+          style={{ minWidth: 260 }}
+          value={volumeFilter}
+          onChange={(v) => onVolumeFilterChange(v)}
+          options={volumeOptions}
+        />
+        {volumeFilter && (
+          <Text type="secondary">
+            只显示卷 <Text code>{volumeFilter}</Text> 的快照
+          </Text>
+        )}
+      </Space>
       {!!error && <ErrorAlert error={error} />}
       {loading && <Spin style={{ display: 'block', margin: '32px auto' }} />}
       <Card>
         {snapshots?.length ? (
           <Table rowKey="snapshot_id" size="small" columns={columns} dataSource={snapshots} pagination={{ pageSize: 10 }} />
         ) : (
-          <Empty description="暂无快照" />
+          <Empty description={volumeFilter ? '该卷暂无快照' : '暂无快照'} />
         )}
       </Card>
     </div>
@@ -265,13 +293,16 @@ function SnapshotListView({
 function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDelete: () => void }) {
   const { data: snapshot, isLoading: detailLoading, error: detailError } = useSnapshot(snapshotId)
   const { data: stats, isLoading: statsLoading, error: statsError } = useSnapshotStats(snapshotId)
-  const { data: du, isLoading: duLoading, error: duError } = useDu(snapshotId, 0, 20)
+  const [duLimit, setDuLimit] = useState<number>(50)
+  const [extLimit, setExtLimit] = useState<number>(10)
+  const [topFilesLimit, setTopFilesLimit] = useState<number>(50)
+  const { data: du, isLoading: duLoading, error: duError } = useDu(snapshotId, 0, duLimit)
 
   const error = detailError || statsError || duError
 
   const extChartOption = useMemo(() => {
     if (!stats?.ext_top_by_count.length) return null
-    const items = stats.ext_top_by_count.slice(0, 10)
+    const items = stats.ext_top_by_count.slice(0, extLimit)
     return {
       tooltip: { trigger: 'axis' },
       grid: { left: 16, right: 16, top: 16, bottom: 8, containLabel: true },
@@ -279,7 +310,7 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
       yAxis: { type: 'category', data: items.map((i) => i.ext || '(无)').reverse() },
       series: [{ type: 'bar', data: items.map((i) => i.count).reverse(), itemStyle: { color: '#aa3bff' } }],
     }
-  }, [stats])
+  }, [stats, extLimit])
 
   const sizeChartOption = useMemo(() => {
     if (!stats?.size_histogram.length) return null
@@ -356,18 +387,39 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
           </Button>
         }
       >
-        <Space orientation="vertical" style={{ width: '100%' }}>
+        <Space orientation="vertical" style={{ width: '100%' }} size="small">
           <Text>快照 ID：<Text code>{snapshot?.snapshot_id}</Text></Text>
           <Text>卷 ID：<Text code>{snapshot?.volume_id}</Text></Text>
           <Text>采集时间：{formatDateTime(snapshot?.collected_at)}</Text>
           <Text>哈希策略：{snapshot?.hash_policy}</Text>
           <Text>跳过项：{formatNumber(snapshot?.skipped_count)}</Text>
+          <div>
+            <Text style={{ marginRight: 8 }}>盘上副本：</Text>
+            {detailLoading ? <Skeleton.Input size="small" active /> : <OnDiskCopyBadge copy={snapshot?.on_disk_copy ?? null} />}
+          </div>
         </Space>
       </Card>
 
+      <HashPanel snapshotId={snapshotId} />
+
       <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
         <Col xs={24} md={12}>
-          <Card title="扩展名 Top 10（按数量）">
+          <Card
+            title="扩展名 Top（按数量）"
+            extra={
+              <Tooltip title="后端统计固定返回前 20 个扩展名">
+                <Segmented
+                  size="small"
+                  value={extLimit}
+                  onChange={(v) => setExtLimit(v as number)}
+                  options={[
+                    { label: '10', value: 10 },
+                    { label: '全部（20）', value: 20 },
+                  ]}
+                />
+              </Tooltip>
+            }
+          >
             {statsLoading ? (
               <Skeleton active paragraph={{ rows: 5 }} />
             ) : extChartOption ? (
@@ -403,7 +455,24 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
           </Card>
         </Col>
         <Col xs={24} md={12}>
-          <Card title="顶层目录占用 Top">
+          <Card
+            title="顶层目录占用 Top"
+            extra={
+              <Tooltip title="接口单次查询上限 500 条">
+                <Segmented
+                  size="small"
+                  value={duLimit}
+                  onChange={(v) => setDuLimit(v as number)}
+                  options={[
+                    { label: '50', value: 50 },
+                    { label: '100', value: 100 },
+                    { label: '200', value: 200 },
+                    { label: '全部（500）', value: 500 },
+                  ]}
+                />
+              </Tooltip>
+            }
+          >
             {duLoading ? (
               <Skeleton active />
             ) : du?.items.length ? (
@@ -411,6 +480,7 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
                 rowKey="entry_id"
                 size="small"
                 pagination={false}
+                scroll={{ y: 280 }}
                 columns={[
                   { title: '名称', dataIndex: 'name', ellipsis: true },
                   { title: '大小', dataIndex: 'total_bytes', render: (v: number) => formatFileSize(v), width: 120 },
@@ -424,7 +494,24 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
         </Col>
       </Row>
 
-      <Card title="最大文件 Top 50" style={{ marginTop: 16 }}>
+      <Card
+        title="最大文件 Top"
+        extra={
+          <Tooltip title="后端统计固定返回前 50 个最大文件">
+            <Segmented
+              size="small"
+              value={topFilesLimit}
+              onChange={(v) => setTopFilesLimit(v as number)}
+              options={[
+                { label: '10', value: 10 },
+                { label: '25', value: 25 },
+                { label: '全部（50）', value: 50 },
+              ]}
+            />
+          </Tooltip>
+        }
+        style={{ marginTop: 16 }}
+      >
         {statsLoading ? (
           <Skeleton active />
         ) : stats?.top_files.length ? (
@@ -432,14 +519,14 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
             rowKey="entry_id"
             size="small"
             pagination={false}
-            scroll={{ x: 'max-content' }}
+            scroll={{ x: 'max-content', y: 400 }}
             columns={[
               { title: '名称', dataIndex: 'name', ellipsis: true },
               { title: '路径', dataIndex: 'path', ellipsis: true },
               { title: '大小', dataIndex: 'size_bytes', render: (v: number) => formatFileSize(v), width: 120 },
               { title: '修改时间', dataIndex: 'mtime_ns', render: (v: string | null) => nsToDate(v), width: 160 },
             ]}
-            dataSource={stats.top_files}
+            dataSource={stats.top_files.slice(0, topFilesLimit)}
           />
         ) : (
           <Empty description="暂无数据" />
@@ -461,6 +548,13 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
   const [sort, setSort] = useState<SortKey>('name')
   const [order, setOrder] = useState<Order>('asc')
   const [typeFilter, setTypeFilter] = useState<string | undefined>(undefined)
+  // 参数级筛选：文本框先草稿、回车/失焦才生效，避免每个键击都打后端
+  const [qDraft, setQDraft] = useState('')
+  const [qApplied, setQApplied] = useState('')
+  const [extDraft, setExtDraft] = useState('')
+  const [extApplied, setExtApplied] = useState('')
+  const [minSize, setMinSize] = useState<number | undefined>(undefined)
+  const [maxSize, setMaxSize] = useState<number | undefined>(undefined)
   const [allItems, setAllItems] = useState<Entry[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
@@ -479,7 +573,28 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
     sort,
     order,
     type: typeFilter as any,
+    ext: extApplied || undefined,
+    min_size: minSize,
+    max_size: maxSize,
+    q: qApplied || undefined,
   })
+
+  const hasFilters = !!(qApplied || extApplied || minSize != null || maxSize != null || typeFilter)
+
+  const applyTextFilters = () => {
+    setQApplied(qDraft.trim())
+    setExtApplied(extDraft.trim())
+  }
+
+  const clearFilters = () => {
+    setQDraft('')
+    setQApplied('')
+    setExtDraft('')
+    setExtApplied('')
+    setMinSize(undefined)
+    setMaxSize(undefined)
+    setTypeFilter(undefined)
+  }
 
   useEffect(() => {
     if (entriesRes) {
@@ -527,13 +642,24 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
   const loadMore = async () => {
     if (!cursor) return
     setLoadingMore(true)
-    const res = await fetch(
-      `/api/snapshots/${encodeURIComponent(snapshotId)}/entries?parent_id=${parentId}&cursor=${encodeURIComponent(cursor)}&limit=${ENTRY_PAGE_SIZE}&sort=${sort}&order=${order}${typeFilter ? `&type=${typeFilter}` : ''}`
-    )
-    const data = await res.json()
-    setAllItems((prev) => [...prev, ...data.items])
-    setCursor(data.next_cursor)
-    setLoadingMore(false)
+    try {
+      const data = await listEntries(snapshotId, {
+        parent_id: parentId,
+        cursor,
+        limit: ENTRY_PAGE_SIZE,
+        sort,
+        order,
+        type: typeFilter as any,
+        ext: extApplied || undefined,
+        min_size: minSize,
+        max_size: maxSize,
+        q: qApplied || undefined,
+      })
+      setAllItems((prev) => [...prev, ...data.items])
+      setCursor(data.next_cursor)
+    } finally {
+      setLoadingMore(false)
+    }
   }
 
   const toggleSort = (key: SortKey) => {
@@ -657,6 +783,48 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
         </Col>
       </Row>
 
+      <Card size="small" style={{ marginBottom: 16 }} styles={{ body: { padding: '10px 16px' } }}>
+        <Space wrap>
+          <FilterOutlined style={{ color: '#999' }} />
+          <Input
+            placeholder="名称关键词（回车生效）"
+            prefix={<SearchOutlined />}
+            allowClear
+            style={{ width: 200 }}
+            value={qDraft}
+            onChange={(e) => setQDraft(e.target.value)}
+            onPressEnter={applyTextFilters}
+            onBlur={applyTextFilters}
+          />
+          <Input
+            placeholder="扩展名，如 jpg"
+            allowClear
+            style={{ width: 140 }}
+            value={extDraft}
+            onChange={(e) => setExtDraft(e.target.value)}
+            onPressEnter={applyTextFilters}
+            onBlur={applyTextFilters}
+          />
+          <InputNumber
+            placeholder="最小字节"
+            min={0}
+            style={{ width: 130 }}
+            value={minSize}
+            onChange={(v) => setMinSize(v ?? undefined)}
+          />
+          <InputNumber
+            placeholder="最大字节"
+            min={0}
+            style={{ width: 130 }}
+            value={maxSize}
+            onChange={(v) => setMaxSize(v ?? undefined)}
+          />
+          <Button type="primary" size="small" onClick={applyTextFilters}>应用筛选</Button>
+          <Button size="small" onClick={clearFilters} disabled={!hasFilters}>清除</Button>
+          <Text type="secondary" style={{ fontSize: 12 }}>筛选作用于当前目录的直接子项</Text>
+        </Space>
+      </Card>
+
       <Row gutter={[16, 16]}>
         <Col xs={24} md={7} lg={5}>
           <Card title="目录树" styles={{ body: { padding: 12, maxHeight: 600, overflow: 'auto' } }}>
@@ -744,6 +912,8 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   const [mode, setMode] = useState<SearchMode>('prefix')
   const [typeFilter, setTypeFilter] = useState<string | undefined>(undefined)
   const [ext, setExt] = useState('')
+  const [minSize, setMinSize] = useState<number | undefined>(undefined)
+  const [maxSize, setMaxSize] = useState<number | undefined>(undefined)
   const [results, setResults] = useState<SearchItem[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
@@ -784,6 +954,8 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     limit: SEARCH_PAGE_SIZE,
     type: typeFilter as any,
     ext: ext || undefined,
+    min_size: minSize,
+    max_size: maxSize,
   })
 
   useEffect(() => {
@@ -804,13 +976,22 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   const loadMore = async () => {
     if (!cursor) return
     setLoadingMore(true)
-    const res = await fetch(
-      `/api/snapshots/${encodeURIComponent(snapshotId)}/search?q=${encodeURIComponent(q)}&mode=${mode}&cursor=${encodeURIComponent(cursor)}&limit=${SEARCH_PAGE_SIZE}${typeFilter ? `&type=${typeFilter}` : ''}${ext ? `&ext=${encodeURIComponent(ext)}` : ''}`
-    )
-    const data = await res.json()
-    setResults((prev) => [...prev, ...data.items])
-    setCursor(data.next_cursor)
-    setLoadingMore(false)
+    try {
+      const data = await searchEntries(snapshotId, {
+        q,
+        mode,
+        cursor,
+        limit: SEARCH_PAGE_SIZE,
+        type: typeFilter as any,
+        ext: ext || undefined,
+        min_size: minSize,
+        max_size: maxSize,
+      })
+      setResults((prev) => [...prev, ...data.items])
+      setCursor(data.next_cursor)
+    } finally {
+      setLoadingMore(false)
+    }
   }
 
   const columns = [
@@ -851,6 +1032,8 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
             <Option value="dir">目录</Option>
           </Select>
           <Input placeholder="扩展名，如 txt" value={ext} onChange={(e) => setExt(e.target.value)} style={{ width: 140 }} />
+          <InputNumber placeholder="最小字节" min={0} style={{ width: 120 }} value={minSize} onChange={(v) => setMinSize(v ?? undefined)} />
+          <InputNumber placeholder="最大字节" min={0} style={{ width: 120 }} value={maxSize} onChange={(v) => setMaxSize(v ?? undefined)} />
           <Button
             type="primary"
             icon={<SearchOutlined />}
@@ -998,14 +1181,21 @@ function ExportPanel({ snapshotId }: { snapshotId: string }) {
           type="info"
           showIcon
           title="导出格式说明"
-          description="CSV：entries 全表；V1 CSV：兼容旧版的三件套 zip。"
+          description="CSV：entries 全表；V1 CSV：兼容旧版的三件套 zip；HTML 报告：自包含的单文件网页，含统计图表与跳过项汇总。"
         />
-        <Space>
+        <Space wrap>
           <Button icon={<DownloadOutlined />} href={exportSnapshotUrl(snapshotId, 'csv')}>
             导出 CSV
           </Button>
           <Button icon={<DownloadOutlined />} href={exportSnapshotUrl(snapshotId, 'v1_csv')}>
             导出 V1 CSV（zip）
+          </Button>
+          <Button
+            icon={<FileTextOutlined />}
+            href={snapshotReportUrl(snapshotId)}
+            download={`cldm_${snapshotId.replace(/\//g, '_')}_report.html`}
+          >
+            HTML 报告
           </Button>
         </Space>
       </Space>

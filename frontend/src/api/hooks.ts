@@ -12,6 +12,9 @@ import {
   listVolumes,
   getVolumeTrends,
   getDuplicates,
+  getSkipped,
+  getAttachedDisks,
+  submitHashTask,
   type DuplicateMode,
   listDiffs,
   createDiff,
@@ -38,6 +41,8 @@ import {
   type ImportCreateBody,
   type CollectCreateBody,
   type ListTasksParams,
+  type SkippedParams,
+  type HashTaskBody,
   type Task,
   type TaskStatus,
   type Batch,
@@ -411,5 +416,49 @@ export function useSettings() {
     queryKey: ['settings'],
     queryFn: getSettings,
     staleTime: 60_000,
+  })
+}
+
+export function useAttachedDisks(enabled = true) {
+  return useQuery({
+    queryKey: ['attached-disks'],
+    queryFn: getAttachedDisks,
+    enabled,
+    staleTime: 15_000,
+    retry: false,
+  })
+}
+
+export function useSkipped(snapshot_id: string | undefined, params: SkippedParams) {
+  return useQuery({
+    queryKey: ['skipped', snapshot_id, params],
+    queryFn: () => getSkipped(snapshot_id!, params),
+    enabled: !!snapshot_id,
+    staleTime: 30_000,
+  })
+}
+
+export function useSubmitHash() {
+  return useMutation({
+    mutationFn: ({ snapshot_id, body }: { snapshot_id: string; body: HashTaskBody }) =>
+      submitHashTask(snapshot_id, body),
+  })
+}
+
+/**
+ * 哈希进度概览：已算指纹/哈希的文件数。后端没有专门的计数端点，复用
+ * fingerprint 查重的 hashed_files（min_size=0 时即全部已哈希文件数）。
+ *
+ * `enabled` 由调用方按快照的 hash_policy 传入：快照从未算过哈希（policy=none）时
+ * 该端点必然 400，浏览器控制台会留下一条 "Failed to load resource" 报错，
+ * 因此 policy=none 时**不发这个请求**（计数直接按 0 展示）。
+ */
+export function useHashSummary(snapshot_id: string | undefined, enabled = true) {
+  return useQuery({
+    queryKey: ['hash-summary', snapshot_id],
+    queryFn: () => getDuplicates(snapshot_id!, { mode: 'fingerprint', min_size: 0, limit: 1 }),
+    enabled: !!snapshot_id && enabled,
+    staleTime: 15_000,
+    retry: false,
   })
 }
