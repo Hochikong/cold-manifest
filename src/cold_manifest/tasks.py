@@ -349,6 +349,12 @@ class TaskRunner:
         tasks, _, _ = self.list_tasks(limit=500, related_id=batch_id)
         statuses = self.batch_child_statuses(batch_id)
         status = self.batch_status_from_children(statuses)
+        planned = planned_doc.get("planned") or []
+        if planned and len(statuses) < len(planned):
+            # 提交是"先建批次行、再逐条插子任务"；极快的工作线程可能先把已落库的
+            # 子任务跑完，让批次瞬时看起来已终态。子任务行没齐就一律按 running
+            # 报告（也跳过下面的终态回写），避免客户端/测试过早停止轮询。
+            status = "running"
         summary = {s: statuses.count(s) for s in
                    ("pending", "running", "done", "error", "cancelled") if s in statuses}
         if status in ("done", "partial") and row["status"] not in ("done", "partial"):

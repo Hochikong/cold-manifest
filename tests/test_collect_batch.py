@@ -436,3 +436,25 @@ def test_cli_collect_all_partitions(tmp_path: Path, monkeypatch, capsys) -> None
     assert rc == 0
     out = capsys.readouterr().out
     assert "批次状态：done（成功 2/2）" in out
+
+
+def test_batch_not_terminal_until_all_children_present(client) -> None:
+    """子任务行尚未全部落库时，批次不得报终态。
+
+    提交顺序是"先建批次行、再逐条插子任务"；极快的工作线程可能先把已落库的子任务
+    跑完，让批次瞬时看起来 done/partial —— 客户端（与 _wait_batch 这类轮询）会因此
+    过早停止轮询、看到不完整摘要。计划 N 个卷但子任务不足 N 条时一律按 running 报。
+    """
+    c, tmp_path = client
+    runner = c.app.state.task_runner
+    bid = "batch_race_guard"
+    runner.create_batch_row(bid, "disk_demo", "/root",
+                            [{"volume_id": "v0"}, {"volume_id": "v1"}])
+    # 只落库 1 个子任务（应失败 → 终态），模拟"计划 2 个但第 2 条还没插进去"
+    tid = runner.submit("collect", {"path": "/definitely-not-exists",
+                                    "data_root": str(tmp_path / "dataroot")},
+                        related_id=bid)
+    _wait_task(c, tid)
+    body = c.get(f"/api/batches/{bid}").json()
+    assert len(body["tasks"]) == 1
+    assert body["status"] == "running", body
