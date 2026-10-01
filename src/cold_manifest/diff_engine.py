@@ -766,14 +766,20 @@ def _materialize_new(data_root: Path, a: str, b: str, opts: dict, ohash: str,
             if not _all_path_norm_present(db):
                 raise DiffError(
                     f"快照 {sid} 存在 path_norm 缺失的条目，"
-                    "不支持大小写不敏感比对（请用新版采集重建该快照）")
+                    "不支持大小写不敏感比对。请先执行 `cldm fix-pathnorm <快照ID> --data-root <数据根>` "
+                    "回填缺失的 path_norm（或用新版采集重新采集该快照）")
 
     out_db.parent.mkdir(parents=True, exist_ok=True)
+    out_db = out_db.resolve()  # file_uri 要求绝对路径
     # 未封库残留（上次运行崩溃）一律删除重建
     for stale in (out_db, Path(str(out_db) + "-wal"), Path(str(out_db) + "-shm")):
         stale.unlink(missing_ok=True)
 
-    conn = sqlite3.connect(str(out_db))
+    # 主连接必须以 file: URI + uri=True 打开：下面 ATTACH 快照库用 file: URI，
+    # SQLite 规定 ATTACH 是否按 URI 解析取决于主连接打开时的 SQLITE_OPEN_URI
+    # 标志——Linux 编译期默认开所以侥幸能用；Windows 默认关，会把 URI 当
+    # 字面文件名 → "unable to open database"（用户实机"所有对比 400"的根因）。
+    conn = sqlite3.connect(file_uri(out_db, immutable=False, mode="rwc"), uri=True)
     try:
         conn.execute("PRAGMA journal_mode=OFF")
         conn.execute("PRAGMA synchronous=OFF")

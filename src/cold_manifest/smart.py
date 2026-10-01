@@ -162,6 +162,121 @@ def read_smart(device: str) -> "dict | None":
     return None
 
 
+# ---------------------------------------------------------------- 失败原因诊断（live 读取）
+
+
+def _run_cmd_ex(cmd: list[str]) -> "tuple[subprocess.CompletedProcess | None, str | None]":
+    """跑外部命令并保留失败类别：返回 (proc, err)。
+
+    err ∈ {None, "timeout", "not_found", "other"}；proc 为 None 时 err 非 None。
+    """
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT), None
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except FileNotFoundError:
+        return None, "not_found"
+    except (OSError, subprocess.SubprocessError):
+        return None, "other"
+
+
+def _excerpt(text: "str | None", limit: int = 2048) -> str:
+    if not text:
+        return ""
+    return text.strip()[:limit]
+
+
+_PERMISSION_PAT = re.compile(
+    r"permission denied|access is denied|access denied|拒绝访问|"
+    r"requires? (admin|administrator|elevation)|管理员|elevated privileges",
+    re.IGNORECASE,
+)
+_NO_SMART_PAT = re.compile(
+    r"unknown device type|unable to detect device type|no smart|"
+    r"not supported|unsupported|usb bridge|不支持",
+    re.IGNORECASE,
+)
+_NOT_FOUND_PAT = re.compile(
+    r"no such file|not found|unable to open device|could not open|"
+    r"找不到|无法打开|不存在",
+    re.IGNORECASE,
+)
+
+# reason → 人话（面向磁盘页/端点的可诊断文案）
+REASON_MESSAGES = {
+    "permission_denied": (
+        "权限不足：读取 SMART 需要管理员权限"
+        "（Windows 请以管理员身份运行服务/CLI，Linux 需要 root/sudo）"
+    ),
+    "no_smart": "设备或连接桥不支持 SMART（USB 桥可能需要指定设备类型 -d sat）",
+    "not_found": "设备不存在或 smartctl 不可用",
+    "timeout": "读取 SMART 超时（盘可能休眠中或无响应）",
+    "other": "读取 SMART 失败（原因未知，详见 stderr 片段）",
+}
+
+
+def _classify_attempts(attempts: list[dict]) -> str:
+    """按尝试记录归类失败原因（一次确定，不混合）。"""
+    for a in attempts:
+        if a.get("error") == "timeout":
+            return "timeout"
+        if a.get("error") == "not_found":
+            return "not_found"
+    stderrs = " | ".join(a.get("stderr_excerpt") or "" for a in attempts)
+    if _PERMISSION_PAT.search(stderrs):
+        return "permission_denied"
+    if _NO_SMART_PAT.search(stderrs):
+        return "no_smart"
+    if _NOT_FOUND_PAT.search(stderrs):
+        return "not_found"
+    return "other"
+
+
+def read_smart_verbose(device: str) -> dict:
+    """现场读取 SMART 并保留失败原因（诊断用；成功路径与 read_smart 等价）。
+
+    返回：
+    - ok / raw / device_type：成功时与 read_smart 同义；
+    - reason：permission_denied / no_smart / not_found / timeout / other；
+    - message：reason 对应的人话；
+    - raw_excerpt：成功为 stdout 片段（≤2KB），失败为最后一次 stderr 片段（≤2KB）；
+    - attempts：逐次尝试记录 [{device_type, rc, error, stderr_excerpt}]。
+    绝不抛异常。
+    """
+    exe = smartctl_exec()
+    extra = extra_args()
+    attempts: list[dict] = []
+    for dt, dt_args in (("", []), ("sat", ["-d", "sat"])):
+        cmd = [exe, *extra, *dt_args, "-i", "-H", "-A", "-j", device]
+        proc, err = _run_cmd_ex(cmd)
+        if _usable(proc):
+            return {
+                "ok": True,
+                "raw": proc.stdout,
+                "device_type": dt,
+                "reason": None,
+                "message": None,
+                "raw_excerpt": _excerpt(proc.stdout),
+                "attempts": attempts,
+            }
+        attempts.append({
+            "device_type": dt or "default",
+            "rc": None if proc is None else proc.returncode,
+            "error": err,
+            "stderr_excerpt": _excerpt(getattr(proc, "stderr", None) or "", 512),
+        })
+    reason = _classify_attempts(attempts)
+    return {
+        "ok": False,
+        "raw": None,
+        "device_type": "",
+        "reason": reason,
+        "message": REASON_MESSAGES[reason],
+        "raw_excerpt": attempts[-1]["stderr_excerpt"][:2048],
+        "attempts": attempts,
+    }
+
+
 def check_smartctl() -> "str | None":
     """smartctl 可用性探测（--version）。可用返回解析后的可执行路径，否则 None。"""
     exe = smartctl_exec()

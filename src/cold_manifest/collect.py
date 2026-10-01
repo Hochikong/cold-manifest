@@ -24,6 +24,7 @@ from typing import Callable
 from . import __version__
 from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume,
                       register_snapshot, rmtree_ro, snapshot_path, validate_volume_id)
+from .paths import normalize_path
 from .probe import DiskInfo, ProbeError, VolumeInfo, probe_path
 from .scanner import ScanCancelled, scan_tree
 from .scan_journal import ScanJournal, journal_path, read_completed
@@ -81,7 +82,7 @@ class _SQLiteEntryWriter:
                   ctime_ns: int | None, btime_ns: int | None, attrs: int | None, ext: str,
                   error: str | None = None) -> int:
         vals = (parent_id, path, name, depth, type, size_bytes, allocated_bytes,
-                mtime_ns, ctime_ns, btime_ns, attrs, ext, path.casefold(), error)
+                mtime_ns, ctime_ns, btime_ns, attrs, ext, normalize_path(path), error)
         if self._resume:
             # 断点续采重扫：安全重扫已部分入库的目录。取舍：用 INSERT OR IGNORE
             # （而非"按子树先清理再重插"——重扫库未封库、path 索引在续采开始时
@@ -219,6 +220,14 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
             v = smart_struct.get(key)
             if v is not None:
                 meta[f"smart_{key}"] = str(v)
+    else:
+        # 拿不到 SMART 时留下可诊断原因（成功路径不受影响）
+        smart_error = getattr(disk, "smart_error", None)
+        if smart_error:
+            meta["smart_error"] = str(smart_error)
+            raw_err = getattr(disk, "smart_error_raw", None)
+            if raw_err:
+                meta["smart_error_raw"] = str(raw_err)[:2048]
     if serial_fallback:
         # 序列号回退时的原始探测值（诊断用：说明为何 volume_id 用了卷序列号）
         meta["probe_serial_raw"] = probe_serial_raw

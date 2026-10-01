@@ -339,13 +339,13 @@ def _find_by_fingerprint(conn: sqlite3.Connection, snapshot_id: str, min_size: i
     if rows:
         hashed_files, n_groups, total_wasted = rows[0][5], rows[0][6], rows[0][7]
     else:
-        tot = conn.execute(f"""
+        tot = conn.execute("""
         SELECT CAST(COALESCE(SUM(n), 0) AS INTEGER),
                COUNT(*) FILTER (WHERE n > 1),
                CAST(COALESCE(SUM(bytes_in - sz) FILTER (WHERE n > 1), 0) AS INTEGER)
         FROM (SELECT hash_hex, size_bytes AS sz, COUNT(*) AS n, SUM(size_bytes) AS bytes_in
               FROM entries WHERE {where}
-              GROUP BY hash_hex, size_bytes)""", {"min": min_size}).fetchone()
+              GROUP BY hash_hex, size_bytes)""".format(where=_FP_WHERE), {"min": min_size}).fetchone()
         hashed_files, n_groups, total_wasted = tot
 
     if items:

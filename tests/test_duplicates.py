@@ -574,3 +574,74 @@ def test_api_modes(tmp_path: Path) -> None:
         assert items["H2"]["verified"] is True and items["H1"]["verified"] is False
         assert c.get(f"/api/snapshots/{SID}/duplicates",
                      params={"mode": "nope"}).status_code == 400
+
+
+# ---- 回归：零重复组不得 500（指纹档兜底统计 SQL 曾 f-string 引用未定义 where） ----
+
+_ZERODUP_ROWS = [
+    (1, 0, ".", "", 0, "dir", None, None, None, None, None, None),
+    _row(2, "a.bin", 2 * 2**20, "H1"),
+    _row(3, "b.bin", 3 * 2**20, "H2"),
+    _row(4, "sub/c.bin", 4 * 2**20, "H3"),
+]
+
+
+def _open_sealed(tmp_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{(tmp_path / 'vol' / '20260101T000000Z' /
+                                    'snapshot.db').as_posix()}?mode=ro&immutable=1",
+                           uri=True)
+    return conn
+
+
+def test_fingerprint_zero_groups(tmp_path: Path) -> None:
+    """有哈希但所有哈希唯一 → rows 为空走兜底统计：正常返回，不 NameError。"""
+    _build_snapshot(tmp_path, _ZERODUP_ROWS, FULL_META)
+    conn = _open_sealed(tmp_path)
+    try:
+        r = find_duplicates(conn, SID, mode="fingerprint")
+        assert r["mode"] == "fingerprint"
+        assert r["duplicate_groups"] == 0
+        assert r["hashed_files"] == 3
+        assert r["items"] == []
+        assert r["total_wasted_bytes"] == 0
+    finally:
+        conn.close()
+
+
+def test_fingerprint_all_filtered_by_min_size(tmp_path: Path) -> None:
+    """min_size 过滤掉全部 → 同样走兜底统计：正常返回零组。"""
+    _build_snapshot(tmp_path, _ZERODUP_ROWS, FULL_META)
+    conn = _open_sealed(tmp_path)
+    try:
+        r = find_duplicates(conn, SID, mode="fingerprint", min_size=100 * 2**20)
+        assert r["duplicate_groups"] == 0
+        assert r["hashed_files"] == 0
+        assert r["items"] == []
+    finally:
+        conn.close()
+
+
+def test_fingerprint_no_hash_friendly_error(tmp_path: Path) -> None:
+    """完全没有可用哈希 → 友好 DuplicatesError（API 400 / CLI exit 2 的源头）。"""
+    rows = [
+        (1, 0, ".", "", 0, "dir", None, None, None, None, None, None),
+        (2, 1, "a.bin", "a.bin", 1, "file", 2**20, 1111, "a.bin", None, None, None),
+    ]
+    _build_snapshot(tmp_path, rows, FULL_META)
+    conn = _open_sealed(tmp_path)
+    try:
+        with pytest.raises(DuplicatesError):
+            find_duplicates(conn, SID, mode="fingerprint")
+    finally:
+        conn.close()
+
+
+def test_content_zero_groups(tmp_path: Path) -> None:
+    """content 档零重复组（对照：该分支原本就正常）。"""
+    _build_snapshot(tmp_path, _ZERODUP_ROWS, FULL_META)
+    conn = _open_sealed(tmp_path)
+    try:
+        r = find_duplicates(conn, SID, mode="content")
+        assert r["duplicate_groups"] == 0 and r["items"] == []
+    finally:
+        conn.close()

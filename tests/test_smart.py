@@ -144,6 +144,140 @@ def test_read_smart_config(monkeypatch) -> None:
     assert calls[0][:3] == ["/opt/tools/smartctl", "--nocheck", "standby"]
 
 
+# ---------------------------------------------------------------- read_smart_verbose
+
+
+def _fake_cmd_ex(results: list[object]):
+    """按调用序返回预设 (proc, err)；记录 cmd。"""
+    calls: list[list[str]] = []
+
+    def fake(cmd: list[str]):
+        calls.append(cmd)
+        r = results[len(calls) - 1]
+        if isinstance(r, tuple) and r and r[0] == "ERR":
+            return None, r[1]
+        return r, None
+
+    return fake, calls
+
+
+def test_read_smart_verbose_success_first_try(monkeypatch) -> None:
+    fake, calls = _fake_cmd_ex([_proc(SAMPLE, rc=0)])
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake)
+    res = smart.read_smart_verbose("/dev/sdb")
+    assert res["ok"] is True
+    assert res["device_type"] == ""
+    assert res["reason"] is None
+    assert json.loads(res["raw"])["model_name"] == "TOSHIBA HDWG480"
+    assert len(calls) == 1
+
+
+def test_read_smart_verbose_sat_retry(monkeypatch) -> None:
+    fake, calls = _fake_cmd_ex([_proc("", rc=2), _proc(SAMPLE, rc=0)])
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake)
+    res = smart.read_smart_verbose("/dev/sdb")
+    assert res["ok"] is True and res["device_type"] == "sat"
+    # 默认参数失败的尝试也留下（诊断用）
+    assert len(res["attempts"]) == 1
+    assert res["attempts"][0]["device_type"] == "default"
+
+
+def test_read_smart_verbose_permission_denied(monkeypatch) -> None:
+    import subprocess
+
+    def fake2(cmd):
+        p = subprocess.CompletedProcess(args=[], returncode=16,
+                                        stdout="", stderr="Open failed: Access is denied")
+        return p, None
+
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake2)
+    res = smart.read_smart_verbose("/dev/sdb")
+    assert res["ok"] is False
+    assert res["reason"] == "permission_denied"
+    assert "管理员" in res["message"]
+    assert len(res["attempts"]) == 2
+    assert res["attempts"][0]["rc"] == 16
+    assert "Access is denied" in res["attempts"][0]["stderr_excerpt"]
+    assert "Access is denied" in res["raw_excerpt"]
+
+
+def test_read_smart_verbose_no_smart(monkeypatch) -> None:
+    import subprocess
+
+    def fake2(cmd):
+        p = subprocess.CompletedProcess(args=[], returncode=2, stdout="",
+                                        stderr="Unable to detect device type")
+        return p, None
+
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake2)
+    res = smart.read_smart_verbose("/dev/sdb")
+    assert res["ok"] is False and res["reason"] == "no_smart"
+    assert "不支持" in res["message"]
+
+
+def test_read_smart_verbose_not_found(monkeypatch) -> None:
+    fake, _ = _fake_cmd_ex([("ERR", "not_found"), ("ERR", "not_found")])
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake)
+    res = smart.read_smart_verbose("/dev/nope")
+    assert res["ok"] is False and res["reason"] == "not_found"
+    assert res["raw_excerpt"] == ""
+
+
+def test_read_smart_verbose_timeout(monkeypatch) -> None:
+    fake, _ = _fake_cmd_ex([("ERR", "timeout"), ("ERR", "timeout")])
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake)
+    res = smart.read_smart_verbose("/dev/sdb")
+    assert res["ok"] is False and res["reason"] == "timeout"
+    assert "超时" in res["message"]
+
+
+def test_read_smart_verbose_other(monkeypatch) -> None:
+    fake, _ = _fake_cmd_ex([_proc("", rc=2), _proc("", rc=2)])
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake)
+    res = smart.read_smart_verbose("/dev/sdb")
+    assert res["ok"] is False and res["reason"] == "other"
+    assert res["message"]
+
+
+# ---------------------------------------------------------------- 采集失败原因落 meta
+
+
+def test_collect_smart_error_meta(tmp_path: Path, monkeypatch) -> None:
+    scan_root = tmp_path / "vol"
+    _make_tree(scan_root)
+    data_root = tmp_path / "data"
+    vol = VolumeInfo(
+        filesystem="ext4", label="L", volume_serial_hex="abcd-1234",
+        partition_uuid="1111-2222", partition_index=1, partition_table_type="GPT",
+        capacity_bytes=1_000, free_bytes=900, mount_point=str(scan_root),
+        device_path="/dev/sdb1",
+    )
+    disk = DiskInfo(
+        disk_serial="SER123", serial_source="probe",
+        smart_status="unavailable",
+        smart_error=smart.REASON_MESSAGES["permission_denied"],
+        smart_error_raw="Open failed: Access is denied",
+    )
+
+    monkeypatch.setattr(
+        "cold_manifest.collect.probe_path",
+        lambda path, *, manual_serial=None, smartctl=True: (vol, disk))
+
+    result = collect_volume(scan_root, data_root=data_root)
+    conn = sqlite3.connect(result.db_path)
+    conn.row_factory = sqlite3.Row
+    meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
+    conn.close()
+    assert meta["smart_status"] == "unavailable"
+    assert "管理员" in meta["smart_error"]
+    assert meta["smart_error_raw"] == "Open failed: Access is denied"
+    assert "smart_raw_json" not in meta
+
+    cat = connect_catalog(data_root)
+    assert smart.list_smart(cat, "SER123") == []
+    cat.close()
+
+
 # ---------------------------------------------------------------- disk_smart 历史
 
 

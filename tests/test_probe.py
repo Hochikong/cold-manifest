@@ -286,9 +286,9 @@ class TestDispatch:
 
         def fake_smart_run(cmd):
             calls.append(cmd[0])
-            return None  # smartctl 不可用（_run_cmd 把 OSError/超时折叠为 None）
+            return None, "not_found"  # smartctl 不可用（_run_cmd_ex 折叠为 (None, err)）
 
-        monkeypatch.setattr("cold_manifest.smart._run_cmd", fake_smart_run)
+        monkeypatch.setattr("cold_manifest.smart._run_cmd_ex", fake_smart_run)
         vol, disk = self._run_probe_linux(monkeypatch, fake_run)
         assert "smartctl" in calls
         assert disk.smart_status == "unavailable"
@@ -304,9 +304,9 @@ class TestDispatch:
             return sp.CompletedProcess(cmd, 0, stdout=LSBLK_JSON, stderr="")
 
         def fake_smart_run(cmd):
-            return None  # 超时折叠为 None
+            return None, "timeout"  # 超时折叠为 (None, err)
 
-        monkeypatch.setattr("cold_manifest.smart._run_cmd", fake_smart_run)
+        monkeypatch.setattr("cold_manifest.smart._run_cmd_ex", fake_smart_run)
         vol, disk = self._run_probe_linux(monkeypatch, fake_run)
         assert disk.smart_status == "unavailable"
 
@@ -321,9 +321,9 @@ class TestDispatch:
         def fake_smart_run(cmd):
             assert cmd[0] == "smartctl"
             assert cmd[1:3] == ["-i", "-H"]
-            return sp.CompletedProcess(cmd, 0, stdout=SMARTCTL_JSON, stderr="")
+            return sp.CompletedProcess(cmd, 0, stdout=SMARTCTL_JSON, stderr=""), None
 
-        monkeypatch.setattr("cold_manifest.smart._run_cmd", fake_smart_run)
+        monkeypatch.setattr("cold_manifest.smart._run_cmd_ex", fake_smart_run)
         vol, disk = self._run_probe_linux(monkeypatch, fake_run)
         assert disk.smart_status == "passed"
         assert disk.smart_raw == SMARTCTL_JSON

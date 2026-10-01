@@ -242,14 +242,16 @@ def probe_path_linux(
     smart_serial = ""
     smart_raw: str | None = None
     smart_device_type = ""
+    smart_error: str | None = None
+    smart_error_raw: str | None = None
     if smartctl:
         disk_dev = disk_node.get("path") or os.path.basename(source_dev)
         # smart.py：CLDM_SMARTCTL 可配置 + CLDM_SMARTCTL_ARGS 透传 + -d sat 自动重试；
-        # 拿不到 SMART（未安装/超时/不支持）返回 None：不阻断采集
-        from ..smart import read_smart
+        # 拿不到 SMART（权限/不支持/超时）→ smart_error 记人话原因：不阻断采集
+        from ..smart import read_smart_verbose
 
-        res = read_smart(disk_dev)
-        if res is not None:
+        res = read_smart_verbose(disk_dev)
+        if res["ok"]:
             smart_raw = res["raw"]
             smart_device_type = res["device_type"]
             try:
@@ -262,6 +264,9 @@ def probe_path_linux(
             interface = (sj.get("device") or {}).get("type") or ""
             passed = (sj.get("smart_status") or {}).get("passed")
             smart_status = {True: "passed", False: "failed"}.get(passed, "unavailable")
+        else:
+            smart_error = res["message"]
+            smart_error_raw = res["raw_excerpt"]
 
     if manual_serial:
         disk_serial, serial_source = manual_serial.strip(), "manual"
@@ -285,5 +290,7 @@ def probe_path_linux(
         smart_status=smart_status,
         smart_raw=smart_raw,
         smart_device_type=smart_device_type,
+        smart_error=smart_error,
+        smart_error_raw=smart_error_raw,
     )
     return volume, disk_info

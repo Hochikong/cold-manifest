@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .db import file_uri
+from .paths import normalize_path
 from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume, register_snapshot,
                       rmtree_ro, snapshot_path, validate_volume_id)
 from .schema import SNAPSHOT_TABLES_DDL
@@ -122,7 +123,7 @@ def _ensure_dir_chain(dir_ids: "dict[str, int]", conn: sqlite3.Connection,
         "INSERT OR REPLACE INTO entries(entry_id,parent_id,path,name,depth,type,size_bytes,allocated_bytes,"
         "mtime_ns,ctime_ns,btime_ns,attrs,ext,hash_algo,hash_hex,hash_state,path_norm,error)"
         " VALUES(?,?,?,?,?,'dir',NULL,NULL,NULL,NULL,NULL,NULL,'',NULL,NULL,NULL,?,NULL)",
-        (eid, parent_id, rel_dir, name, depth, rel_dir.casefold()),
+        (eid, parent_id, rel_dir, name, depth, normalize_path(rel_dir)),
     )
     dir_ids[rel_dir] = eid
     return eid
@@ -146,7 +147,7 @@ def _build_entries(conn: sqlite3.Connection, tree_path: Path,
     conn.execute(
         "INSERT OR REPLACE INTO entries(entry_id,parent_id,path,name,depth,type,size_bytes,allocated_bytes,"
         "mtime_ns,ctime_ns,btime_ns,attrs,ext,hash_algo,hash_hex,hash_state,path_norm,error)"
-        " VALUES(1,0,'.','',0,'dir',NULL,NULL,NULL,NULL,NULL,NULL,'',NULL,NULL,NULL,NULL,NULL)"
+        " VALUES(1,0,'.','',0,'dir',NULL,NULL,NULL,NULL,NULL,NULL,'',NULL,NULL,NULL,'.',NULL)"
     )
 
     with tree_path.open(newline="", encoding="utf-8-sig") as f:
@@ -205,7 +206,7 @@ def _build_entries(conn: sqlite3.Connection, tree_path: Path,
                 name = row[i_name] or rel.rsplit("/", 1)[-1]
                 depth = rel.count("/") + 1
                 buf.append((eid, parent_id, rel, name, depth, "dir", None, None,
-                            mtime_ns, None, None, None, "", None, None, None, rel.casefold(), None))
+                            mtime_ns, None, None, None, "", None, None, None, normalize_path(rel), None))
                 dir_count += 1
                 dir_ids[rel] = eid
                 max_depth = max(max_depth, depth)
@@ -222,7 +223,7 @@ def _build_entries(conn: sqlite3.Connection, tree_path: Path,
                 except ValueError:
                     size = 0
                 buf.append((eid, parent_id, rel, name, depth, "file", size, size,
-                            mtime_ns, None, None, None, _ext_of(name), None, None, None, rel.casefold(), None))
+                            mtime_ns, None, None, None, _ext_of(name), None, None, None, normalize_path(rel), None))
                 file_count += 1
                 total_bytes += size
                 if size == 0:

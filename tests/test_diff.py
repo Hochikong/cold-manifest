@@ -173,3 +173,31 @@ def test_cli_diff_depth_filter(tmp_path: Path, two_snaps, capsys) -> None:
     # depth<=1 只剩 docs 下深度 1 的条目与顶层目录（本例 changed 条目都在深度 2，只剩无）
     # type_changed 行 docs/typeme 深度 2 被过滤
     assert all(p.split(",")[1].count("/") <= 0 for p in body)
+
+
+def test_out_db_opened_with_uri(tmp_path: Path, two_snaps, monkeypatch) -> None:
+    """回归（Windows"所有对比 400"根因）：diff 结果库主连接必须 file: URI + uri=True
+    打开——ATTACH 是否按 URI 解析取决于主连接的 SQLITE_OPEN_URI，漏传 uri=True
+    时 Windows 把 URI 当字面文件名 → unable to open database。这里拦截
+    sqlite3.connect，断言对 <diff_id>.db 的打开调用走的是 URI 形态且 uri=True。
+    """
+    import sqlite3 as _sqlite3
+    a, b = two_snaps
+
+    real_connect = _sqlite3.connect
+    calls: "list[tuple]" = []
+
+    def spy_connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr("cold_manifest.diff_engine.sqlite3.connect", spy_connect)
+
+    r = materialize_diff(tmp_path, a, b)
+    assert r.db_path.is_file()
+    name = r.db_path.name
+    hits = [c for c in calls if c[0] and isinstance(c[0][0], str) and name in c[0][0]]
+    assert hits, "未拦截到对 diff 结果库的 connect 调用"
+    for args, kwargs in hits:
+        assert args[0].startswith("file:"), f"结果库未用 file: URI 打开：{args[0]!r}"
+        assert kwargs.get("uri") is True, "结果库 connect 漏传 uri=True"

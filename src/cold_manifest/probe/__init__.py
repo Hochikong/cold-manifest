@@ -42,6 +42,8 @@ class DiskInfo:
     smart_status: str = "unavailable"  # passed / failed / unavailable
     smart_raw: str | None = None  # smartctl -A -j 原始 stdout（拿不到为 None）
     smart_device_type: str = ""  # smartctl -d 生效类型（"" = 默认参数即成功，"sat" = 重试生效）
+    smart_error: str | None = None  # SMART 拿不到时的人话原因（可诊断）
+    smart_error_raw: str | None = None  # 失败现场 stderr 片段（≤2KB，诊断用）
 
 
 @dataclass

@@ -7,8 +7,8 @@ from pathlib import Path
 from .schema import CATALOG_DDL, SNAPSHOT_DDL
 
 
-def file_uri(path: "str | Path", *, immutable: bool = True) -> str:
-    """构造只读打开 SQLite 库的 file: URI（全项目唯一构造点）。
+def file_uri(path: "str | Path", *, immutable: bool = True, mode: str = "ro") -> str:
+    """构造打开 SQLite 库的 file: URI（全项目唯一构造点）。
 
     为什么必须统一走这里：Windows 上数据根常形如 `D:\\pkg\\bin\\..\\..\\data`
     （start.cmd 的 %~dp0 展开），直接把未归一化路径手拼进
@@ -16,13 +16,16 @@ def file_uri(path: "str | Path", *, immutable: bool = True) -> str:
     SQLite 的 URI 解析不处理 `..` 段，Windows 盘符形态 `D:/...` 也必须
     以 `file:///D:/...` 开头才能识别。此处先 `resolve()` 消掉 `..`/`.`
     与符号链接，再用 `Path.as_uri()` 做百分号编码（空格、中文等），
-    最后追加 `mode=ro`（immutable=True 时加 `immutable=1`）。
+    最后追加 `mode`（默认 ro；immutable=True 时加 `immutable=1`）。
+    可写打开（mode='rwc'/'rw'）必须配套 sqlite3.connect(..., uri=True)，
+    否则 URI 会被当成字面文件名——且主连接未开 SQLITE_OPEN_URI 时
+    ATTACH 的 file: URI 也不按 URI 解析（Windows 编译期默认关）。
     """
     p = Path(path)
     if not p.is_absolute():
         raise ValueError(f"路径必须是绝对路径：{path}（请先 resolve()）")
     p = p.resolve()
-    uri = p.as_uri() + "?mode=ro"
+    uri = p.as_uri() + f"?mode={mode}"
     if immutable:
         uri += "&immutable=1"
     return uri

@@ -209,6 +209,7 @@ def disk_detail(disk_id: str, request: Request) -> dict:
         back = _meta_backfill(state, disk_id)
         latest = back[-1] if back else None
     detail["latest_smart"] = latest
+    detail["smart_error"] = _latest_meta_smart_error(state, disk_id)
     return detail
 
 
@@ -226,11 +227,120 @@ def disk_smart_history(disk_id: str, request: Request) -> dict:
         items.append(r)
     items.extend(_meta_backfill(state, disk_id))
     items.sort(key=lambda x: x.get("collected_at") or "")
-    return {"disk_id": disk_id, "items": items, "count": len(items)}
+    return {"disk_id": disk_id, "items": items, "count": len(items),
+            "smart_error": _latest_meta_smart_error(state, disk_id)}
 
 
 def list_smart_rows(state: Any, disk_id: str) -> "list[dict]":
     return smart.list_smart(state.catalog, disk_id)
+
+
+def _latest_meta_smart_error(state: Any, disk_id: str) -> "dict | None":
+    """该盘最新一个带 meta.smart_error 的快照（前端解释"为什么没有 SMART"）。"""
+    rows = state.catalog.execute(
+        """
+        SELECT s.snapshot_id FROM snapshots s
+        JOIN volumes v ON v.volume_id = s.volume_id
+        WHERE v.disk_id = ? ORDER BY s.collected_at DESC
+        """,
+        (disk_id,),
+    ).fetchall()
+    for r in rows:
+        try:
+            sconn = state.snapshot_db(r["snapshot_id"])
+            pairs = sconn.execute(
+                "SELECT key, value FROM meta"
+                " WHERE key IN ('smart_error','smart_error_raw')").fetchall()
+        except Exception:  # noqa: BLE001 — 库缺失/只读失败跳过
+            continue
+        d = {k: v for k, v in pairs}
+        if d.get("smart_error"):
+            return {
+                "smart_error": d["smart_error"],
+                "smart_error_raw": d.get("smart_error_raw"),
+                "snapshot_id": r["snapshot_id"],
+            }
+    return None
+
+
+# ---------------------------------------------------------------- 现场读取 SMART
+
+
+class SmartReadBody(BaseModel):
+    path: "str | None" = None
+
+
+def _locate_attached_device(disk_id: str, path: "str | None") -> str:
+    """定位当前插着的盘设备：优先 body.path，否则按序列号在 attached 里找。
+
+    定位不到（盘不在线/路径无法定位）抛 HTTPException 404。
+    """
+    if path:
+        try:
+            dev = smart.device_for_path(path)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=404,
+                                detail=f"无法定位 {path} 所在物理盘：{e}")
+        if not dev:
+            raise HTTPException(status_code=404,
+                                detail=f"无法定位 {path} 所在物理盘")
+        return dev
+    if sys.platform.startswith("linux"):
+        try:
+            attached = _attached_linux()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=404, detail=f"本机盘枚举失败：{e}")
+    elif sys.platform == "win32":
+        try:
+            attached = _attached_win()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=404, detail=f"本机盘枚举失败：{e}")
+    else:
+        raise HTTPException(status_code=404,
+                            detail=f"不支持的平台：{sys.platform}")
+    want = (disk_id or "").strip()
+    item = next(
+        (i for i in attached.get("items") or []
+         if str(i.get("serial") or "").strip() == want),
+        None,
+    )
+    if item is None:
+        raise HTTPException(status_code=404,
+                            detail=f"盘 {disk_id} 当前不在线（未在 /api/disks/attached 中）")
+    dev = str(item.get("device") or "").strip()
+    if not dev and item.get("volumes"):
+        try:
+            dev = smart.device_for_path(item["volumes"][0].get("path") or "")
+        except Exception:  # noqa: BLE001
+            dev = None
+    if not dev:
+        raise HTTPException(status_code=404,
+                            detail=f"盘 {disk_id} 在线但无法定位物理设备")
+    return dev
+
+
+@router.post("/disks/{disk_id}/smart/read")
+def disk_smart_read(disk_id: str, request: Request,
+                    body: "SmartReadBody | None" = None) -> dict:
+    """对当前插着的盘现场读一次 SMART（不写库）。
+
+    盘不在（404 之外）的读取失败一律 200 + ok=false + 人话原因，绝不 500。
+    """
+    get_state(request)  # 仅确认服务已挂 data_root
+    device = _locate_attached_device(disk_id, body.path if body else None)
+    res = smart.read_smart_verbose(device)
+    out: dict = {
+        "disk_id": disk_id,
+        "device": device,
+        "ok": res["ok"],
+        "device_type": res["device_type"],
+        "reason": res["reason"],
+        "message": res["message"],
+        "raw_excerpt": res["raw_excerpt"],
+        "attempts": res["attempts"],
+        "parsed": smart.parse_smart(res["raw"]) if res["ok"] else None,
+    }
+    return out
 
 
 # ---------------------------------------------------------------- preflight

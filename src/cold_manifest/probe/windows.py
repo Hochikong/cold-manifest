@@ -271,13 +271,13 @@ def probe_path_win(
     # Windows 版 smartctl 下对 USB 桥盘常无效）
     if smartctl:
         try:
-            from ..smart import parse_smart, read_smart
+            from ..smart import parse_smart, read_smart_verbose
 
             data = json.loads(text)
             idx = (data.get("disk") or {}).get("index")
             device = f"\\\\.\\PhysicalDrive{idx}" if isinstance(idx, int) else f"{letter}:"
-            res = read_smart(device)
-            if res is not None:
+            res = read_smart_verbose(device)
+            if res["ok"]:
                 info.smart_raw = res["raw"]
                 info.smart_device_type = res["device_type"]
                 parsed = parse_smart(res["raw"])
@@ -289,6 +289,10 @@ def probe_path_win(
                         info.serial_source = "smartctl"
                 info.firmware = info.firmware or (parsed.get("firmware") or "")
                 info.smart_status = parsed.get("health") or "unavailable"
+            else:
+                # 拿不到不阻断，但留下可诊断原因（Windows 常见：需要管理员权限）
+                info.smart_error = res["message"]
+                info.smart_error_raw = res["raw_excerpt"]
         except Exception:  # noqa: BLE001 — SMART 拿不到绝不阻断采集
             pass
 

@@ -12,6 +12,7 @@ from . import __version__
 from .exporter import export_csv as _export_csv
 from .exporter import export_v1_csv as _export_v1_csv
 from .exporter import open_snapshot_rwcheck as _open_snapshot_rwcheck
+from .import_legacy import LegacyImportError
 
 
 def _default_data_root() -> str:
@@ -62,8 +63,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("--force", action="store_true", help="目标已存在封库快照时删除重建")
 
     p_diff = sub.add_parser("diff", help="比对两个快照（同步执行，退出码 0 无差异 / 1 有差异 / 2 错误）")
-    p_diff.add_argument("a", help="快照 A（快照 ID，如 VOL_P0/20260101T000000Z）")
-    p_diff.add_argument("b", help="快照 B")
+    p_diff.add_argument("a", help="快照 A（快照 ID，形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）")
+    p_diff.add_argument("b", help="快照 B（快照 ID，同 A 的格式）")
     p_diff.add_argument("--depth", type=int, default=None, help="结果按目录深度过滤（查询期，不影响物化）")
     p_diff.add_argument("--hash", choices=["none", "sha256"], default="none",
                         help="内容比对模式：sha256 需两快照已 cldm hash，可识别 content_changed / moved_or_renamed")
@@ -79,7 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diff.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
     p_export = sub.add_parser("export", help="导出快照为 CSV")
-    p_export.add_argument("snapshot", help="快照 ID 或路径")
+    p_export.add_argument("snapshot", help="快照 ID（形如 volume_id/时间戳；Windows 反斜杠分隔亦可）或路径")
     p_export.add_argument("--format", choices=["csv", "v1_csv"], default="csv", help="导出格式（默认 csv）")
     p_export.add_argument("--output", default=None,
                           help="csv：输出文件路径；v1_csv：输出目录（产出 metadata/tree/warnings 三件套）")
@@ -87,18 +88,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_fts = sub.add_parser("build-fts",
                            help="为已有封库快照就地补建 FTS5 全文索引（显式升级动作）")
-    p_fts.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_fts.add_argument("snapshot_id", help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）或 snapshot.db 路径")
     p_fts.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+
+    p_fixpn = sub.add_parser("fix-pathnorm",
+                             help="为旧快照回填缺失的 entries.path_norm（大小写不敏感对比的前置条件；幂等）")
+    p_fixpn.add_argument("snapshot_id", nargs="?", default=None,
+                         help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）或 snapshot.db 路径；与 --all 二选一")
+    p_fixpn.add_argument("--all", action="store_true",
+                         help="处理数据根下所有快照库")
+    p_fixpn.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
     p_stats = sub.add_parser("build-stats",
                              help="为已有封库快照就地补建 stats 预计算表（显式升级动作）")
-    p_stats.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_stats.add_argument("snapshot_id", help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）或 snapshot.db 路径")
     p_stats.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
     p_hash = sub.add_parser("hash",
                             help="为快照补算文件哈希（按需，可续算，跨快照缓存复用；"
                                  "缓存键不含 volume_id，跨盘同名同大小同 mtime 可能复用旧哈希）")
-    p_hash.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
+    p_hash.add_argument("snapshot_id", help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）")
     p_hash.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_hash.add_argument("--algo", default="sha256", help="哈希算法（默认 sha256）")
     p_hash.add_argument("--policy", choices=["full", "sampled"], default="full",
@@ -122,7 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
                             help="快照内重复文件三档查重"
                                  "（--mode content=完整哈希 / name=同名 /"
                                  " fingerprint=大小+指纹）")
-    p_dups.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_dups.add_argument("snapshot_id", help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）或 snapshot.db 路径")
     p_dups.add_argument("--mode", choices=["content", "name", "fingerprint"],
                         default="content",
                         help="查重档位：content=完整哈希分组（默认，要求已"
@@ -141,7 +150,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_delete = sub.add_parser("delete",
                               help="删除快照：主机快照目录 +（可选）盘上副本 + catalog 注册行"
                                    "（退出码 0 成功 / 2 错误或被阻塞）")
-    p_delete.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
+    p_delete.add_argument("snapshot_id", help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）")
     p_delete.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_delete.add_argument("--on-disk", choices=["keep", "delete"], default="keep",
                           help="盘上副本处置：keep=保留（默认）；delete=同时删除"
@@ -151,7 +160,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_verify = sub.add_parser("verify-copy",
                               help="校验快照盘上副本与源文件完整性（只读；退出码 0 一致 / 1 不一致 / 2 错误）")
-    p_verify.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）")
+    p_verify.add_argument("snapshot_id", help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）")
     p_verify.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
     p_verify.add_argument("--sample", type=int, default=0,
                           help="源文件随机抽检条数（需快照已 cldm hash --policy full；默认 0 = 只对副本）")
@@ -162,7 +171,7 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="显式指定扫描根（覆盖 meta/catalog 记录，须为目录）")
 
     p_report = sub.add_parser("report", help="生成快照自包含 HTML 报告（无 JS，单文件）")
-    p_report.add_argument("snapshot_id", help="快照 ID（如 VOL_P0/20260101T000000Z）或 snapshot.db 路径")
+    p_report.add_argument("snapshot_id", help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）或 snapshot.db 路径")
     p_report.add_argument("--html", "--output", dest="html", default=None,
                           metavar="PATH", help="报告输出路径（.html）")
     p_report.add_argument("--max-rows", type=int, default=1000,
@@ -440,6 +449,80 @@ def _cmd_build_fts(args: argparse.Namespace) -> int:
         conn.close()
 
 
+# ---- fix-pathnorm ----------------------------------------------------------
+
+def _cmd_fix_pathnorm(args: argparse.Namespace) -> int:
+    """为旧快照回填缺失的 entries.path_norm（大小写不敏感对比的前置条件）。
+
+    幂等：只补 path_norm IS NULL 或 '' 的行，取值统一走 paths.normalize_path
+    （与采集 / legacy 导入同一条规则）。已有值绝不覆盖。写入须绕过只读打开
+    （open_snapshot 是 mode=ro&immutable），此处显式以读写打开——与 build-fts
+    同一套做法。未封库的库跳过并告警（现场可能仍在被采集写入门）。
+    """
+    from .catalog import snapshot_path
+    from .paths import normalize_path
+
+    if getattr(args, "all", False):
+        root = Path(args.data_root)
+        if not root.is_dir():
+            print(f"错误：数据根不存在：{root}", file=sys.stderr)
+            return 2
+        dbs = sorted(root.glob("*/*/snapshot.db"))
+        if not dbs:
+            print(f"数据根下没有快照库：{root}")
+            return 0
+    else:
+        db = Path(args.snapshot_id)
+        if not db.is_file():
+            db = snapshot_path(args.data_root, args.snapshot_id)
+            if not db.is_file():
+                print(f"错误：快照不存在：{args.snapshot_id}（{db}）", file=sys.stderr)
+                return 2
+        dbs = [db]
+
+    rc = 0
+    grand_total = 0
+    for db in dbs:
+        try:
+            conn = sqlite3.connect(str(db))
+        except sqlite3.Error as e:
+            print(f"错误：无法打开 {db}：{e}", file=sys.stderr)
+            rc = 2
+            continue
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
+            if not row or row[0] != "sealed":
+                print(f"警告：跳过未封库快照：{db}", file=sys.stderr)
+                continue
+            missing = conn.execute(
+                "SELECT COUNT(*) FROM entries WHERE path_norm IS NULL OR path_norm = ''"
+            ).fetchone()[0]
+            if missing == 0:
+                print(f"{db}：无需补写（path_norm 已全量）")
+                continue
+            # SQLite 的 LOWER 不处理非 ASCII，必须逐行带出 path 在 Python 侧 casefold
+            rows = conn.execute(
+                "SELECT entry_id, path FROM entries WHERE path_norm IS NULL OR path_norm = ''"
+            ).fetchall()
+            conn.execute("BEGIN")
+            conn.executemany(
+                "UPDATE entries SET path_norm=? WHERE entry_id=?",
+                [(normalize_path(p), eid) for eid, p in rows],
+            )
+            conn.commit()
+            fixed = len(rows)
+            grand_total += fixed
+            print(f"{db}：补写 {fixed:,} 行 path_norm")
+        except sqlite3.Error as e:
+            print(f"错误：{db}：{e}", file=sys.stderr)
+            rc = 2
+        finally:
+            conn.close()
+    if getattr(args, "all", False):
+        print(f"合计补写：{grand_total:,} 行（{len(dbs)} 个库）")
+    return rc
+
+
 # ---- build-stats ------------------------------------------------------------
 
 def _cmd_build_stats(args: argparse.Namespace) -> int:
@@ -494,7 +577,11 @@ def _cmd_hash(args: argparse.Namespace) -> int:
         return 2
 
     data_root = Path(args.data_root)
-    db = snapshot_path(data_root, args.snapshot_id)
+    try:
+        db = snapshot_path(data_root, args.snapshot_id)
+    except LegacyImportError as e:  # 非法快照 ID（volume_id 段含非法字符）
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
     cat = connect_catalog(data_root)
     try:
         if find_snapshot(cat, args.snapshot_id) is None:
@@ -883,6 +970,22 @@ def _reconfigure_console_utf8() -> None:
                 pass
 
 
+def _norm_snapshot_id(value: "str | None") -> "str | None":
+    """快照 ID 归一：Windows 用户自然输入反斜杠分隔（VOL_P2\\20261001T121359Z），
+    会被 volume_id 校验拒成"非法快照 ID"——统一把 `\` 归一成 `/`。
+
+    仅作用于 snapshot_id 类参数（snapshot_id/snapshot/diff 的 a、b）；
+    真实路径类参数（--data-root/--output/--root/--snapshot-dir 等）不走这里。
+    值为真实存在的文件路径时不归一——各命令同时接受 snapshot.db 直传路径，
+    Windows 真实路径的反斜杠不能动。
+    """
+    if not value or "\\" not in value:
+        return value
+    if Path(value).is_file():
+        return value
+    return value.replace("\\", "/")
+
+
 def main(argv: "list[str] | None" = None) -> int:
     _reconfigure_console_utf8()
     parser = _build_parser()
@@ -892,6 +995,13 @@ def main(argv: "list[str] | None" = None) -> int:
     # 后续 file: URI 构造（db.file_uri）依赖归一化后的绝对路径。
     if getattr(args, "data_root", None):
         args.data_root = str(Path(args.data_root).resolve())
+
+    # 统一归一化快照 ID 类参数（见 _norm_snapshot_id；覆盖全部吃快照 ID 的
+    # 子命令：diff 的 a/b、export 的 snapshot、其余命令的 snapshot_id）
+    for attr in ("snapshot_id", "snapshot", "a", "b"):
+        v = getattr(args, attr, None)
+        if isinstance(v, str):
+            setattr(args, attr, _norm_snapshot_id(v))
 
     if args.command == "serve":
         import uvicorn
@@ -932,6 +1042,12 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "build-fts":
         return _cmd_build_fts(args)
+
+    if args.command == "fix-pathnorm":
+        if not args.all and not args.snapshot_id:
+            print("错误：需提供快照 ID 或 --all", file=sys.stderr)
+            return 2
+        return _cmd_fix_pathnorm(args)
 
     if args.command == "build-stats":
         return _cmd_build_stats(args)

@@ -21,7 +21,8 @@ SID_OLD = "vol/20260101T000000Z"  # meta 有 smart_raw_json、历史表无行（
 SID_NEW = "vol/20260301T000000Z"  # disk_smart 有 catalog 行
 
 
-def _build_snapshot_db(path: Path, smart_raw: "str | None") -> None:
+def _build_snapshot_db(path: Path, smart_raw: "str | None",
+                       smart_error: "str | None" = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     init_snapshot(conn)
@@ -30,6 +31,9 @@ def _build_snapshot_db(path: Path, smart_raw: "str | None") -> None:
     if smart_raw is not None:
         conn.execute("INSERT INTO meta(key, value) VALUES('smart_raw_json', ?)",
                      (smart_raw,))
+    if smart_error is not None:
+        conn.execute("INSERT INTO meta(key, value) VALUES('smart_error', ?)",
+                     (smart_error,))
     conn.commit()
     conn.close()
 
@@ -39,7 +43,8 @@ def client(tmp_path: Path) -> TestClient:
     data_root = tmp_path / "data"
     data_root.mkdir()
     _build_snapshot_db(data_root / "vol" / "20260101T000000Z" / "snapshot.db", SAMPLE)
-    _build_snapshot_db(data_root / "vol" / "20260301T000000Z" / "snapshot.db", None)
+    _build_snapshot_db(data_root / "vol" / "20260301T000000Z" / "snapshot.db", None,
+                       smart_error="权限不足：读取 SMART 需要管理员权限")
 
     cat = sqlite3.connect(catalog_path(data_root))
     init_catalog(cat)
@@ -128,6 +133,78 @@ def test_attached_degrades(client: TestClient, monkeypatch) -> None:
     body = client.get("/api/disks/attached").json()
     assert body["available"] is False
     assert "lsblk" in body["reason"]
+
+
+# ---------------------------------------------------------------- smart_error 透出
+
+
+def test_detail_and_history_expose_smart_error(client: TestClient) -> None:
+    detail = client.get("/api/disks/D1").json()
+    assert detail["smart_error"]["snapshot_id"] == SID_NEW
+    assert "管理员" in detail["smart_error"]["smart_error"]
+
+    hist = client.get("/api/disks/D1/smart").json()
+    assert hist["smart_error"]["snapshot_id"] == SID_NEW
+
+
+# ---------------------------------------------------------------- 现场读取
+
+
+def _ok_verbose(raw: str = SAMPLE, device_type: str = "sat") -> dict:
+    return {"ok": True, "raw": raw, "device_type": device_type, "reason": None,
+            "message": None, "raw_excerpt": raw[:2048], "attempts": []}
+
+
+def test_smart_read_live_ok(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True,
+        "items": [{"device": "/dev/sdb", "model": "M", "serial": "D1",
+                   "size_bytes": 100, "volumes": []}],
+        "count": 1,
+    })
+    monkeypatch.setattr(smart, "read_smart_verbose", lambda dev: _ok_verbose())
+    r = client.post("/api/disks/D1/smart/read")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["device"] == "/dev/sdb"
+    assert body["device_type"] == "sat"
+    assert body["parsed"]["health"] == "passed"
+    assert body["reason"] is None
+
+
+def test_smart_read_live_failure_readable(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True,
+        "items": [{"device": "/dev/sdb", "model": "M", "serial": "D1",
+                   "size_bytes": 100, "volumes": []}],
+        "count": 1,
+    })
+
+    def fail(dev: str) -> dict:
+        return {"ok": False, "raw": None, "device_type": "",
+                "reason": "permission_denied",
+                "message": smart.REASON_MESSAGES["permission_denied"],
+                "raw_excerpt": "Access is denied",
+                "attempts": [{"device_type": "default", "rc": 16, "error": None,
+                              "stderr_excerpt": "Access is denied"}]}
+
+    monkeypatch.setattr(smart, "read_smart_verbose", fail)
+    r = client.post("/api/disks/D1/smart/read")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["reason"] == "permission_denied"
+    assert "管理员" in body["message"]
+    assert body["parsed"] is None
+    assert body["raw_excerpt"] == "Access is denied"
+
+
+def test_smart_read_live_disk_absent_404(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True, "items": [], "count": 0})
+    r = client.post("/api/disks/NOPE/smart/read")
+    assert r.status_code == 404
+    assert "不在线" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------- preflight
