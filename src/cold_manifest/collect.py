@@ -23,7 +23,7 @@ from typing import Callable
 
 from . import __version__
 from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume,
-                      register_snapshot, snapshot_path, validate_volume_id)
+                      register_snapshot, rmtree_ro, snapshot_path, validate_volume_id)
 from .probe import DiskInfo, ProbeError, VolumeInfo, probe_path
 from .scanner import ScanCancelled, scan_tree
 from .scan_journal import ScanJournal, journal_path, read_completed
@@ -273,7 +273,7 @@ def _sweep_leftovers(data_root: Path, volume_id: str, keep_ts: str,
         if not is_collect_orphan(child):
             continue  # 已封库的历史快照或非本工具产生的库，不动
         try:
-            shutil.rmtree(child)
+            rmtree_ro(child)
         except OSError as exc:
             warnings.append(f"leftover_cleanup=failed({child}: {exc})")
         else:
@@ -531,7 +531,7 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
             raise CollectError(
                 f"目标快照已存在且已封库：{sid}（同秒重跑或重复采集；如需重建请先删除 {dest_dir}）")
         # 未封库 = 上次采集崩溃的脏残留（无 journal，不可续采），一律删除重建
-        shutil.rmtree(dest_dir)
+        rmtree_ro(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     journal: "ScanJournal | None" = None
@@ -546,7 +546,7 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
             except Exception:  # noqa: BLE001 — 中断清理不掩盖原异常
                 _log.warning("中断时 journal 落盘失败（%s）", journal._path)
         try:
-            shutil.rmtree(Path(scan_root) / "_coldmanifest" / volume_id / ts)
+            rmtree_ro(Path(scan_root) / "_coldmanifest" / volume_id / ts)
         except OSError as exc:
             _log.warning("中断清理失败（残留 %s）：%s",
                          Path(scan_root) / "_coldmanifest" / volume_id / ts, exc)

@@ -22,7 +22,8 @@ class AppState:
         # 被 LRU 挤出的连接不在这里 close：可能仍有在途流式导出引用它，
         # close 会掐断读取（Cannot operate on a closed database）。移入 retired，
         # 交给引用计数/GC 兜底，AppState.close() 统一收尾。
-        self._retired: "list[sqlite3.Connection]" = []
+        # 元组带 snapshot_id，供 evict_snapshot 按快照定向关闭。
+        self._retired: "list[tuple[str, sqlite3.Connection]]" = []
 
     @property
     def catalog(self) -> sqlite3.Connection:
@@ -50,15 +51,41 @@ class AppState:
         conn.execute("PRAGMA cache_size=-262144")  # 256 MiB 页缓存
         self._snap_pools[snapshot_id] = conn
         if len(self._snap_pools) > _POOL_SIZE:
-            _, evicted = self._snap_pools.popitem(last=False)
-            self._retired.append(evicted)
+            evicted_id, evicted = self._snap_pools.popitem(last=False)
+            self._retired.append((evicted_id, evicted))
         return conn
+
+    def evict_snapshot(self, snapshot_id: str) -> int:
+        """关闭某快照在池内与 retired 里的所有连接（删除前释放 Windows 文件句柄）。
+
+        返回实际关闭的连接数；快照不在池中返回 0，不报错。
+        """
+        closed = 0
+        conn = self._snap_pools.pop(snapshot_id, None)
+        if conn is not None:
+            try:
+                conn.close()
+                closed += 1
+            except sqlite3.Error:
+                pass
+        still_retired: "list[tuple[str, sqlite3.Connection]]" = []
+        for sid, c in self._retired:
+            if sid != snapshot_id:
+                still_retired.append((sid, c))
+                continue
+            try:
+                c.close()
+                closed += 1
+            except sqlite3.Error:
+                pass
+        self._retired = still_retired
+        return closed
 
     def close(self) -> None:
         for conn in self._snap_pools.values():
             conn.close()
         self._snap_pools.clear()
-        for conn in self._retired:
+        for _, conn in self._retired:
             try:
                 conn.close()
             except sqlite3.Error:

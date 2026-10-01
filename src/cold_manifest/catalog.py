@@ -3,6 +3,8 @@
 import os
 import re
 import sqlite3
+import stat
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +114,33 @@ class SnapshotDeleteError(Exception):
     """快照删除参数/路径非法（路由层转 400）。"""
 
 
+def rmtree_ro(path: "str | Path") -> None:
+    """shutil.rmtree 的 Windows 兼容版：只读文件先 chmod 去只读再删。
+
+    目录不存在时静默返回（与调用点原有的"不存在即跳过"语义一致）。
+    文件被其他进程占用（Windows 独占打开）时 PermissionError 照常抛出，
+    由调用方决定重试/报错——本函数不吞占用类错误。
+    """
+    import shutil
+
+    def _onexc(func, p, exc_info):  # type: (object, str, object) -> None
+        try:
+            os.chmod(p, stat.S_IWRITE)
+        except OSError:
+            pass
+        func(p)
+
+    kwargs: "dict[str, Any]" = {}
+    if sys.version_info >= (3, 12):
+        kwargs["onexc"] = _onexc
+    else:
+        kwargs["onerror"] = _onexc
+    try:
+        shutil.rmtree(path, **kwargs)
+    except FileNotFoundError:
+        return
+
+
 class SnapshotDeleteBlocked(Exception):
     """删除被阻塞：被 diff 引用或存在活跃任务（路由层转 409）。
 
@@ -160,8 +189,6 @@ def delete_snapshot(conn: sqlite3.Connection, data_root: "str | Path",
     返回 {snapshot_id, deleted_host, deleted_disk, freed_bytes,
           diffs_removed, warnings}。
     """
-    import shutil
-
     if on_disk not in ("keep", "delete"):
         raise SnapshotDeleteError(f"非法 on_disk：{on_disk!r}（允许 keep/delete）")
 
@@ -226,7 +253,7 @@ def delete_snapshot(conn: sqlite3.Connection, data_root: "str | Path",
     deleted_host = False
     if host_dir.is_dir():
         freed += _dir_size(host_dir)
-        shutil.rmtree(host_dir)
+        rmtree_ro(host_dir)
         deleted_host = True
     else:
         warnings.append(f"主机快照目录不存在（仅清理 catalog 行）：{host_dir}")
@@ -247,7 +274,7 @@ def delete_snapshot(conn: sqlite3.Connection, data_root: "str | Path",
             _safe_child(copy_dir.parent, copy_dir, "盘上副本目录")
             if copy_dir.is_dir():
                 freed += _dir_size(copy_dir)
-                shutil.rmtree(copy_dir)
+                rmtree_ro(copy_dir)
                 deleted_disk = True
             else:
                 deleted_disk = False

@@ -607,9 +607,29 @@ def delete_snapshot_ep(
         lock.acquire()
     except LockBusy as e:
         raise HTTPException(status_code=409, detail=f"数据根被占用：{e}") from None
+
+    def _fail_busy(exc: PermissionError) -> HTTPException:
+        state.catalog.rollback()
+        where = getattr(exc, "filename", None) or snapshot_id
+        return HTTPException(
+            status_code=409,
+            detail=f"{where}：文件被占用或只读，请关闭正在进行的导出/查看后重试")
+
     try:
-        return _delete_snapshot(state.catalog, state.data_root, snapshot_id,
-                                on_disk=on_disk, force=force)
+        # Windows：池内缓存的快照库只读句柄会锁住文件，删除前先释放
+        state.evict_snapshot(snapshot_id)
+        try:
+            return _delete_snapshot(state.catalog, state.data_root, snapshot_id,
+                                    on_disk=on_disk, force=force)
+        except PermissionError:
+            # 可能仍有在途流式导出持有连接：关掉后重试一次；
+            # 仍失败则明确报错，绝不谎报成功（Linux unlink 语义不会走到这里）
+            state.evict_snapshot(snapshot_id)
+            try:
+                return _delete_snapshot(state.catalog, state.data_root, snapshot_id,
+                                        on_disk=on_disk, force=force)
+            except PermissionError as e:
+                raise _fail_busy(e) from None
     except LookupError as e:
         state.catalog.rollback()
         raise HTTPException(status_code=404, detail=str(e)) from None

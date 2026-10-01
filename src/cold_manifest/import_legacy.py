@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 from .db import file_uri
 from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume, register_snapshot,
-                      snapshot_path, validate_volume_id)
+                      rmtree_ro, snapshot_path, validate_volume_id)
 from .schema import SNAPSHOT_TABLES_DDL
 
 _BATCH_SIZE = 10_000
@@ -320,8 +320,7 @@ def import_snapshot(snapshot_dir: "str | Path", data_root: "str | Path",
             return ImportResult(snapshot_id=snapshot_id, volume_id=volume_id, ts=ts,
                                 db_path=db_path, skipped_import=True, elapsed_s=time.monotonic() - t0)
         # 未封库 = 上次导入崩溃的脏残留，一律删除重建（与 force 无关）
-        import shutil
-        shutil.rmtree(dest_dir)
+        rmtree_ro(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(db_path))

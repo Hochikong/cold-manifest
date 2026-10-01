@@ -15,7 +15,6 @@ import base64
 import json
 import logging
 import queue
-import shutil
 import sqlite3
 import threading
 import time
@@ -24,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .catalog import rmtree_ro
 from .db import init_catalog, open_catalog
 from .seal import is_collect_orphan
 
@@ -143,7 +143,7 @@ class TaskRunner:
                 if not _is_collect_orphan(ts_dir):
                     continue
                 try:
-                    shutil.rmtree(ts_dir)
+                    rmtree_ro(ts_dir)
                 except OSError as e:
                     _log.warning("孤儿清扫：删除 %s 失败：%s", ts_dir, e)
                 else:
