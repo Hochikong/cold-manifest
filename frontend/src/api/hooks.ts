@@ -31,6 +31,8 @@ import {
   listDiffEntries,
   scanImports,
   createImport,
+  importDb,
+  rebuildCatalog,
   createCollect,
   cancelTask,
   listTasks,
@@ -520,5 +522,27 @@ export function useHashSummary(snapshot_id: string | undefined, enabled = true) 
     enabled: !!snapshot_id && enabled,
     staleTime: 15_000,
     retry: false,
+  })
+}
+
+/** 就地登记外部 snapshot.db；400（未封库/白名单外）由调用方按 detail 提示。 */
+export function useImportDb() {
+  return useMutation({
+    mutationFn: (path: string) => importDb(path),
+  })
+}
+
+/** catalog 重建（dry_run=true 预演 / false 执行，执行持数据根锁，被占 → 409）。 */
+export function useRebuildCatalog() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (dry_run: boolean) => rebuildCatalog(dry_run),
+    onSuccess: (_data, dry_run) => {
+      if (!dry_run) {
+        qc.invalidateQueries({ queryKey: ['snapshots'] })
+        qc.invalidateQueries({ queryKey: ['disks'] })
+        qc.invalidateQueries({ queryKey: ['volumes'] })
+      }
+    },
   })
 }

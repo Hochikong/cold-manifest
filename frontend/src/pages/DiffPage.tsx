@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import {
   Card,
@@ -19,6 +19,7 @@ import {
   Alert,
   Drawer,
   Badge,
+  Input,
 } from 'antd'
 import type { TableProps } from 'antd'
 import {
@@ -26,6 +27,7 @@ import {
   PlayCircleOutlined,
   DownloadOutlined,
   ArrowLeftOutlined,
+  FilterOutlined,
 } from '@ant-design/icons'
 import ReactECharts from 'echarts-for-react'
 import { useSnapshots, useDiffs, useDiff, useDiffSummary, useDiffEntries, useCreateDiff } from '../api/hooks'
@@ -286,10 +288,23 @@ function DiffSelector() {
 }
 
 function DiffDetail({ diffId }: { diffId: string }) {
+  const [searchParams, setSearchParams] = useSearchParams()
   const { data: diff, isLoading: diffLoading, error: diffError } = useDiff(diffId)
   const { data: summary, isLoading: summaryLoading, error: summaryError } = useDiffSummary(diffId, 50)
   const [category, setCategory] = useState<string | undefined>(undefined)
   const [drawerEntry, setDrawerEntry] = useState<DiffEntry | null>(null)
+
+  // 路径前缀筛选状态写进 URL（?prefix=…），便于分享与浏览器回退
+  const prefix = searchParams.get('prefix') || ''
+  const setPrefix = useCallback(
+    (v: string) => {
+      const next = new URLSearchParams(searchParams)
+      if (v) next.set('prefix', v)
+      else next.delete('prefix')
+      setSearchParams(next)
+    },
+    [searchParams, setSearchParams]
+  )
 
   const counts = diff?.summary || {}
   const error = diffError || summaryError
@@ -413,6 +428,13 @@ function DiffDetail({ diffId }: { diffId: string }) {
                 {CATEGORY_LABELS[category]?.label}
               </Tag>
             )}
+            {prefix.trim() && (
+              <Tooltip title="路径前缀筛选已写入地址栏，可直接分享">
+                <Tag color="geekblue" closable onClose={() => setPrefix('')}>
+                  前缀 {prefix.trim()}
+                </Tag>
+              </Tooltip>
+            )}
           </Space>
         }
         extra={
@@ -426,7 +448,14 @@ function DiffDetail({ diffId }: { diffId: string }) {
           </Space>
         }
       >
-        <DiffEntriesTable diffId={diffId} category={category} onRowClick={setDrawerEntry} aSnapshotId={diff?.a ?? ''} />
+        <DiffEntriesTable
+          diffId={diffId}
+          category={category}
+          pathPrefix={prefix}
+          onPrefixChange={setPrefix}
+          onRowClick={setDrawerEntry}
+          aSnapshotId={diff?.a ?? ''}
+        />
       </Card>
 
       <Drawer
@@ -446,11 +475,16 @@ type DiffSortKey = 'path' | 'size_delta'
 function DiffEntriesTable({
   diffId,
   category,
+  pathPrefix,
+  onPrefixChange,
   onRowClick,
   aSnapshotId,
 }: {
   diffId: string
   category: string | undefined
+  /** URL 里的路径前缀（未 trim，可能为空串） */
+  pathPrefix: string
+  onPrefixChange: (v: string) => void
   onRowClick: (e: DiffEntry) => void
   aSnapshotId: string
 }) {
@@ -460,9 +494,27 @@ function DiffEntriesTable({
   const [sort, setSort] = useState<DiffSortKey>('path')
   const [order, setOrder] = useState<'asc' | 'desc'>('asc')
   const rowMenu = useRowContextMenu()
+  const prefixTimer = useRef<number | null>(null)
+
+  // 输入框本地值；URL 外部变化（回退/前进/清空标签）时在渲染期同步回输入框。
+  // 防抖写在 onChange 里，400ms 后写回 URL。
+  const [prefixInput, setPrefixInput] = useState(pathPrefix)
+  const [syncedPrefix, setSyncedPrefix] = useState(pathPrefix)
+  if (pathPrefix !== syncedPrefix) {
+    setSyncedPrefix(pathPrefix)
+    setPrefixInput(pathPrefix)
+  }
+  const handlePrefixInput = (v: string) => {
+    setPrefixInput(v)
+    if (prefixTimer.current) window.clearTimeout(prefixTimer.current)
+    prefixTimer.current = window.setTimeout(() => onPrefixChange(v.trim()), 400)
+  }
+
+  const trimmedPrefix = pathPrefix.trim()
 
   const { data, isLoading, error } = useDiffEntries(diffId, {
     category,
+    path_prefix: trimmedPrefix || undefined,
     limit: 200,
     sort,
     order,
@@ -479,7 +531,14 @@ function DiffEntriesTable({
     if (!cursor) return
     setLoadingMore(true)
     try {
-      const res = await listDiffEntries(diffId, { category, limit: 200, sort, order, cursor })
+      const res = await listDiffEntries(diffId, {
+        category,
+        path_prefix: trimmedPrefix || undefined,
+        limit: 200,
+        sort,
+        order,
+        cursor,
+      })
       setAllItems((prev) => [...prev, ...res.items])
       setCursor(res.next_cursor)
     } finally {
@@ -575,6 +634,21 @@ function DiffEntriesTable({
   return (
     <div>
       {error && <ErrorAlert error={error} />}
+      <Space wrap style={{ marginBottom: 12 }} align="center">
+        <Input
+          prefix={<FilterOutlined style={{ color: '#bbb' }} />}
+          placeholder="按路径前缀过滤，如 photos/2024（以 / 结尾表示目录）"
+          style={{ width: 360 }}
+          value={prefixInput}
+          onChange={(e) => handlePrefixInput(e.target.value)}
+        />
+        {prefixInput && (
+          <Button onClick={() => handlePrefixInput('')}>清空</Button>
+        )}
+        {trimmedPrefix && (
+          <Text type="secondary">仅显示以 <Text code>{trimmedPrefix}</Text> 开头的路径</Text>
+        )}
+      </Space>
       <Table
         rowKey="id"
         size="small"

@@ -1,6 +1,7 @@
 import { Card, Descriptions, Spin, Typography } from 'antd'
 import { useSettings } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import RebuildCatalogCard from '../components/RebuildCatalogCard'
 
 const { Title } = Typography
 
@@ -18,6 +19,7 @@ export default function SettingsPage() {
           <Descriptions.Item label="数据根目录">{data?.data_root || '-'}</Descriptions.Item>
         </Descriptions>
       </Card>
+      <RebuildCatalogCard />
     </div>
   )
 }

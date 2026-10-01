@@ -795,6 +795,58 @@ export async function createImport(body: ImportCreateBody): Promise<ImportCreate
   return data
 }
 
+// ---------------------------------------------------------------- 就地登记外部 snapshot.db（POST /imports/db）
+
+export interface ImportDbResponse {
+  /** false = 幂等命中（该库此前已登记，本次只返回现有登记） */
+  created: boolean
+  snapshot_id: string
+  volume_id: string
+  db_path: string
+  snapshot: Record<string, unknown> | null
+  warnings: string[]
+}
+
+/** 就地登记已封库的 snapshot.db（只引用原文件，不拷入数据根）。 */
+export async function importDb(path: string): Promise<ImportDbResponse> {
+  const { data } = await client.post<ImportDbResponse>('/imports/db', { path })
+  return data
+}
+
+// ---------------------------------------------------------------- catalog 重建（POST /admin/rebuild-catalog）
+
+export interface RebuildCatalogSummary {
+  scanned: number
+  disks_added: number
+  volumes_added: number
+  snapshots_added: number
+  copies_added: number
+  fields_backfilled: number
+  snapshots_skipped: number
+  warnings: string[]
+  dry_run: boolean
+}
+
+/** 重建/回填 catalog 注册行；dry_run=true 只输出计划不写。写操作持数据根锁（被占 → 409）。 */
+export async function rebuildCatalog(dry_run: boolean): Promise<RebuildCatalogSummary> {
+  const { data } = await client.post<RebuildCatalogSummary>('/admin/rebuild-catalog', { dry_run })
+  return data
+}
+
+/** 从 axios 错误里取后端 detail（字符串优先），退化到 error.message。 */
+export function apiErrorDetail(e: unknown): string {
+  if (axios.isAxiosError(e)) {
+    const data: unknown = e.response?.data
+    if (typeof data === 'string' && data) return data
+    if (data && typeof data === 'object' && 'detail' in data) {
+      const d = (data as { detail?: unknown }).detail
+      if (typeof d === 'string' && d) return d
+      if (d && typeof d === 'object') return JSON.stringify(d)
+    }
+  }
+  return e instanceof Error ? e.message : String(e)
+}
+
 export interface CollectCreateBody {
   path: string
   volume_id?: string | null
