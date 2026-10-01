@@ -40,9 +40,23 @@ SMART_KEYS = (
     "model",
     "serial",
     "firmware",
+    "capacity_bytes",    # user_capacity.bytes（Windows CIM 拿不到容量时的补救）
+    "rotation_rate",     # 转速（rpm；SSD 为 0）
+    "form_factor",       # form_factor.name（如 3.5 inches）
 )
 
 _TIMEOUT = 30
+
+# exit_status 位掩码语义（smartctl 文档）：
+#   bit0(1)   命令行解析出错           → 失败
+#   bit1(2)   设备打不开               → 失败
+#   bit2(4)   某些子命令不支持/失败（有 JSON 输出仍算读到数据）
+#   bit3(8)   盘报 SMART FAILING       → 成功，健康=failed
+#   bit4(16)  预失败属性超阈值         → 成功，健康=warning
+#   bit5-7(32/64/128) 历史告警/日志    → 成功，健康=warning
+_FAIL_MASK = 3
+_HEALTH_FAIL_BIT = 8
+_HEALTH_WARN_BITS = 16 | 32 | 64 | 128
 
 
 # ---------------------------------------------------------------- 解析
@@ -68,14 +82,17 @@ def _lo16(v: int | None) -> int | None:
     return None if v is None else v & 0xFFFF
 
 
-def parse_smart(raw: "str | None") -> dict:
+def parse_smart(raw: "str | None", exit_status: "int | None" = None) -> dict:
     """smartctl JSON 文本 → 结构化字段。坏 JSON/缺失字段不抛异常。
 
-    - health：smart_status.passed → passed/failed，缺 → unavailable；
+    - health：smart_status.passed → passed/failed；缺失时按 exit_status 位掩码
+      推断（bit3=8 → failed；bit4-7 → warning；否则 unavailable）；
     - power_on_hours：优先 power_on_time.hours，回退属性 9 raw 低 16 位；
     - reallocated/pending：属性 5/197 raw 低 16 位；start_stop：属性 4；
     - spin_up_ms：属性 3 raw 低 16 位；
-    - device_type：device.type（sat/ata/scsi/...）。
+    - device_type：device.type（sat/ata/scsi/...）；
+    - model/serial：model_name（回退 device_model / device.model）/ serial_number；
+    - capacity_bytes/rotation_rate/form_factor：user_capacity.bytes 等诊断字段。
     """
     out: dict = {k: None for k in SMART_KEYS}
     out["health"] = "unavailable"
@@ -90,7 +107,16 @@ def parse_smart(raw: "str | None") -> dict:
 
     passed = (sj.get("smart_status") or {}).get("passed") \
         if isinstance(sj.get("smart_status"), dict) else None
-    out["health"] = {True: "passed", False: "failed"}.get(passed, "unavailable")
+    if passed is True:
+        out["health"] = "passed"
+    elif passed is False:
+        out["health"] = "failed"
+    else:
+        bits = exit_status or 0
+        if bits & _HEALTH_FAIL_BIT:
+            out["health"] = "failed"
+        elif bits & _HEALTH_WARN_BITS:
+            out["health"] = "warning"
 
     try:
         out["temperature_c"] = int((sj.get("temperature") or {}).get("current"))
@@ -112,9 +138,20 @@ def parse_smart(raw: "str | None") -> dict:
 
     dev = sj.get("device") if isinstance(sj.get("device"), dict) else {}
     out["device_type"] = dev.get("type") or None
-    out["model"] = sj.get("model_name") or sj.get("device_model") or None
+    out["model"] = sj.get("model_name") or sj.get("device_model") \
+        or dev.get("model") or None
     out["serial"] = (sj.get("serial_number") or "").strip() or None
     out["firmware"] = sj.get("firmware_version") or None
+    try:
+        out["capacity_bytes"] = int((sj.get("user_capacity") or {}).get("bytes"))
+    except (TypeError, ValueError):
+        out["capacity_bytes"] = None
+    try:
+        out["rotation_rate"] = int(sj.get("rotation_rate"))
+    except (TypeError, ValueError):
+        out["rotation_rate"] = None
+    ff = sj.get("form_factor")
+    out["form_factor"] = ff.get("name") if isinstance(ff, dict) else (ff or None)
     return out
 
 
@@ -140,25 +177,135 @@ def _run_cmd(cmd: list[str]) -> "subprocess.CompletedProcess | None":
 
 
 def _usable(proc: "subprocess.CompletedProcess | None") -> bool:
-    """smartctl 输出可用：有 JSON 输出即可（rc≠0 常见于部分属性缺失）。"""
-    return proc is not None and bool(proc.stdout.strip()) \
-        and proc.stdout.lstrip().startswith("{")
+    """smartctl 输出可用：有 JSON 输出且 exit_status 低 2 位无致命错误。
 
-
-def read_smart(device: str) -> "dict | None":
-    """采集一台盘的 SMART。返回 ``{"raw": stdout, "device_type": 生效类型或 ""}``。
-
-    默认参数失败/无输出 → 自动重试 ``-d sat``（USB 桥常见），
-    重试成功则 device_type 记 "sat"；两次都拿不到 → None。
+    exit_status 位掩码：bit0(1)=命令行错误、bit1(2)=设备打不开 → 失败；
+    bit3-7（8/16/32/64/128）是健康告警位——有数据就算成功（健康标记由
+    parse_smart 按 exit_status 推断），message 里的 warning 不算失败。
     """
+    if proc is None or not proc.stdout.strip() \
+            or not proc.stdout.lstrip().startswith("{"):
+        return False
+    return (proc.returncode & _FAIL_MASK) == 0
+
+
+# ---------------------------------------------------------------- 设备名解析
+# Windows USB 桥实测定案：\\.\PhysicalDriveN 常打不开（Invalid argument），而
+# smartctl --scan 给出的 /dev/sdN + -d sat 才能读到。因此 Windows 上优先用
+# --scan 的映射（scan 输出顺序与 disk_index 一致），拿不到再回退 PhysicalDrive。
+
+_SCAN_CACHE: "list[dict] | None" = None
+
+_SCAN_LINE_PAT = re.compile(r"^(\S+)\s+-d\s+([^\s,#+]+)")
+
+
+def reset_scan_cache() -> None:
+    """清空 --scan 结果缓存（测试/设备热插拔后用）。"""
+    global _SCAN_CACHE
+    _SCAN_CACHE = None
+
+
+def parse_scan_output(text: str) -> "list[dict]":
+    """smartctl --scan 文本输出 → [{device, type}]。
+
+    实测样例（Windows USB 桥）：
+      /dev/sdc -d sat # [SAT], ATA device
+    """
+    entries: list[dict] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _SCAN_LINE_PAT.match(line)
+        if m:
+            entries.append({"device": m.group(1), "type": m.group(2)})
+    return entries
+
+
+def scan_devices() -> "list[dict]":
+    """smartctl --scan 结果（进程内缓存）：优先 -j JSON，回退文本解析。"""
+    global _SCAN_CACHE
+    if _SCAN_CACHE is not None:
+        return _SCAN_CACHE
+    exe = smartctl_exec()
+    entries: list[dict] = []
+    proc = _run_cmd([exe, "--scan", "-j"])
+    if proc is not None and proc.stdout.lstrip().startswith("{"):
+        try:
+            sj = json.loads(proc.stdout)
+            for d in sj.get("devices") or []:
+                if isinstance(d, dict) and d.get("name"):
+                    entries.append({"device": str(d["name"]),
+                                    "type": str(d.get("type") or "")})
+        except (json.JSONDecodeError, ValueError):
+            entries = []
+    if not entries:
+        proc = _run_cmd([exe, "--scan"])
+        if proc is not None:
+            entries = parse_scan_output(proc.stdout)
+    _SCAN_CACHE = entries
+    return entries
+
+
+def smart_device(disk_index: "int | None", letter: "str | None" = None
+                 ) -> "tuple[str, str]":
+    """定位要采 SMART 的设备串。返回 (device, 扫描建议的 -d 类型或 "")。
+
+    优先级：CLDM_SMARTCTL_DEVICE 直接覆盖 → --scan 第 disk_index 行
+    （顺序与 PhysicalDrive 编号一致）→ \\\\.\\PhysicalDriveN → 盘符。
+    """
+    env = os.environ.get("CLDM_SMARTCTL_DEVICE")
+    if env and env.strip():
+        return env.strip(), ""
+    if isinstance(disk_index, int):
+        entries = scan_devices()
+        if 0 <= disk_index < len(entries):
+            e = entries[disk_index]
+            return e["device"], e["type"]
+        return f"\\\\.\\PhysicalDrive{disk_index}", ""
+    return f"{letter}:", ""
+
+
+# ---------------------------------------------------------------- 类型兜底链
+
+# 每一步都是一次独立尝试（auto → sat → sat,12 → 扫描建议 → 桥专用）
+_BASE_TYPES = ("", "sat", "sat,12")
+_BRIDGE_TYPES = ("usbjmicron", "usbsunplus", "usbprolific", "jms56x")
+
+
+def _device_types(suggested: "str | None" = None) -> list[str]:
+    chain = list(_BASE_TYPES)
+    if suggested:
+        chain.append(suggested)
+    chain.extend(_BRIDGE_TYPES)
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in chain:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _build_cmd(device: str, device_type: str) -> list[str]:
     exe = smartctl_exec()
     extra = extra_args()
-    proc = _run_cmd([exe, *extra, "-i", "-H", "-A", "-j", device])
-    if _usable(proc):
-        return {"raw": proc.stdout, "device_type": ""}
-    proc = _run_cmd([exe, *extra, "-d", "sat", "-i", "-H", "-A", "-j", device])
-    if _usable(proc):
-        return {"raw": proc.stdout, "device_type": "sat"}
+    dt_args = ["-d", device_type] if device_type else []
+    return [exe, *extra, *dt_args, "-i", "-H", "-A", "-j", device]
+
+
+def read_smart(device: str, *, suggested_type: "str | None" = None) -> "dict | None":
+    """采集一台盘的 SMART。返回 ``{"raw", "device_type", "exit_status"}``。
+
+    按类型兜底链逐次尝试（auto → sat → sat,12 → 扫描建议 → 桥专用），
+    第一次读到数据（exit_status 低 2 位无致命错误且有 JSON）即返回；全失败 → None。
+    """
+    for dt in _device_types(suggested_type):
+        cmd = _build_cmd(device, dt)
+        proc = _run_cmd(cmd)
+        if _usable(proc):
+            return {"raw": proc.stdout, "device_type": dt,
+                    "exit_status": proc.returncode}
     return None
 
 
@@ -193,7 +340,7 @@ _PERMISSION_PAT = re.compile(
 )
 _NO_SMART_PAT = re.compile(
     r"unknown device type|unable to detect device type|no smart|"
-    r"not supported|unsupported|usb bridge|不支持",
+    r"not supported|unsupported|usb bridge|不支持|invalid argument",
     re.IGNORECASE,
 )
 _NOT_FOUND_PAT = re.compile(
@@ -208,11 +355,17 @@ REASON_MESSAGES = {
         "权限不足：读取 SMART 需要管理员权限"
         "（Windows 请以管理员身份运行服务/CLI，Linux 需要 root/sudo）"
     ),
-    "no_smart": "设备或连接桥不支持 SMART（USB 桥可能需要指定设备类型 -d sat）",
+    "device_type_unknown": (
+        "无法识别设备类型（USB 桥常见；已尝试 auto/sat/桥专用参数均失败，"
+        "可设 CLDM_SMARTCTL_DEVICE 直接指定设备串）"
+    ),
     "not_found": "设备不存在或 smartctl 不可用",
     "timeout": "读取 SMART 超时（盘可能休眠中或无响应）",
     "other": "读取 SMART 失败（原因未知，详见 stderr 片段）",
 }
+
+# 兼容别名（v1 文案键名）
+REASON_MESSAGES.setdefault("no_smart", REASON_MESSAGES["device_type_unknown"])
 
 
 def _classify_attempts(attempts: list[dict]) -> str:
@@ -226,34 +379,36 @@ def _classify_attempts(attempts: list[dict]) -> str:
     if _PERMISSION_PAT.search(stderrs):
         return "permission_denied"
     if _NO_SMART_PAT.search(stderrs):
-        return "no_smart"
+        return "device_type_unknown"
     if _NOT_FOUND_PAT.search(stderrs):
         return "not_found"
     return "other"
 
 
-def read_smart_verbose(device: str) -> dict:
+def read_smart_verbose(device: str, *, suggested_type: "str | None" = None,
+                       device_types: "list[str] | None" = None) -> dict:
     """现场读取 SMART 并保留失败原因（诊断用；成功路径与 read_smart 等价）。
 
-    返回：
-    - ok / raw / device_type：成功时与 read_smart 同义；
-    - reason：permission_denied / no_smart / not_found / timeout / other；
+    - ok / raw / device_type / exit_status：成功时与 read_smart 同义；
+    - reason：permission_denied / device_type_unknown / not_found / timeout / other；
     - message：reason 对应的人话；
     - raw_excerpt：成功为 stdout 片段（≤2KB），失败为最后一次 stderr 片段（≤2KB）；
-    - attempts：逐次尝试记录 [{device_type, rc, error, stderr_excerpt}]。
-    绝不抛异常。
+    - attempts：失败尝试记录 [{device_type, argv, rc, exit_status, error,
+      stderr_excerpt, ok}]（成功的那次由返回字段直接承载）。
+    device_types 可显式覆盖兜底链（测试用）；绝不抛异常。
     """
-    exe = smartctl_exec()
-    extra = extra_args()
+    types = device_types if device_types is not None \
+        else _device_types(suggested_type)
     attempts: list[dict] = []
-    for dt, dt_args in (("", []), ("sat", ["-d", "sat"])):
-        cmd = [exe, *extra, *dt_args, "-i", "-H", "-A", "-j", device]
+    for dt in types:
+        cmd = _build_cmd(device, dt)
         proc, err = _run_cmd_ex(cmd)
         if _usable(proc):
             return {
                 "ok": True,
                 "raw": proc.stdout,
                 "device_type": dt,
+                "exit_status": proc.returncode,
                 "reason": None,
                 "message": None,
                 "raw_excerpt": _excerpt(proc.stdout),
@@ -261,8 +416,11 @@ def read_smart_verbose(device: str) -> dict:
             }
         attempts.append({
             "device_type": dt or "default",
+            "argv": " ".join(cmd),
             "rc": None if proc is None else proc.returncode,
+            "exit_status": None if proc is None else proc.returncode,
             "error": err,
+            "ok": False,
             "stderr_excerpt": _excerpt(getattr(proc, "stderr", None) or "", 512),
         })
     reason = _classify_attempts(attempts)
@@ -270,6 +428,7 @@ def read_smart_verbose(device: str) -> dict:
         "ok": False,
         "raw": None,
         "device_type": "",
+        "exit_status": None,
         "reason": reason,
         "message": REASON_MESSAGES[reason],
         "raw_excerpt": attempts[-1]["stderr_excerpt"][:2048],
@@ -303,7 +462,8 @@ def device_for_path(path: "str | Path", disk_index: "int | None" = None) -> "str
     """
     if sys.platform == "win32":
         if isinstance(disk_index, int):
-            return f"\\\\.\\PhysicalDrive{disk_index}"
+            dev, _sug = smart_device(disk_index)
+            return dev
         letter = str(Path(path).resolve())[:2].rstrip(":")
         if len(letter) == 1 and letter.isalpha():
             return f"{letter}:"

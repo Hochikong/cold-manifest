@@ -263,7 +263,19 @@ def probe_path_linux(
             firmware = sj.get("firmware_version") or ""
             interface = (sj.get("device") or {}).get("type") or ""
             passed = (sj.get("smart_status") or {}).get("passed")
-            smart_status = {True: "passed", False: "failed"}.get(passed, "unavailable")
+            if passed is True:
+                smart_status = "passed"
+            elif passed is False:
+                smart_status = "failed"
+            else:
+                # 无 smart_status 字段时按 exit_status 位掩码推断健康
+                bits = smart_exit_status or 0
+                if bits & 8:
+                    smart_status = "failed"
+                elif bits & (16 | 32 | 64 | 128):
+                    smart_status = "warning"
+                else:
+                    smart_status = "unavailable"
         else:
             smart_error = res["message"]
             smart_error_raw = res["raw_excerpt"]

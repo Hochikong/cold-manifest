@@ -47,7 +47,7 @@ def ensure_disk(conn: sqlite3.Connection, disk_id: str, **fields: Any) -> None:
     keys = list(cols)
     updates = ("last_seen=excluded.last_seen, " + ", ".join(
         f"{k}=COALESCE(excluded.{k}, {k})"
-        for k in keys if k not in ("disk_id", "first_seen", "last_seen"))).rstrip(", ")
+        for k in keys if k not in ("disk_id", "first_seen", "last_seen", "nickname"))).rstrip(", ")
     if not updates:
         # 只有 disk_id/first_seen/last_seen（无附加字段）：UPSERT 只刷 last_seen
         updates = "last_seen=excluded.last_seen"
@@ -62,12 +62,33 @@ def ensure_volume(conn: sqlite3.Connection, volume_id: str, disk_id: str, **fiel
     """登记卷（幂等）：已存在则保留已有真值、回填缺失字段（如 partition_uuid）。"""
     cols = {"volume_id": volume_id, "disk_id": disk_id, **fields}
     keys = list(cols)
-    updates = ", ".join(f"{k}=COALESCE(excluded.{k}, {k})" for k in keys if k != "volume_id")
+    updates = ", ".join(f"{k}=COALESCE(excluded.{k}, {k})" for k in keys if k not in ("volume_id", "nickname"))
     conn.execute(
         f"INSERT INTO volumes({','.join(keys)}) VALUES({','.join('?' * len(keys))}) "
         f"ON CONFLICT(volume_id) DO UPDATE SET {updates}",
         [cols[k] for k in keys],
     )
+
+
+def snapshot_label(conn: sqlite3.Connection, snapshot_id: str) -> str:
+    """快照展示标签（P1 昵称）：卷昵称（磁盘昵称）逐级回落。
+
+    卷有昵称 → "卷昵（盘昵）"；仅盘有 → "盘昵"；都没有 → ""。
+    有昵称时尾部附 " · <volume_id>"；快照/卷行缺失也返回 ""。
+    """
+    row = conn.execute(
+        "SELECT v.volume_id AS volume_id, v.nickname AS vnick, d.nickname AS dnick"
+        " FROM snapshots s JOIN volumes v ON v.volume_id = s.volume_id"
+        " LEFT JOIN disks d ON d.disk_id = v.disk_id"
+        " WHERE s.snapshot_id=?", (snapshot_id,)).fetchone()
+    if row is None:
+        return ""
+    label = ""
+    if row[1]:
+        label = row[1] + (f"（{row[2]}）" if row[2] else "")
+    elif row[2]:
+        label = row[2]
+    return f"{label} · {row[0]}" if label else ""
 
 
 def create_batch(conn: sqlite3.Connection, disk_id: str, planned_volumes: "list[str] | None" = None) -> str:

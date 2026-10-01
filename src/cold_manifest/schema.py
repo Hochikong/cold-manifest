@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS disks (
   disk_id TEXT PRIMARY KEY,              -- 规范化 serial；无 serial 时 'NOSERIAL_' + 首卷 partition_uuid
   physical_model TEXT, physical_serial TEXT, bridge_model TEXT,
   capacity_bytes INTEGER, interface_type TEXT,
-  first_seen TEXT, last_seen TEXT, notes TEXT
+  first_seen TEXT, last_seen TEXT, notes TEXT,
+  nickname TEXT
 );
 
 CREATE TABLE IF NOT EXISTS volumes (
@@ -90,7 +91,8 @@ CREATE TABLE IF NOT EXISTS volumes (
   partition_index INTEGER,
   partition_uuid TEXT,                   -- 真正的稳定锚
   volume_serial_hex TEXT, filesystem TEXT, label TEXT,
-  capacity_bytes INTEGER, notes TEXT
+  capacity_bytes INTEGER, notes TEXT,
+  nickname TEXT
 );
 
 CREATE TABLE IF NOT EXISTS snapshots (

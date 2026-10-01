@@ -195,6 +195,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_impdb.add_argument("--copy", action="store_true",
                          help="未实现：当前仅支持就地登记（--copy 会被拒绝）")
 
+    p_check = sub.add_parser("integrity-check",
+                             help="快照库完整性自查（只读）：对快照库跑 PRAGMA quick_check，"
+                                  "用于区分'假损坏'（服务报 malformed 但重启即好）与真损坏；"
+                                  "退出码 0=全部正常 / 1=有损坏或缺失")
+    p_check.add_argument("snapshot_id", nargs="?", default=None,
+                         help="快照 ID（形如 volume_id/时间戳）；省略时必须给 --all")
+    p_check.add_argument("--all", action="store_true",
+                         help="遍历 catalog 里登记的全部快照逐一自查")
+    p_check.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+
     return parser
 
 
@@ -952,6 +962,74 @@ def _cmd_import_db(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- integrity-check --------------------------------------------------------
+
+def _cmd_integrity_check(args: argparse.Namespace) -> int:
+    """快照库完整性自查（只读）：quick_check（异常时升级 integrity_check）。
+
+    退出码 0=全部正常；1=有损坏/缺失；2=用法错误。只读打开（mode=ro），
+    不加锁不写库，可对正在服务的快照安全执行。
+    """
+    from .catalog import connect_catalog
+    from .db import open_snapshot
+
+    data_root = Path(args.data_root)
+    targets: "list[str]" = []
+    if args.all:
+        if not (data_root / "catalog.db").is_file():
+            print(f"错误：catalog 不存在：{data_root / 'catalog.db'}", file=sys.stderr)
+            return 2
+        cat = connect_catalog(data_root)
+        try:
+            targets = [r[0] for r in
+                       cat.execute("SELECT snapshot_id FROM snapshots ORDER BY snapshot_id")]
+        finally:
+            cat.close()
+        if not targets:
+            print("catalog 中没有登记的快照")
+            return 0
+    elif args.snapshot_id:
+        targets = [args.snapshot_id]
+    else:
+        print("错误：需提供快照 ID 或 --all", file=sys.stderr)
+        return 2
+
+    bad = 0
+    for sid in targets:
+        db = data_root / sid.split("/")[0] / sid.split("/")[1] / "snapshot.db"
+        if not db.is_file():
+            print(f"{sid}：✗ 快照库文件缺失：{db}")
+            bad += 1
+            continue
+        try:
+            conn = open_snapshot(db)
+        except sqlite3.Error as e:
+            print(f"{sid}：✗ 无法打开 —— {e}")
+            bad += 1
+            continue
+        try:
+            rows = conn.execute("PRAGMA quick_check").fetchall()
+            verdict = "; ".join(r[0] for r in rows)
+            if verdict != "ok":
+                # quick_check 只查部分结构：异常时跑完整 integrity_check 给全量报告
+                rows = conn.execute("PRAGMA integrity_check").fetchall()
+                verdict = "; ".join(r[0] for r in rows)
+            if verdict == "ok":
+                n = conn.execute("SELECT count(*) FROM entries").fetchone()[0]
+                print(f"{sid}：✓ 正常（entries {n:,} 条）")
+            else:
+                print(f"{sid}：✗ 损坏 —— {verdict}")
+                bad += 1
+        except sqlite3.DatabaseError as e:
+            print(f"{sid}：✗ 损坏 —— {e}")
+            bad += 1
+        finally:
+            conn.close()
+    print(f"共检查 {len(targets)} 个快照库："
+          f"{'全部正常' if bad == 0 else f'{bad} 个异常'}")
+    return 1 if bad else 0
+
+
 # ---- main -------------------------------------------------------------------
 
 def _reconfigure_console_utf8() -> None:
@@ -1069,6 +1147,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "import-db":
         return _cmd_import_db(args)
+
+    if args.command == "integrity-check":
+        return _cmd_integrity_check(args)
 
     if args.command == "hash":
         return _cmd_hash(args)

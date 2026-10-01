@@ -338,7 +338,9 @@ def disk_smart_read(disk_id: str, request: Request,
         "message": res["message"],
         "raw_excerpt": res["raw_excerpt"],
         "attempts": res["attempts"],
-        "parsed": smart.parse_smart(res["raw"]) if res["ok"] else None,
+        "exit_status": res.get("exit_status"),
+        "parsed": smart.parse_smart(res["raw"],
+                                    exit_status=res.get("exit_status")) if res["ok"] else None,
     }
     return out
 
@@ -397,7 +399,7 @@ def collect_preflight(body: PreflightBody) -> dict:
         return res
     parsed = smart.parse_smart(r["raw"])
     res["device_type_hint"] = r["device_type"] or parsed.get("device_type") or ""
-    res["is_smart_capable"] = parsed.get("health") in ("passed", "failed")
+    res["is_smart_capable"] = parsed.get("health") in ("passed", "failed", "warning")
     if not res["is_smart_capable"]:
         res["warnings"].append("该盘未返回可用的 SMART 状态")
     return res

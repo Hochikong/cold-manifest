@@ -358,10 +358,12 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
     conn.execute("PRAGMA cache_size=-65536")
     try:
         try:
+            # 不用 immutable=1：封库后快照仍会被就地写（hash/build-fts/build-stats），
+            # immutable 连接在文件变化后读到错乱页会报假 malformed（见 db.open_snapshot）
             conn.execute("ATTACH DATABASE ? AS sna",
-                         (file_uri(db_a, immutable=True),))
+                         (file_uri(db_a, immutable=False),))
             conn.execute("ATTACH DATABASE ? AS snb",
-                         (file_uri(db_b, immutable=True),))
+                         (file_uri(db_b, immutable=False),))
         except sqlite3.Error as e:
             raise DiffError(
                 f"无法 ATTACH 快照库：{db_a} / {db_b}——"

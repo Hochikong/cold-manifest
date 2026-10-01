@@ -554,10 +554,12 @@ def generate_snapshot_report(conn: sqlite3.Connection,
 
 
 def _meta_suffix(m: "dict | None") -> str:
-    """快照采集时间等后缀（已转义拼接）。"""
+    """快照昵称标签、采集时间等后缀（已转义拼接）。"""
     if not m:
         return ""
     parts = []
+    if m.get("label"):
+        parts.append(_esc(m["label"]))
     if m.get("collected_at"):
         parts.append(f"采集 {_esc(m['collected_at'])}")
     if m.get("total_bytes") is not None:

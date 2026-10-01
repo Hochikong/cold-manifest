@@ -21,6 +21,7 @@ from .api.routes_diffs import router as diffs_router
 from .api.routes_disks import router as disks_router
 from .api.routes_duplicates import router as duplicates_router
 from .api.routes_imports import router as imports_router
+from .api.routes_labels import router as labels_router
 from .api.routes_misc import router as misc_router
 from .api.routes_search import router as search_router
 from .api.routes_snapshots import router as snapshots_router
@@ -53,6 +54,10 @@ def create_app(data_root: "str | None" = None) -> FastAPI:
     async def validation_to_400(request: Request, exc: RequestValidationError) -> JSONResponse:
         return JSONResponse({"detail": exc.errors()}, status_code=400)
 
+    # 快照库 DatabaseError（malformed 等）→ 可读 409/500，不再裸 traceback（P0）
+    from .api.state import install_snapshot_error_handler
+    install_snapshot_error_handler(app)
+
     # /api 路由（必须先于静态 mount 注册）
     # duplicates_router 须先于 snapshots_router：后者有 /{snapshot_id:path}
     # catch-all，会吞掉 .../duplicates 后缀（见 routes_duplicates.py 头注）
@@ -68,6 +73,7 @@ def create_app(data_root: "str | None" = None) -> FastAPI:
     app.include_router(trends_router)
     app.include_router(search_router)
     app.include_router(admin_router)
+    app.include_router(labels_router)
 
     if _FRONTEND_DIST.is_dir():
         app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="spa")

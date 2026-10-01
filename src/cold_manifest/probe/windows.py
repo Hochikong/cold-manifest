@@ -267,20 +267,24 @@ def probe_path_win(
     text = run_powershell(build_powershell_command(letter))
     volume, info = parse_windows_json(text, letter)
 
-    # smartctl 可选增强（P4-②）：拿不到不阻断；设备用 PhysicalDrive<N>（盘符在
-    # Windows 版 smartctl 下对 USB 桥盘常无效）
+    # smartctl 可选增强（P4-②）：拿不到不阻断。设备定位走 smart.smart_device：
+    # Windows USB 桥实测定案——\\.\PhysicalDriveN 常打不开，优先用
+    # smartctl --scan 的 /dev/sdN + 扫描建议类型；CLDM_SMARTCTL_DEVICE 可直接覆盖
     if smartctl:
         try:
-            from ..smart import parse_smart, read_smart_verbose
+            from ..smart import parse_smart, read_smart_verbose, smart_device
 
             data = json.loads(text)
             idx = (data.get("disk") or {}).get("index")
-            device = f"\\\\.\\PhysicalDrive{idx}" if isinstance(idx, int) else f"{letter}:"
-            res = read_smart_verbose(device)
+            device, suggested = smart_device(
+                idx if isinstance(idx, int) else None, letter)
+            res = read_smart_verbose(device, suggested_type=suggested)
+            info.smart_attempts = res.get("attempts") or None
             if res["ok"]:
                 info.smart_raw = res["raw"]
                 info.smart_device_type = res["device_type"]
-                parsed = parse_smart(res["raw"])
+                parsed = parse_smart(res["raw"],
+                                     exit_status=res.get("exit_status"))
                 info.physical_model = parsed.get("model") or info.physical_model
                 if parsed.get("serial"):
                     info.physical_serial = parsed["serial"]
@@ -288,7 +292,10 @@ def probe_path_win(
                         info.disk_serial = parsed["serial"]
                         info.serial_source = "smartctl"
                 info.firmware = info.firmware or (parsed.get("firmware") or "")
+                if info.capacity_bytes is None and parsed.get("capacity_bytes"):
+                    info.capacity_bytes = parsed["capacity_bytes"]
                 info.smart_status = parsed.get("health") or "unavailable"
+                info.smart_exit_status = res.get("exit_status")
             else:
                 # 拿不到不阻断，但留下可诊断原因（Windows 常见：需要管理员权限）
                 info.smart_error = res["message"]

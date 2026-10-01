@@ -1,5 +1,6 @@
 """API 进程内状态：catalog 连接 + 快照库只读连接 LRU 池（§6.1）。"""
 
+import logging
 import sqlite3
 from collections import OrderedDict
 from pathlib import Path
@@ -33,8 +34,12 @@ class AppState:
         return self._catalog
 
     def snapshot_db(self, snapshot_id: str) -> sqlite3.Connection:
-        """按 snapshot_id 取快照库只读连接（immutable），LRU 缓存。
+        """按 snapshot_id 取快照库只读连接（mode=ro，不用 immutable），LRU 缓存。
 
+        不用 immutable=1：封库后快照仍会被就地写（hash / build-fts /
+        build-stats），immutable 声明的"文件永不变化"不成立，写入后旧连接
+        读到错乱页会报假 malformed（见 db.open_snapshot docstring）。
+        因此写快照库的任务必须配合 evict_snapshot 逐出池连接。
         snapshot_id 不存在或库文件缺失时抛 LookupError。
         """
         conn = self._snap_pools.get(snapshot_id)
@@ -100,3 +105,31 @@ def get_state(request: Any) -> AppState:
     """FastAPI 依赖：从 app.state 取 AppState。"""
     state: AppState = request.app.state.cldm
     return state
+
+
+def install_snapshot_error_handler(app: Any) -> None:
+    """注册 sqlite3.DatabaseError 全局处理器（app 级，覆盖所有 /api 路由）。
+
+    背景：快照库读取失败（尤其 "database disk image is malformed"）过去会
+    裸 500 + traceback。malformed 多为历史 immutable 连接在库被就地写
+    （hash / build-fts / build-stats）后读到错乱页的"假损坏"——文件没坏，
+    重启服务即恢复。这里转成可读中文响应；原文进服务端日志。
+    """
+    from fastapi.responses import JSONResponse
+
+    log = logging.getLogger(__name__)
+
+    @app.exception_handler(sqlite3.DatabaseError)
+    async def _snapshot_db_error(request: Any, exc: sqlite3.DatabaseError) -> Any:
+        log.error("快照库读取失败（%s %s）：%s",
+                  getattr(request, "method", "?"),
+                  getattr(getattr(request, "url", None), "path", "?"),
+                  exc, exc_info=exc)
+        msg = str(exc).lower()
+        if "malformed" in msg or "not a database" in msg or "encrypted" in msg:
+            return JSONResponse(
+                {"detail": "快照库读取失败，可能被并发写入影响：请重启服务后重试；"
+                           "仍失败可用 `cldm integrity-check <快照ID>` 自查，"
+                           "必要时重新采集"},
+                status_code=409)
+        return JSONResponse({"detail": f"快照库读取失败：{exc}"}, status_code=500)

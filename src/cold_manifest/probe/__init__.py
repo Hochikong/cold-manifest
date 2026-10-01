@@ -44,6 +44,8 @@ class DiskInfo:
     smart_device_type: str = ""  # smartctl -d 生效类型（"" = 默认参数即成功，"sat" = 重试生效）
     smart_error: str | None = None  # SMART 拿不到时的人话原因（可诊断）
     smart_error_raw: str | None = None  # 失败现场 stderr 片段（≤2KB，诊断用）
+    smart_attempts: "list | None" = None  # smartctl 类型兜底链逐次尝试记录
+    smart_exit_status: "int | None" = None  # 生效那次的 smartctl exit_status
 
 
 @dataclass

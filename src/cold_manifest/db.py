@@ -20,6 +20,10 @@ def file_uri(path: "str | Path", *, immutable: bool = True, mode: str = "ro") ->
     可写打开（mode='rwc'/'rw'）必须配套 sqlite3.connect(..., uri=True)，
     否则 URI 会被当成字面文件名——且主连接未开 SQLITE_OPEN_URI 时
     ATTACH 的 file: URI 也不按 URI 解析（Windows 编译期默认关）。
+
+    immutable 只保留给"确定不会再变"的场景（如读取盘上副本、比对期间
+    的临时物化库）。封库后的 snapshot.db 仍会被就地写（hash /
+    build-fts / build-stats），immutable 的"文件永不变化"前提不成立。
     """
     p = Path(path)
     if not p.is_absolute():
@@ -32,12 +36,15 @@ def file_uri(path: "str | Path", *, immutable: bool = True, mode: str = "ro") ->
 
 
 def open_snapshot(path: "str | Path", check_same_thread: bool = True) -> sqlite3.Connection:
-    """只读打开快照库。
+    """只读打开快照库（mode=ro，普通只读，**不用** immutable=1）。
 
-    immutable=1 声明文件不再变化：跳过锁与缓存校验，只读查询最快
-    （封库后的 snapshot.db 是不可变制品）。
+    为什么不用 immutable=1：immutable 向 SQLite 声明"文件永不变化"，会跳过
+    锁与缓存失效校验。但封库后的 snapshot.db 仍会被就地写（hash / build-fts /
+    build-stats 回填），前提不成立——写入后旧 immutable 连接读到过期/错乱页，
+    表现为 "database disk image is malformed"（文件其实没坏，重启服务即
+    "恢复"）。这正是 Windows 实机上那类"假损坏"的根因。
     """
-    conn = sqlite3.connect(file_uri(path, immutable=True), uri=True,
+    conn = sqlite3.connect(file_uri(path, immutable=False), uri=True,
                            check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     return conn
@@ -82,6 +89,12 @@ def _migrate_catalog(conn: sqlite3.Connection) -> None:
     ):
         if name not in cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {decl}")
+
+    # 昵称列（P1）：disks / volumes 各加 nickname TEXT，幂等
+    for table in ("disks", "volumes"):
+        tcols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if tcols and "nickname" not in tcols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN nickname TEXT")
     conn.commit()
 
 

@@ -757,11 +757,12 @@ _KIND_BUILD_STATS = "build_stats"
 
 
 def _evict_snapshot_pools(snapshot_id: str) -> None:
-    """就地重建索引/预计算后，逐出 API 进程内该快照的只读连接池缓存。
+    """就地写快照库（build_fts/build_stats/hash）前后，逐出 API 进程内该快照的池连接。
 
-    池内连接是 immutable 打开的：build_fts/build_stats 改了库文件后旧连接
-    看不到新表。任务在 API 进程内执行时同步逐出（uvicorn 的模块级 app）；
-    经 CLI 等其他途径执行时静默跳过。
+    池连接虽已是 mode=ro 普通只读（不再 immutable），但旧连接仍持文件句柄与
+    页缓存；写任务执行前逐出避免与在途读交叉，执行后逐出让后续读拿到新连接、
+    并在 Windows 上释放旧句柄。任务在 API 进程内执行时同步逐出（uvicorn 的
+    模块级 app）；经 CLI 等其他途径执行时静默跳过。
     """
     try:
         from ..server import app as _app
@@ -949,8 +950,18 @@ class HashBody(BaseModel):
 
 
 def _run_hash(payload: dict, progress_cb: Any, cancel_event: Any = None) -> dict:
-    """工作线程执行体（经 tasks._FN_REGISTRY 调用）：持 data_root 锁同步哈希。"""
-    return run_hash_task(payload, progress_cb, cancel_event)
+    """工作线程执行体（经 tasks._FN_REGISTRY 调用）：持 data_root 锁同步哈希。
+
+    哈希会就地写快照库（回填 entries.hash_*），与 build-fts/build-stats 一样
+    必须写前/写后逐出该快照的池连接（_evict_snapshot_pools）：写前避免带旧
+    连接写、写后让后续读拿到新连接。任务跑在 TaskRunner 工作线程里拿不到
+    request/app state，复用 build-* 的"模块级 app 查找、CLI 下静默跳过"路径。
+    """
+    _evict_snapshot_pools(payload["snapshot_id"])       # 写前逐出
+    try:
+        return run_hash_task(payload, progress_cb, cancel_event)
+    finally:
+        _evict_snapshot_pools(payload["snapshot_id"])   # 写后逐出
 
 
 register_task_fn(_KIND_HASH, _run_hash)

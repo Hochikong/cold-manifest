@@ -177,6 +177,8 @@ def test_device_for_path_win(monkeypatch, tmp_path):
     from cold_manifest import smart
 
     monkeypatch.setattr(smart.sys, "platform", "win32")
+    # 屏蔽真实 smartctl --scan：无扫描结果 → PhysicalDrive 回退
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [])
 
     # 提供 disk_index → PhysicalDrive
     assert smart.device_for_path("E:\\data", disk_index=3) == "\\\\.\\PhysicalDrive3"

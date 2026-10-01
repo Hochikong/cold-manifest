@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from ..diff_engine import (DiffError, diff_db_path, iter_diff_csv, materialize_diff,
                            _read_evidence, _read_hints)
+from ..catalog import snapshot_label
 from ..report import generate_diff_report
 from .pagination import decode_cursor, encode_cursor
 from ..db import file_uri
@@ -111,6 +112,12 @@ def create_diff(body: DiffCreateBody, request: Request) -> dict:
 # ---------------------------------------------------------------- 状态 / summary
 
 
+def _diff_labels(state: AppState, a: "str | None", b: "str | None") -> dict:
+    """两侧昵称标签（卷昵 → 盘昵 → 空串），供 detail/summary 响应。"""
+    return {"a": snapshot_label(state.catalog, a or ""),
+            "b": snapshot_label(state.catalog, b or "")}
+
+
 @router.get("/{diff_id}")
 def diff_detail(diff_id: str, request: Request) -> dict:
     """状态 / 选项 / 分类计数（catalog.diff_runs + 结果库 diff_meta）。"""
@@ -130,6 +137,7 @@ def diff_detail(diff_id: str, request: Request) -> dict:
     hints = _read_hints(diff_db_path(state.data_root, diff_id))
     if hints:
         detail["hints"] = hints
+    detail["labels"] = _diff_labels(state, detail.get("a"), detail.get("b"))
     return detail
 
 
@@ -178,6 +186,10 @@ def diff_summary(diff_id: str, request: Request,
         hints = _read_hints(diff_db_path(state.data_root, diff_id))
         if hints:
             payload["hints"] = hints
+        run = state.catalog.execute(
+            "SELECT a, b FROM diff_runs WHERE diff_id=?", (diff_id,)).fetchone()
+        payload["labels"] = _diff_labels(
+            state, run["a"] if run else None, run["b"] if run else None)
         return payload
     finally:
         conn.close()
@@ -302,7 +314,8 @@ def diff_report(
                 (sid,)).fetchone()
             if row:
                 snap_meta[side] = {"collected_at": row["collected_at"],
-                                   "total_bytes": row["total_bytes"]}
+                                   "total_bytes": row["total_bytes"],
+                                   "label": snapshot_label(state.catalog, sid)}
         buf = io.StringIO()
         try:
             generate_diff_report(diff_db_path(state.data_root, diff_id), buf,
