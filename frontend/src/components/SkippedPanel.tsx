@@ -6,12 +6,12 @@ import {
   Select,
   Space,
   Statistic,
-  Table,
   Tag,
   Typography,
 } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import ErrorAlert from './ErrorAlert'
+import ResizableTable from './ResizableTable'
 import { useSkipped, useSnapshot } from '../api/hooks'
 import { formatNumber } from '../utils/format'
 import { getSkipped, type SkippedItem, type SkippedResponse } from '../api/client'
@@ -193,7 +193,8 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
           </Button>
         }
       >
-        <Table
+        <ResizableTable
+          tableId="skipped"
           rowKey={(r) => `${r.path}\u0000${r.warning_type}`}
           size="small"
           loading={isLoading}
@@ -201,6 +202,7 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
           columns={columns}
           dataSource={items}
           pagination={false}
+          scroll={{ x: 'max-content' }}
           locale={{ emptyText: <Empty description={isLoading ? '加载中…' : '没有跳过项（采集完整）'} /> }}
         />
         {cursor && (

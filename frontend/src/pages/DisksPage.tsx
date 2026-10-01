@@ -1,9 +1,10 @@
-import { Card, Table, Typography, Empty, Spin, Tag } from 'antd'
+import { Card, Typography, Empty, Spin, Tag } from 'antd'
 import { CheckCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons'
 import { useDisks } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
 import DiskDetailPanel from '../components/DiskDetailPanel'
+import ResizableTable from '../components/ResizableTable'
 import { formatFileSize, formatNumber, truncateMiddle } from '../utils/format'
 import type { Disk } from '../api/client'
 
@@ -79,13 +80,15 @@ export default function DisksPage() {
       {isLoading && <Spin style={{ display: 'block', margin: '32px auto' }} />}
       <Card>
         {data?.items.length ? (
-          <Table
+          <ResizableTable
+            tableId="disks"
             rowKey="disk_id"
             size="small"
             tableLayout="fixed"
             columns={columns}
             dataSource={data.items}
             pagination={{ pageSize: 20 }}
+            scroll={{ x: 'max-content' }}
             expandable={{
               expandedRowRender: (record: Disk) => <DiskDetailPanel disk_id={record.disk_id} />,
               rowExpandable: () => true,

@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Button, Descriptions, Drawer, Empty, Space, Spin, Table, Tabs, Tag, Typography } from 'antd'
+import { Button, Descriptions, Drawer, Empty, Space, Spin, Tabs, Tag, Typography } from 'antd'
 import type { TableProps } from 'antd'
 import { useVolumeDetail } from '../api/hooks'
 import type { VolumeDetailSnapshot } from '../api/client'
 import ErrorAlert from './ErrorAlert'
 import VolumeTrendsChart from './VolumeTrendsChart'
+import ResizableTable from './ResizableTable'
 import { formatDateTime, formatFileSize, formatNumber } from '../utils/format'
 
 const { Text } = Typography
@@ -99,13 +100,15 @@ export default function VolumeDetailDrawer({ volumeId, onClose }: VolumeDetailDr
               key: 'snapshots',
               label: `快照（${vol.snapshots.length}）`,
               children: vol.snapshots.length ? (
-                <Table<VolumeDetailSnapshot>
+                <ResizableTable<VolumeDetailSnapshot>
+                  tableId="volume-snapshots"
                   rowKey="snapshot_id"
                   size="small"
                   tableLayout="fixed"
                   columns={snapshotColumns}
                   dataSource={vol.snapshots}
                   pagination={{ pageSize: 8, hideOnSinglePage: true }}
+                  scroll={{ x: 'max-content' }}
                   onRow={(record) => ({
                     onClick: () => navigate(`/snapshots?snapshot=${encodeURIComponent(record.snapshot_id)}&tab=overview`),
                     style: { cursor: 'pointer' },

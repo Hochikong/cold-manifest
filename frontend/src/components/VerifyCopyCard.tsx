@@ -8,7 +8,6 @@ import {
   Modal,
   Radio,
   Space,
-  Table,
   Tag,
   Typography,
 } from 'antd'
@@ -16,6 +15,7 @@ import { CloseOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
 import { useVerifyCopy } from '../api/hooks'
 import { apiErrorDetail, type VerifyCopyReport, type VerifyCopySample } from '../api/client'
+import ResizableTable from '../components/ResizableTable'
 
 const { Text } = Typography
 
@@ -218,11 +218,13 @@ export function VerifyCopyResultCard({
           <Text strong style={{ display: 'block', margin: '12px 0 8px' }}>
             异常明细（前 {Math.min(abnormal.length, 10)} 条，共 {abnormal.length} 条）
           </Text>
-          <Table
+          <ResizableTable
+            tableId="verify-copy"
             rowKey="path"
             size="small"
             tableLayout="fixed"
             pagination={false}
+            scroll={{ x: 'max-content' }}
             dataSource={abnormal.slice(0, 10)}
             columns={[
               { title: '路径', dataIndex: 'path', ellipsis: true },

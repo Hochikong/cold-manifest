@@ -65,6 +65,7 @@ import {
 } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
+import ResizableTable from '../components/ResizableTable'
 import DuplicateReport from '../components/DuplicateReport'
 import HashPanel from '../components/HashPanel'
 import SkippedPanel from '../components/SkippedPanel'
@@ -414,7 +415,16 @@ function SnapshotListView({
       {loading && <Spin style={{ display: 'block', margin: '32px auto' }} />}
       <Card>
         {visibleRows?.length ? (
-          <Table rowKey="snapshot_id" size="small" tableLayout="fixed" columns={columns} dataSource={visibleRows} pagination={{ pageSize: 10 }} />
+          <ResizableTable
+            tableId="snapshots"
+            rowKey="snapshot_id"
+            size="small"
+            tableLayout="fixed"
+            columns={columns}
+            dataSource={visibleRows}
+            pagination={{ pageSize: 10 }}
+            scroll={{ x: 'max-content' }}
+          />
         ) : (
           <Empty description={pinnedOnly ? '暂无置顶快照' : volumeFilter ? '该卷暂无快照' : '暂无快照'} />
         )}
@@ -1152,7 +1162,8 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
         </Col>
         <Col xs={24} md={17} lg={19}>
           <Card>
-            <Table
+            <ResizableTable
+              tableId="browse-entries"
               rowKey="entry_id"
               size="small"
               loading={entriesLoading}
@@ -1160,6 +1171,7 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
               columns={columns}
               dataSource={allItems}
               pagination={false}
+              scroll={{ x: 'max-content' }}
               onChange={onTableChange}
               onRow={(record) => ({
                 onContextMenu: (e) => rowMenu.open(e, browseTarget(record)),
@@ -1480,13 +1492,15 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
         <Card title={`搜索结果（${formatNumber(results.length)} 条）`}>
           {results.length ? (
             <>
-              <Table
+              <ResizableTable
+                tableId="snapshot-search"
                 rowKey="entry_id"
                 size="small"
                 tableLayout="fixed"
                 columns={columns}
                 dataSource={results}
                 pagination={false}
+                scroll={{ x: 'max-content' }}
                 onRow={(record) => ({
                   onContextMenu: (e) => rowMenu.open(e, searchTarget(record)),
                 })}

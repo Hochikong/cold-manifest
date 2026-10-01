@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Card, Table, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal, Drawer, Select, Tooltip } from 'antd'
+import { Card, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal, Drawer, Select, Tooltip } from 'antd'
 import { ReloadOutlined, StopOutlined, ApartmentOutlined } from '@ant-design/icons'
 import { useTasks, useCancelTask, useBatch } from '../api/hooks'
 import { listTasks, type Task, type Batch, type TaskStatus } from '../api/client'
@@ -9,6 +9,7 @@ import EllipsisText from '../components/EllipsisText'
 import { useShowApiError } from '../utils/apiError'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatDateTime } from '../utils/format'
+import ResizableTable from '../components/ResizableTable'
 
 const { Text } = Typography
 const PAGE_SIZE = 20
@@ -384,14 +385,15 @@ export default function TasksPage() {
         <Spin style={{ display: 'block', margin: '32px auto' }} />
       ) : visibleItems.length ? (
         <>
-          <Table
+          <ResizableTable
+            tableId="tasks"
             rowKey="id"
             size="small"
             tableLayout="fixed"
             columns={columns}
             dataSource={visibleItems}
             pagination={false}
-            scroll={{ x: 960 }}
+            scroll={{ x: 'max-content' }}
           />
           {hasMore && !typeFilter && (
             <div style={{ textAlign: 'center', marginTop: 16 }}>

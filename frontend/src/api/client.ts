@@ -680,6 +680,8 @@ export interface DiffRun {
   diff_id: string
   a: string
   b: string
+  /** A/B 快照的人类可读标签（卷昵称 · 时间戳目录），可能为空串；后端未上线时缺失 */
+  labels?: { a: string; b: string }
   options_hash: string
   created_at: string
   duration_ms: number
@@ -693,11 +695,17 @@ export interface DiffRun {
 
 export interface DiffsResponse {
   items: DiffRun[]
-  count: number
+  has_more: boolean
+  next_cursor: string | null
 }
 
-export async function listDiffs(): Promise<DiffsResponse> {
-  const { data } = await client.get('/diffs')
+export interface ListDiffsParams {
+  limit?: number
+  cursor?: string
+}
+
+export async function listDiffs(params: ListDiffsParams = {}): Promise<DiffsResponse> {
+  const { data } = await client.get('/diffs', { params })
   return data
 }
 

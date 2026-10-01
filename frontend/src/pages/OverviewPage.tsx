@@ -37,7 +37,7 @@ export default function OverviewPage() {
   const [collectOpen, setCollectOpen] = useState(false)
   const { data: volumes, isLoading: volLoading, error: volError } = useVolumes()
   const { data: snapshots, isLoading: snapLoading, error: snapError } = useSnapshots()
-  const { data: diffs, isLoading: diffLoading, error: diffError } = useDiffs()
+  const { data: diffs, isLoading: diffLoading, error: diffError } = useDiffs({ limit: 20 })
 
   const latestSnapshot = useMemo(() => {
     if (!snapshots?.items.length) return null
@@ -140,7 +140,7 @@ export default function OverviewPage() {
           <Card>
             <Statistic
               title="历史对比任务"
-              value={diffs?.count ?? 0}
+              value={diffs?.items.length ?? 0}
               prefix={<SwapOutlined />}
             />
           </Card>

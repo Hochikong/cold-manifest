@@ -9,7 +9,6 @@ import {
   Select,
   Space,
   Spin,
-  Table,
   Typography,
   Button,
 } from 'antd'
@@ -17,6 +16,7 @@ import type { TableProps } from 'antd'
 import { FileOutlined, FolderOutlined, SearchOutlined } from '@ant-design/icons'
 import { useGlobalSearch, useSnapshots, useVolumes } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import ResizableTable from '../components/ResizableTable'
 import { useRowContextMenu } from '../hooks/useRowContextMenu'
 import { formatDateTime, formatFileSize, formatNumber, nsToDate } from '../utils/format'
 import { dirNameOf, snapshotBrowseUrl } from '../utils/path'
@@ -246,13 +246,15 @@ export default function SearchPage() {
           title={`搜索结果（已加载 ${formatNumber(items.length)} 条）`}
           extra={scanned && <Text type="secondary">已搜 {formatNumber(scanned.snapshots)} 个快照</Text>}
         >
-          <Table<GlobalSearchItem>
+          <ResizableTable<GlobalSearchItem>
+            tableId="search"
             rowKey={(r) => `${r.snapshot_id}:${r.entry_id}`}
             size="small"
             tableLayout="fixed"
             columns={columns}
             dataSource={items}
             pagination={false}
+            scroll={{ x: 'max-content' }}
             loading={isFetching && items.length > 0}
             onRow={(record) => ({
               onClick: () => navigate(snapshotBrowseUrl(record.snapshot_id, record.type === 'dir' ? record.path : dirNameOf(record.path))),

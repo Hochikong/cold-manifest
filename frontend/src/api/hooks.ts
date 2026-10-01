@@ -29,6 +29,7 @@ import {
   getDiff,
   getDiffSummary,
   listDiffEntries,
+  type ListDiffsParams,
   scanImports,
   createImport,
   importDb,
@@ -266,10 +267,10 @@ export function useDuplicates(
   })
 }
 
-export function useDiffs() {
+export function useDiffs(params: ListDiffsParams = {}) {
   return useQuery({
-    queryKey: ['diffs'],
-    queryFn: listDiffs,
+    queryKey: ['diffs', params],
+    queryFn: () => listDiffs(params),
     staleTime: 30_000,
   })
 }

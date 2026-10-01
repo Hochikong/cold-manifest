@@ -13,7 +13,6 @@ import {
   Skeleton,
   Space,
   Statistic,
-  Table,
   Tag,
   Tooltip,
   Typography,
@@ -26,6 +25,7 @@ import {
 } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import ErrorAlert from './ErrorAlert'
+import ResizableTable from './ResizableTable'
 import EllipsisText from './EllipsisText'
 import { useRowContextMenu } from '../hooks/useRowContextMenu'
 import { useShowApiError } from '../utils/apiError'
@@ -436,13 +436,14 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
               <Skeleton active paragraph={{ rows: 6 }} />
             ) : allItems.length ? (
               <>
-                <Table<DuplicateItem>
+                <ResizableTable<DuplicateItem>
+                  tableId="duplicates"
                   rowKey={(r) => r.hash_hex ?? r.name ?? String(r.size_bytes)}
                   size="small"
                   tableLayout="fixed"
                   pagination={false}
                   loading={fetchingDuplicates || loadingMore}
-                  scroll={{ x: 880 }}
+                  scroll={{ x: 'max-content' }}
                   expandable={{
                     expandedRowRender: (record) => (
                       <Space orientation="vertical" style={{ width: '100%' }}>

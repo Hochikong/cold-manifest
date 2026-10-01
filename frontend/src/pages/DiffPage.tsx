@@ -33,11 +33,12 @@ import ReactECharts from 'echarts-for-react'
 import { useSnapshots, useDiffs, useDiff, useDiffSummary, useDiffEntries, useCreateDiff } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
+import ResizableTable from '../components/ResizableTable'
 import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
 import { useShowApiError } from '../utils/apiError'
 import { formatFileSize, formatDateTime, nsToDate } from '../utils/format'
 import { dirNameOf } from '../utils/path'
-import { apiErrorDetail, exportDiffUrl, diffReportUrl, listDiffEntries, type DiffEntry } from '../api/client'
+import { apiErrorDetail, exportDiffUrl, diffReportUrl, listDiffEntries, listDiffs, type DiffEntry, type DiffRun } from '../api/client'
 
 const { Title, Text } = Typography
 
@@ -112,10 +113,80 @@ export default function DiffPage() {
 
 function DiffSelector() {
   const { data: snapshots, isLoading: snapLoading, error: snapError } = useSnapshots()
-  const { data: diffs, isLoading: diffLoading, error: diffError } = useDiffs()
+  // 历史对比列表：首页 20 条，has_more 时点「加载更多」追加（keyset cursor，不整页重拉）
+  const { data: firstPage, isLoading: diffLoading, error: diffError } = useDiffs({ limit: 20 })
+  const [moreItems, setMoreItems] = useState<DiffRun[]>([])
+  const [cursor, setCursor] = useState<string | null>(null)
+  const [hasMore, setHasMore] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
   const create = useCreateDiff()
   const showApiError = useShowApiError()
   const navigate = useNavigate()
+
+  // 首页数据变化（刷新 / 发起新对比后 invalidate）→ 重置追加页（渲染期同步，避免 effect 级联）
+  const [syncedFirst, setSyncedFirst] = useState(firstPage)
+  if (firstPage !== syncedFirst) {
+    setSyncedFirst(firstPage)
+    setMoreItems([])
+    setCursor(firstPage?.next_cursor ?? null)
+    setHasMore(firstPage?.has_more ?? false)
+  }
+
+  const loadMoreDiffs = async () => {
+    if (!cursor) return
+    setLoadingMore(true)
+    try {
+      const res = await listDiffs({ limit: 20, cursor })
+      setMoreItems((prev) => [...prev, ...res.items])
+      setCursor(res.next_cursor)
+      setHasMore(res.has_more)
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
+  const diffItems = useMemo(() => [...(firstPage?.items || []), ...moreItems], [firstPage, moreItems])
+
+  const historyColumns: TableProps<DiffRun>['columns'] = [
+    {
+      title: 'ID',
+      dataIndex: 'diff_id',
+      width: 280,
+      ellipsis: true,
+      render: (v: string) => (
+        <Tooltip title={v}>
+          <Button type="link" style={{ padding: 0 }} onClick={() => navigate(`/diff?id=${v}`)}>{v}</Button>
+        </Tooltip>
+      ),
+    },
+    {
+      title: 'A',
+      dataIndex: 'a',
+      width: 260,
+      ellipsis: true,
+      render: (_v: string, record) => <EllipsisText value={record.labels?.a || record.a} code />,
+    },
+    {
+      title: 'B',
+      dataIndex: 'b',
+      width: 260,
+      ellipsis: true,
+      render: (_v: string, record) => <EllipsisText value={record.labels?.b || record.b} code />,
+    },
+    { title: '创建时间', dataIndex: 'created_at', width: 150, render: (v: string) => formatDateTime(v) },
+    { title: '耗时', dataIndex: 'duration_ms', width: 90, render: (v: number) => `${(v / 1000).toFixed(1)} 秒` },
+    {
+      title: '差异',
+      width: 190,
+      render: (_, record) => (
+        <Space size={4}>
+          <Tag color="green">+{record.summary?.added ?? 0}</Tag>
+          <Tag color="red">-{record.summary?.removed ?? 0}</Tag>
+          <Tag color="orange">~{record.summary?.size_changed ?? 0}</Tag>
+        </Space>
+      ),
+    },
+  ]
 
   const [a, setA] = useState<string | undefined>(undefined)
   const [b, setB] = useState<string | undefined>(undefined)
@@ -270,42 +341,26 @@ function DiffSelector() {
       <Card title="历史对比">
         {diffLoading ? (
           <Skeleton active />
-        ) : diffs?.items.length ? (
-          <Table
-            rowKey="diff_id"
-            size="small"
-            tableLayout="fixed"
-            pagination={{ pageSize: 10 }}
-            dataSource={diffs.items}
-            columns={[
-              {
-                title: 'ID',
-                dataIndex: 'diff_id',
-                width: 280,
-                ellipsis: true,
-                render: (v: string) => (
-                  <Tooltip title={v}>
-                    <Button type="link" style={{ padding: 0 }} onClick={() => navigate(`/diff?id=${v}`)}>{v}</Button>
-                  </Tooltip>
-                ),
-              },
-              { title: 'A', dataIndex: 'a', ellipsis: true, render: (v: string) => <EllipsisText value={v} code /> },
-              { title: 'B', dataIndex: 'b', ellipsis: true, render: (v: string) => <EllipsisText value={v} code /> },
-              { title: '创建时间', dataIndex: 'created_at', width: 150, render: (v: string) => formatDateTime(v) },
-              { title: '耗时', dataIndex: 'duration_ms', width: 90, render: (v: number) => `${(v / 1000).toFixed(1)} 秒` },
-              {
-                title: '差异',
-                width: 190,
-                render: (_: unknown, record: { summary: Record<string, number | null> }) => (
-                  <Space size={4}>
-                    <Tag color="green">+{record.summary?.added ?? 0}</Tag>
-                    <Tag color="red">-{record.summary?.removed ?? 0}</Tag>
-                    <Tag color="orange">~{record.summary?.size_changed ?? 0}</Tag>
-                  </Space>
-                ),
-              },
-            ]}
-          />
+        ) : diffItems.length ? (
+          <>
+            <ResizableTable<DiffRun>
+              tableId="diff-history"
+              rowKey="diff_id"
+              size="small"
+              tableLayout="fixed"
+              pagination={false}
+              scroll={{ x: 'max-content' }}
+              dataSource={diffItems}
+              columns={historyColumns}
+            />
+            {hasMore && (
+              <div style={{ textAlign: 'center', marginTop: 16 }}>
+                <Button loading={loadingMore} onClick={() => void loadMoreDiffs()}>
+                  加载更多（已加载 {diffItems.length} 条）
+                </Button>
+              </div>
+            )}
+          </>
         ) : (
           <Empty description="暂无对比记录" />
         )}
@@ -679,7 +734,8 @@ function DiffEntriesTable({
           <Text type="secondary">仅显示以 <Text code>{trimmedPrefix}</Text> 开头的路径</Text>
         )}
       </Space>
-      <Table
+      <ResizableTable
+        tableId="diff-entries"
         rowKey="id"
         size="small"
         loading={isLoading}
@@ -687,7 +743,7 @@ function DiffEntriesTable({
         columns={columns}
         dataSource={allItems}
         pagination={false}
-        scroll={{ x: 960 }}
+        scroll={{ x: 'max-content' }}
         onChange={onTableChange}
         onRow={(record) => ({
           onContextMenu: (e) => rowMenu.open(e, rowTarget(record)),
