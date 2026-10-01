@@ -60,6 +60,19 @@ def _rowget(row: Any) -> dict:
     return dict(row)
 
 
+def display_label(vnick: "str | None", dnick: "str | None", volume_id: str) -> str:
+    """快照展示标签：与 catalog.snapshot_label 同口径，供 JOIN 结果就地计算。
+
+    卷昵（盘昵）· volume_id → 盘昵 · volume_id → ""（列表用，避免 N+1 查询）。
+    """
+    label = ""
+    if vnick:
+        label = vnick + (f"（{dnick}）" if dnick else "")
+    elif dnick:
+        label = dnick
+    return f"{label} · {volume_id}" if label else ""
+
+
 def _resolve_parent(conn: Any, parent_id: int) -> int:
     """parent_id=0 → root 条目（生产布局 entry_id=1, parent_id=0, depth=0）。
 
@@ -88,7 +101,9 @@ def list_snapshots(
            s.hash_policy, s.file_count, s.dir_count, s.total_bytes, s.total_alloc,
            s.zero_byte_count, s.max_depth, s.skipped_count, s.host_path, s.pinned,
            v.disk_id, v.filesystem, v.label, v.capacity_bytes AS volume_capacity_bytes,
-           d.physical_model, d.physical_serial, d.capacity_bytes AS disk_capacity_bytes
+           v.nickname AS volume_nickname,
+           d.physical_model, d.physical_serial, d.capacity_bytes AS disk_capacity_bytes,
+           d.nickname AS disk_nickname
     FROM snapshots s
     JOIN volumes v ON v.volume_id = s.volume_id
     LEFT JOIN disks d ON d.disk_id = v.disk_id
@@ -101,6 +116,8 @@ def list_snapshots(
     items = [_rowget(r) for r in state.catalog.execute(sql, params)]
     for item in items:
         item["pinned"] = bool(item.get("pinned"))
+        item["label"] = display_label(item.get("volume_nickname"),
+                                      item.get("disk_nickname"), item["volume_id"])
     return {"items": items, "count": len(items)}
 
 
@@ -922,11 +939,17 @@ def snapshot_detail(snapshot_id: str, request: Request) -> dict:
     row = _require_snapshot(state, snapshot_id)
     detail = _rowget(row)
     vol = state.catalog.execute(
-        "SELECT v.*, d.physical_model, d.physical_serial, d.capacity_bytes AS disk_capacity_bytes"
+        "SELECT v.*, d.physical_model, d.physical_serial,"
+        " d.capacity_bytes AS disk_capacity_bytes, d.nickname AS disk_nickname"
         " FROM volumes v LEFT JOIN disks d ON d.disk_id = v.disk_id WHERE v.volume_id=?",
         (row["volume_id"],),
     ).fetchone()
     detail["volume"] = _rowget(vol) if vol else None
+    detail["volume_nickname"] = vol["nickname"] if vol else None
+    detail["disk_nickname"] = vol["disk_nickname"] if vol else None
+    detail["label"] = (display_label(detail["volume_nickname"],
+                                     detail["disk_nickname"], row["volume_id"])
+                       if vol else "")
     copies = state.catalog.execute(
         "SELECT * FROM on_disk_copies WHERE snapshot_id=?", (snapshot_id,)
     ).fetchone()

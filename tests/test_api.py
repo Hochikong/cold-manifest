@@ -308,7 +308,7 @@ def test_volumes(client: TestClient) -> None:
 
 def test_diffs_empty(client: TestClient) -> None:
     body = client.get("/api/diffs").json()
-    assert body == {"items": [], "count": 0}
+    assert body == {"items": [], "has_more": False, "next_cursor": None}
 
 
 def test_settings(client: TestClient) -> None:

@@ -74,7 +74,7 @@ def list_disks(request: Request) -> dict:
     rows = state.catalog.execute(
         """
         SELECT d.disk_id, d.physical_model, d.physical_serial, d.bridge_model,
-               d.capacity_bytes, d.interface_type, d.first_seen, d.last_seen,
+               d.capacity_bytes, d.interface_type, d.first_seen, d.last_seen, d.nickname,
                (SELECT COUNT(*) FROM volumes v WHERE v.disk_id = d.disk_id) AS volume_count,
                (SELECT COUNT(*) FROM snapshots s JOIN volumes v2 ON s.volume_id = v2.volume_id
                 WHERE v2.disk_id = d.disk_id) AS snapshot_count

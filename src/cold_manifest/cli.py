@@ -205,6 +205,23 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="遍历 catalog 里登记的全部快照逐一自查")
     p_check.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
 
+    p_nick = sub.add_parser(
+        "nickname",
+        help="设置磁盘/分区昵称（速记名，Web UI、快照列表与比对报告会显示；"
+             "省略名字或空串=清除；最长 64 字符）")
+    nick_sub = p_nick.add_subparsers(dest="nick_target", metavar="<disk|volume>",
+                                     required=True)
+    p_nick_d = nick_sub.add_parser("disk", help="设置磁盘昵称")
+    p_nick_d.add_argument("disk_id", help="磁盘 ID（即磁盘序列号，见 cldm serve 的盘列表）")
+    p_nick_d.add_argument("name", nargs="?", default="",
+                          help="昵称（≤64 字符；省略或空串=清除）")
+    p_nick_d.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+    p_nick_v = nick_sub.add_parser("volume", help="设置分区昵称")
+    p_nick_v.add_argument("volume_id", help="分区 ID（形如 序列号_P序号，如 SN123_P1）")
+    p_nick_v.add_argument("name", nargs="?", default="",
+                          help="昵称（≤64 字符；省略或空串=清除）")
+    p_nick_v.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+
     return parser
 
 
@@ -859,6 +876,60 @@ def _cmd_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- nickname ----------------------------------------------------------------
+
+_NICKNAME_MAX = 64
+
+
+def _cmd_nickname(args: argparse.Namespace) -> int:
+    """设置/清除磁盘或分区昵称；未知 ID / 非法 volume_id → 退出码 2。"""
+    from .catalog import connect_catalog, validate_volume_id
+    from .import_legacy import LegacyImportError
+
+    data_root = Path(args.data_root)
+    if not data_root.is_dir():
+        print(f"错误：数据根不存在：{data_root}", file=sys.stderr)
+        return 2
+
+    name = (args.name or "").strip()
+    if len(name) > _NICKNAME_MAX:
+        print(f"错误：昵称过长（最多 {_NICKNAME_MAX} 字符，当前 {len(name)}）",
+              file=sys.stderr)
+        return 2
+    nickname: "str | None" = name or None  # 空串 = 清除
+
+    if args.nick_target == "volume":
+        try:
+            validate_volume_id(args.volume_id)
+        except LegacyImportError as e:
+            print(f"错误：{e}", file=sys.stderr)
+            return 2
+
+    cat = connect_catalog(data_root)
+    try:
+        table, id_col = (("disks", "disk_id") if args.nick_target == "disk"
+                         else ("volumes", "volume_id"))
+        target = getattr(args, id_col)
+        if cat.execute(f"SELECT 1 FROM {table} WHERE {id_col}=?",
+                       (target,)).fetchone() is None:
+            print(f"错误：{'盘' if table == 'disks' else '卷'}不存在：{target}",
+                  file=sys.stderr)
+            return 2
+        cat.execute(f"UPDATE {table} SET nickname=? WHERE {id_col}=?",
+                    (nickname, target))
+        cat.commit()
+    finally:
+        cat.close()
+
+    if nickname:
+        print(f"已设置{'磁盘' if args.nick_target == 'disk' else '分区'}"
+              f" {target} 昵称：{nickname}")
+    else:
+        print(f"已清除{'磁盘' if args.nick_target == 'disk' else '分区'}"
+              f" {target} 的昵称")
+    return 0
+
+
 # ---- report / rebuild-catalog / import-db -----------------------------------
 
 def _cmd_report(args: argparse.Namespace) -> int:
@@ -1135,6 +1206,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "delete":
         return _cmd_delete(args)
+
+    if args.command == "nickname":
+        return _cmd_nickname(args)
 
     if args.command == "verify-copy":
         return _cmd_verify_copy(args)
