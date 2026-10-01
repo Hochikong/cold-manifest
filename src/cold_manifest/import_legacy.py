@@ -11,6 +11,7 @@ import calendar
 import csv
 import re
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -343,6 +344,9 @@ def import_snapshot(snapshot_dir: "str | Path", data_root: "str | Path",
             ("source_dir", str(snapshot_dir.resolve())),
             ("dirs_source", "derived"),
             ("allocated_source", "logical_size_fallback"),
+            # 采集平台标记（与 collect._write_meta 同口径）：legacy v1 无此键，
+            # 导入发生在哪台机器就记当前平台（仅提示用，不参与比对语义）
+            ("os_platform", sys.platform),
             ("import_time_utc", now),
         ]
         conn.executemany("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", meta_rows)

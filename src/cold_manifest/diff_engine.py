@@ -74,6 +74,7 @@ class DiffResult:
     counts: dict = field(default_factory=dict)   # 含 content_changed/moved_or_renamed=None
     evidence_level: "str | None" = None          # "hash" | "size+mtime"
     evidence: "dict | None" = None               # 各分类的判定依据
+    hints: "list[str]" = field(default_factory=list)   # 平台提示等非结论性说明
     reused: bool = False
     elapsed_s: float = 0.0
 
@@ -635,6 +636,56 @@ def _build_evidence(db_a: Path, db_b: Path, hash_enabled: bool) -> "tuple[str, d
     return ("hash" if content_ev == "hash" else "size+mtime"), evidence
 
 
+_HINT_CASE_INSENSITIVE = (
+    "两侧快照至少一方来自 Windows（文件名大小写不敏感）；若源盘上存在仅大小写"
+    "不同的改名（如 a.txt → A.TXT），会显示为 1 条删除 + 1 条新增。"
+    "如需正确配对，可加 case_insensitive 重跑。"
+)
+
+
+def _snapshot_os_platform(db: Path) -> "str | None":
+    """快照 meta 的采集平台标记（os_platform）；旧快照无该键返回 None。"""
+    conn = open_snapshot(db)
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key='os_platform'").fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _build_hints(opts: dict, db_a: Path, db_b: Path) -> "list[str]":
+    """平台相关提示：未启用 case_insensitive 且任一侧来自 Windows 时提示（P1-4）。
+
+    旧快照无 os_platform 键时不提示（不猜测平台）。
+    """
+    if opts.get("case_insensitive", False):
+        return []
+    platforms = {_snapshot_os_platform(db_a), _snapshot_os_platform(db_b)}
+    if "win32" not in platforms:
+        return []
+    return [_HINT_CASE_INSENSITIVE]
+
+
+def _read_hints(db: Path) -> "list[str]":
+    """读 diff_meta 的 hints_json；旧结果库无该键返回 []。"""
+    if not db.is_file():
+        return []
+    conn = sqlite3.connect(file_uri(db, immutable=False), uri=True)
+    try:
+        row = conn.execute(
+            "SELECT value FROM diff_meta WHERE key='hints_json'").fetchone()
+        if not row:
+            return []
+        try:
+            hints = json.loads(row[0])
+        except json.JSONDecodeError:
+            return []
+        return hints if isinstance(hints, list) else []
+    finally:
+        conn.close()
+
+
 def _all_path_norm_present(db: Path) -> bool:
     """entries.path_norm 是否全部非空非 ''（SQL 快路径的前提）。"""
     conn = open_snapshot(db)
@@ -661,6 +712,7 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
     if not force and _read_existing_status(out_db) == "done":
         counts = _read_summary(out_db)
         ev_level, ev = _read_evidence(out_db)
+        hints = _read_hints(out_db)
         if ev is None:   # 旧库无 evidence 键：按 options/counts 推导（best effort）
             ev_level = "hash" if counts.get("content_changed") is not None else "size+mtime"
             content_ev = "hash" if ev_level == "hash" else "unavailable"
@@ -670,7 +722,7 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
                   "identical": "hash" if content_ev == "hash" else "size+mtime"}
         return DiffResult(diff_id=did, a=a, b=b, db_path=out_db, options_json=ojson,
                           options_hash=ohash, counts=counts, evidence_level=ev_level,
-                          evidence=ev, reused=True,
+                          evidence=ev, hints=hints, reused=True,
                           elapsed_s=time.monotonic() - t0)
 
     try:
@@ -748,6 +800,7 @@ def _materialize_new(data_root: Path, a: str, b: str, opts: dict, ohash: str,
             _pair_moved(conn, counts)
 
         evidence_level, evidence = _build_evidence(db_a, db_b, hash_enabled)
+        hints = _build_hints(opts, db_a, db_b)
 
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         meta_rows = [
@@ -756,6 +809,7 @@ def _materialize_new(data_root: Path, a: str, b: str, opts: dict, ohash: str,
             ("summary_json", json.dumps(counts, sort_keys=True)),
             ("evidence_level", evidence_level),
             ("evidence_json", json.dumps(evidence, sort_keys=True)),
+            ("hints_json", json.dumps(hints, ensure_ascii=False)),
         ]
         conn.executemany("INSERT OR REPLACE INTO diff_meta(key, value) VALUES(?, ?)", meta_rows)
         conn.commit()
@@ -782,7 +836,7 @@ def _materialize_new(data_root: Path, a: str, b: str, opts: dict, ohash: str,
 
     return DiffResult(diff_id=did, a=a, b=b, db_path=out_db, options_json=ojson,
                       options_hash=ohash, counts=counts, evidence_level=evidence_level,
-                      evidence=evidence, reused=False, elapsed_s=elapsed)
+                      evidence=evidence, hints=hints, reused=False, elapsed_s=elapsed)
 
 
 def _read_summary(db: Path) -> dict:

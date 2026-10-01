@@ -242,6 +242,9 @@ def _cmd_diff(args: argparse.Namespace) -> int:
                 rows += 1
         print(f"  已写出 {rows:,} 行 → {args.output}")
 
+    for h in result.hints:
+        print(f"提示：{h}")
+
     changed = sum(v for k, v in result.counts.items() if k != "identical" and v)
     return 1 if changed else 0
 

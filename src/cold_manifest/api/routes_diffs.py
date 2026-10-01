@@ -15,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..diff_engine import (DiffError, diff_db_path, iter_diff_csv, materialize_diff,
-                           _read_evidence)
+                           _read_evidence, _read_hints)
 from ..report import generate_diff_report
 from .pagination import decode_cursor, encode_cursor
 from ..db import file_uri
@@ -102,6 +102,7 @@ def create_diff(body: DiffCreateBody, request: Request) -> dict:
         "counts": result.counts,
         "evidence_level": result.evidence_level,
         "evidence": result.evidence,
+        "hints": result.hints,
         "reused": result.reused,
         "elapsed_s": round(result.elapsed_s, 3),
     }
@@ -126,6 +127,9 @@ def diff_detail(diff_id: str, request: Request) -> dict:
     if ev is not None:
         detail["evidence_level"] = ev_level
         detail["evidence"] = ev
+    hints = _read_hints(diff_db_path(state.data_root, diff_id))
+    if hints:
+        detail["hints"] = hints
     return detail
 
 
@@ -171,6 +175,9 @@ def diff_summary(diff_id: str, request: Request,
         if ev is not None:
             payload["evidence_level"] = ev_level
             payload["evidence"] = ev
+        hints = _read_hints(diff_db_path(state.data_root, diff_id))
+        if hints:
+            payload["hints"] = hints
         return payload
     finally:
         conn.close()

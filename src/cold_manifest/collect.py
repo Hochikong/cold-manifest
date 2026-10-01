@@ -463,6 +463,15 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         raise CollectError(f"扫描根不存在或不是目录：{scan_root}")
     data_root = Path(data_root)
 
+    # 长路径预警（P2-2）：仅 Windows 且扫描根路径超长时提醒；Linux 不触发。
+    # 仅警告不阻断——深层文件是否真的超 MAX_PATH 取决于实际目录深度。
+    long_path_warning = (
+        sys.platform == "win32" and len(str(scan_root)) > 200)
+    if long_path_warning:
+        warnings.append(
+            "long_path=扫描根路径超过 200 字符：建议启用 Windows 长路径支持"
+            "（组策略/注册表 LongPathsEnabled），否则深层文件可能因 MAX_PATH 限制采集失败")
+
     def _check_cancel() -> None:
         if cancel_event is not None and cancel_event.is_set():
             raise CollectCancelled("采集已取消")
@@ -584,6 +593,14 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
                              " VALUES('resume_state', 'incomplete')")
                 writer = _SQLiteEntryWriter(conn)
                 journal = ScanJournal(dest_dir, on_flush=conn.commit)
+            if long_path_warning:
+                # skipped 表留痕（与 warnings 列表同内容，快照内可查）
+                conn.execute(
+                    "INSERT OR IGNORE INTO skipped(path, warning_type, stage, detail)"
+                    " VALUES(?, 'long_path', 'probe', ?)",
+                    (str(scan_root),
+                     "扫描根路径超过 200 字符：建议启用 Windows 长路径支持"
+                     "（LongPathsEnabled），否则深层文件可能因 MAX_PATH 采集失败"))
             _check_cancel()
 
             def _journal_record(rel: str) -> None:
