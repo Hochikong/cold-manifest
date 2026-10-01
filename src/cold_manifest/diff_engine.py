@@ -280,7 +280,7 @@ def _pair_moved(conn: sqlite3.Connection, counts: dict) -> None:
 def _cls_expr(alias_a: str, alias_b: str, colmap: "dict | None" = None) -> str:
     """分类 CASE 表达式（与 _classify 逐分支等价）。
 
-    :hashp/?2/?3 参数为 1/0（hash 是否启用、ignore_size、ignore_mtime）。
+    :hashp / :ig_s / :ig_m 参数为 1/0（hash 是否启用、ignore_size、ignore_mtime）。
     NULL 比较统一用 IS / IS NOT——Python 的 None != None 为 False（视为相等），
     IS 语义一致。
     colmap：B 侧别名列名映射（bside 紧凑副本的列名与 entries 不同）。
@@ -294,13 +294,13 @@ def _cls_expr(alias_a: str, alias_b: str, colmap: "dict | None" = None) -> str:
 CASE
   WHEN {B_id} IS NULL THEN 'removed'
   WHEN {A}."type" IS NOT {B_type} THEN 'type_changed'
-  WHEN ?1 AND {A}.hash_hex IS NOT NULL AND {A}.hash_state = 'full'
+  WHEN :hashp AND {A}.hash_hex IS NOT NULL AND {A}.hash_state = 'full'
        AND {B_hash} IS NOT NULL AND {B_state} = 'full'
     THEN CASE WHEN {A}.hash_hex IS NOT {B_hash} THEN 'content_changed'
-              WHEN NOT ?3 AND {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
+              WHEN NOT :ig_m AND {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
               ELSE 'identical' END
-  WHEN NOT ?2 AND {A}.size_bytes IS NOT {B_size} THEN 'size_changed'
-  WHEN NOT ?3 AND {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
+  WHEN NOT :ig_s AND {A}.size_bytes IS NOT {B_size} THEN 'size_changed'
+  WHEN NOT :ig_m AND {A}.mtime_ns IS NOT {B_mtime} THEN 'mtime_changed'
   ELSE 'identical'
 END"""
 
@@ -401,14 +401,14 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
                    sa.size_bytes, bs.size,
                    sa.mtime_ns, bs.mtime,
                    sa."type", bs.ptype,
-                   CASE WHEN ?1 THEN sa.hash_hex END,
-                   CASE WHEN ?1 THEN bs.hash END,
+                   CASE WHEN :hashp THEN sa.hash_hex END,
+                   CASE WHEN :hashp THEN bs.hash END,
                    NULL
             FROM sna.entries sa
             CROSS JOIN pairs p INDEXED BY ix_pairs_aid ON p.aid = sa.entry_id
             CROSS JOIN bside bs ON bs.id = p.bid
             {where}
-            """, (h, ig_s, ig_m))
+            """, {"hashp": h, "ig_s": ig_s, "ig_m": ig_m})
 
         # 4. removed（顺序扫 A）与 added（bside 热页）
         conn.execute(
@@ -419,12 +419,12 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
                    sa.size_bytes, NULL,
                    sa.mtime_ns, NULL,
                    sa."type", NULL,
-                   CASE WHEN ?1 AND sa.hash_hex IS NOT NULL
+                   CASE WHEN :hashp AND sa.hash_hex IS NOT NULL
                              AND sa.hash_state = 'full' THEN sa.hash_hex END,
                    NULL, NULL
             FROM sna.entries sa
             CROSS JOIN rem_ids r ON r.id = sa.entry_id
-            """, (h,))
+            """, {"hashp": h})
         conn.execute(
             f"""
             {_INSERT_COLS}
@@ -434,12 +434,12 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
                    NULL, bs.mtime,
                    NULL, bs.ptype,
                    NULL,
-                   CASE WHEN ?1 AND bs.hash IS NOT NULL
+                   CASE WHEN :hashp AND bs.hash IS NOT NULL
                              AND bs.hstate = 'full' THEN bs.hash END,
                    bs.path
             FROM bside bs
             CROSS JOIN add_ids r ON r.id = bs.id
-            """, (h,))
+            """, {"hashp": h})
         conn.commit()
 
         # 5. 计数：已落库各类走 GROUP BY；identical 在默认（不落库）模式下

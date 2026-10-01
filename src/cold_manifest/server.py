@@ -15,12 +15,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
+from .api.routes_admin import router as admin_router
 from .api.routes_collect import batches_router, router as collect_router
 from .api.routes_diffs import router as diffs_router
 from .api.routes_disks import router as disks_router
 from .api.routes_duplicates import router as duplicates_router
 from .api.routes_imports import router as imports_router
 from .api.routes_misc import router as misc_router
+from .api.routes_search import router as search_router
 from .api.routes_snapshots import router as snapshots_router
 from .api.routes_tasks import router as tasks_router
 from .api.routes_trends import router as trends_router
@@ -64,6 +66,8 @@ def create_app(data_root: "str | None" = None) -> FastAPI:
     app.include_router(batches_router)
     app.include_router(tasks_router)
     app.include_router(trends_router)
+    app.include_router(search_router)
+    app.include_router(admin_router)
 
     if _FRONTEND_DIST.is_dir():
         app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="spa")

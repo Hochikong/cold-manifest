@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from ..import_legacy import ImportResult, import_snapshot
@@ -166,3 +166,48 @@ def submit_import(body: ImportBody, request: Request) -> dict:
         raise HTTPException(status_code=409,
                             detail="同目录已有 pending/running 的导入任务")
     return {"task_id": task_id, "status": "pending"}
+
+
+class ImportDbBody(BaseModel):
+    path: str
+
+
+@router.post("/db")
+def import_db(body: ImportDbBody, request: Request, response: Response) -> dict:
+    """就地登记外部 snapshot.db（复用 import_db.import_snapshot_db）。
+
+    路径须在 CLDM_IMPORT_ROOTS 白名单内（设置时）；未封库 / 不存在 /
+    无法推导 <volume_id>/<ts> 布局 → 400；已登记 → 200 幂等（created=false）。
+    """
+    from ..import_db import ImportDbError, import_snapshot_db
+
+    p = Path(body.path)
+    if not p.is_absolute():
+        raise HTTPException(status_code=400,
+                            detail=f"path 必须为绝对路径：{body.path}")
+    if not p.is_file():
+        raise HTTPException(status_code=400,
+                            detail=f"快照库不存在或不是文件：{body.path}")
+    if not _allowed_by_roots(p):
+        raise HTTPException(status_code=400,
+                            detail=f"path 不在允许的导入根内：{body.path}")
+
+    state = get_state(request)
+    try:
+        result = import_snapshot_db(p, state.data_root)
+    except ImportDbError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+    row = state.catalog.execute(
+        "SELECT * FROM snapshots WHERE snapshot_id = ?",
+        (result["snapshot_id"],),
+    ).fetchone()
+    response.status_code = 201 if result["created"] else 200
+    return {
+        "created": result["created"],
+        "snapshot_id": result["snapshot_id"],
+        "volume_id": result["volume_id"],
+        "db_path": str(result["db_path"]),
+        "snapshot": dict(row) if row is not None else None,
+        "warnings": result["warnings"],
+    }

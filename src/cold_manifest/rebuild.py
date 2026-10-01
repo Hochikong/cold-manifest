@@ -228,7 +228,7 @@ def _reconcile_snapshot(cat: sqlite3.Connection, result: dict,
     snap_fields = {
         "collected_at": collected_at,
         "collector_version": meta.get("collector_version") or None,
-        "host_path": host_path or None,
+        "host_path": host_path,
         "status": "sealed",
         "hash_policy": meta.get("hash_policy") or "none",
         "exclude_rules_json": meta.get("exclude_rules_json") or None,
