@@ -27,7 +27,9 @@ def client(tmp_path: Path):
         yield c, tmp_path
 
 
-def _wait_task(client: TestClient, task_id: str, timeout: float = 15.0) -> dict:
+def _wait_task(client: TestClient, task_id: str, timeout: float = 60.0) -> dict:
+    # 上限放宽到 60s：全量套件负载下任务可能远超 15s，旧值曾造成"遗留 pending 未执行"式
+    # 假失败（单跑稳定）。真挂死仍会超时。
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         r = client.get(f"/api/tasks/{task_id}")
@@ -200,7 +202,8 @@ def test_start_reconciles_stale_running_and_pending(tmp_path: Path, legacy_snap:
         assert t["error"] == "进程重启中断"
         assert t["finished_at"] is not None
         # 遗留 pending 被重新执行
-        deadline = time.monotonic() + 15.0
+        # 同上：负载敏感的等待上限（全量套件下重放队列可能明显变慢）
+        deadline = time.monotonic() + 45.0
         statuses = {}
         while time.monotonic() < deadline:
             statuses = {tid: runner.get_task(tid)["status"]

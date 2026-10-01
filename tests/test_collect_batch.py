@@ -165,7 +165,9 @@ def client(tmp_path: Path):
         yield c, tmp_path
 
 
-def _wait_task(c: TestClient, task_id: str, timeout: float = 15.0) -> dict:
+def _wait_task(c: TestClient, task_id: str, timeout: float = 60.0) -> dict:
+    # 上限放宽到 60s：全量套件负载下（含 3M 行级测试）任务可能远超 15s，
+    # 旧值曾导致本文件偶发"未完成"假失败（单跑稳定）。真挂死仍会超时。
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         body = c.get(f"/api/tasks/{task_id}").json()
@@ -175,7 +177,8 @@ def _wait_task(c: TestClient, task_id: str, timeout: float = 15.0) -> dict:
     raise TimeoutError(f"任务未到终态：{task_id}")
 
 
-def _wait_batch(c: TestClient, batch_id: str, timeout: float = 15.0) -> dict:
+def _wait_batch(c: TestClient, batch_id: str, timeout: float = 60.0) -> dict:
+    # 同上：负载敏感的等待上限（见 _wait_task 注释）
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         body = c.get(f"/api/batches/{batch_id}").json()
