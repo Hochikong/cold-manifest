@@ -17,6 +17,9 @@ from typing import IO, Any
 
 from .db import file_uri
 
+# 报告合法段落名（API report 端点 sections 参数校验用）
+REPORT_SECTIONS = ("overview", "extensions", "sizes", "depth", "topdirs", "skipped")
+
 # 与 diff_engine._COUNTED / routes_diffs._CATEGORIES 一致；identical 不落库，只进摘要
 _SECTION_CATEGORIES = ("added", "removed", "type_changed", "size_changed",
                        "mtime_changed", "content_changed", "moved_or_renamed")
@@ -381,13 +384,22 @@ def generate_snapshot_report(conn: sqlite3.Connection,
                              snapshot_row: Any = None,
                              volume_row: Any = None,
                              smart_row: Any = None,
-                             max_rows_per_section: int = 1000) -> dict:
+                             max_rows_per_section: int = 1000,
+                             sections: "list[str] | None" = None) -> dict:
     """生成自包含快照 HTML 报告，写入 out（路径/文本流；None 则返回文档）。
 
     snapshot_row / volume_row / smart_row：catalog 行（sqlite3.Row 或 dict，
     均可缺省——缺了就从快照库 meta 兜底）。返回摘要统计。
+
+    sections：要生成的段落名列表（overview/extensions/sizes/depth/topdirs/skipped）；
+    None（默认）表示全部段落——既有调用方（CLI / 无参端点）行为不变。
     """
     t0 = time.monotonic()
+    want = set(sections) if sections is not None else None
+
+    def _want(name: str) -> bool:
+        return want is None or name in want
+
     ov = _snapshot_overview(conn, max_rows_per_section)
     from .stats_cache import compute_stats, load_precomputed_stats
 
@@ -428,88 +440,94 @@ def generate_snapshot_report(conn: sqlite3.Connection,
                       f"<style>{_CSS}{_SNAP_CSS}</style>", "</head>", "<body><main>"]
     h.append(f"<h1>快照报告 <span class='muted'>{_esc(snapshot_id)}</span></h1>")
 
-    h.append("<table class='meta'>")
-    header_rows = [
-        ["快照 ID", _esc(snapshot_id)],
-        ["卷", _esc(vol.get("volume_id") or snapshot_id.split("/", 1)[0])
-         + (f"<span class='muted'>（{_esc(vol.get('label') or '')}"
-            f"{_esc(vol.get('filesystem') or '')}）</span>"
-            if vol.get("label") or vol.get("filesystem") else "")],
-        ["采集时间", _esc(collected_at)],
-        ["文件数", _esc(f"{ov['file_count']:,}")],
-        ["目录数", _esc(f"{ov['dir_count']:,}")],
-        ["总大小", _esc(fmt_bytes(ov['total_bytes']))],
-        ["最大深度", _esc(ov['max_depth'])],
-        ["哈希策略", _esc(hash_policy)],
-        ["报告生成时间", _esc(datetime.now(timezone.utc)
-                              .strftime("%Y-%m-%dT%H:%M:%SZ"))],
-    ]
-    if smart_line:
-        header_rows.append(["SMART", _esc(smart_line)])
-    for k, v in header_rows:
-        h.append(f"<tr><td>{_esc(k)}</td><td>{v}</td></tr>")
-    h.append("</table>")
+    if _want("overview"):
+        h.append("<table class='meta'>")
+        header_rows = [
+            ["快照 ID", _esc(snapshot_id)],
+            ["卷", _esc(vol.get("volume_id") or snapshot_id.split("/", 1)[0])
+             + (f"<span class='muted'>（{_esc(vol.get('label') or '')}"
+                f"{_esc(vol.get('filesystem') or '')}）</span>"
+                if vol.get("label") or vol.get("filesystem") else "")],
+            ["采集时间", _esc(collected_at)],
+            ["文件数", _esc(f"{ov['file_count']:,}")],
+            ["目录数", _esc(f"{ov['dir_count']:,}")],
+            ["总大小", _esc(fmt_bytes(ov['total_bytes']))],
+            ["最大深度", _esc(ov['max_depth'])],
+            ["哈希策略", _esc(hash_policy)],
+            ["报告生成时间", _esc(datetime.now(timezone.utc)
+                                  .strftime("%Y-%m-%dT%H:%M:%SZ"))],
+        ]
+        if smart_line:
+            header_rows.append(["SMART", _esc(smart_line)])
+        for k, v in header_rows:
+            h.append(f"<tr><td>{_esc(k)}</td><td>{v}</td></tr>")
+        h.append("</table>")
 
-    h.append("<div class='cards'>")
-    h.append(f"<div class='card'><div class='num'>{ov['file_count']:,}</div>"
-             f"<div class='lbl'>文件</div></div>")
-    h.append(f"<div class='card'><div class='num'>{ov['dir_count']:,}</div>"
-             f"<div class='lbl'>目录</div></div>")
-    h.append(f"<div class='card'><div class='num'>{_esc(fmt_bytes(ov['total_bytes']))}</div>"
-             f"<div class='lbl'>总大小</div></div>")
-    h.append(f"<div class='card'><div class='num'>{ov['zero_byte_count']:,}</div>"
-             f"<div class='lbl'>零字节文件</div></div>")
-    h.append(f"<div class='card'><div class='num'>{ov['skipped_total']:,}</div>"
-             f"<div class='lbl'>跳过项</div></div>")
-    h.append("</div>")
+        h.append("<div class='cards'>")
+        h.append(f"<div class='card'><div class='num'>{ov['file_count']:,}</div>"
+                 f"<div class='lbl'>文件</div></div>")
+        h.append(f"<div class='card'><div class='num'>{ov['dir_count']:,}</div>"
+                 f"<div class='lbl'>目录</div></div>")
+        h.append(f"<div class='card'><div class='num'>{_esc(fmt_bytes(ov['total_bytes']))}</div>"
+                 f"<div class='lbl'>总大小</div></div>")
+        h.append(f"<div class='card'><div class='num'>{ov['zero_byte_count']:,}</div>"
+                 f"<div class='lbl'>零字节文件</div></div>")
+        h.append(f"<div class='card'><div class='num'>{ov['skipped_total']:,}</div>"
+                 f"<div class='lbl'>跳过项</div></div>")
+        h.append("</div>")
 
     # 扩展名 Top（按字节 / 按数量）
-    h.append("<h2>扩展名 Top（按字节）</h2>")
-    rows = [[_esc(e["ext"]), _esc(f"{e['total_bytes']:,}"),
-             _esc(fmt_bytes(e["total_bytes"]))] for e in stats["ext_top_by_bytes"]]
-    h += (_table(["扩展名", "字节", "人类可读"], rows, num_cols={1, 2})
-          if rows else ["<p class='muted'>无</p>"])
-    h.append("<h2>扩展名 Top（按数量）</h2>")
-    rows = [[_esc(e["ext"]), _esc(f"{e['count']:,}")] for e in stats["ext_top_by_count"]]
-    h += (_table(["扩展名", "文件数"], rows, num_cols={1})
-          if rows else ["<p class='muted'>无</p>"])
+    if _want("extensions"):
+        h.append("<h2>扩展名 Top（按字节）</h2>")
+        rows = [[_esc(e["ext"]), _esc(f"{e['total_bytes']:,}"),
+                 _esc(fmt_bytes(e["total_bytes"]))] for e in stats["ext_top_by_bytes"]]
+        h += (_table(["扩展名", "字节", "人类可读"], rows, num_cols={1, 2})
+              if rows else ["<p class='muted'>无</p>"])
+        h.append("<h2>扩展名 Top（按数量）</h2>")
+        rows = [[_esc(e["ext"]), _esc(f"{e['count']:,}")] for e in stats["ext_top_by_count"]]
+        h += (_table(["扩展名", "文件数"], rows, num_cols={1})
+              if rows else ["<p class='muted'>无</p>"])
 
     # 大小直方图（纯 CSS 条形）
-    h.append("<h2>大小直方图</h2>")
-    h += _bar_chart([(b["label"], b["count"], fmt_bytes(b["total_bytes"]))
-                     for b in stats["size_histogram"]])
+    if _want("sizes"):
+        h.append("<h2>大小直方图</h2>")
+        h += _bar_chart([(b["label"], b["count"], fmt_bytes(b["total_bytes"]))
+                         for b in stats["size_histogram"]])
 
     # 深度分布（文件）
-    h.append("<h2>深度分布（文件）</h2>")
-    depth_rows = stats["depth_histogram"]
-    shown = depth_rows[:max_rows_per_section]
-    h += _bar_chart([(f"depth {d['depth']}", d["count"], f"{d['count']:,}")
-                     for d in shown])
-    if len(depth_rows) > len(shown):
-        h.append(f"<p class='truncated'>共 {len(depth_rows):,} 档，"
-                 f"已截断（仅显示前 {len(shown):,} 档）</p>")
+    if _want("depth"):
+        h.append("<h2>深度分布（文件）</h2>")
+        depth_rows = stats["depth_histogram"]
+        shown = depth_rows[:max_rows_per_section]
+        h += _bar_chart([(f"depth {d['depth']}", d["count"], f"{d['count']:,}")
+                         for d in shown])
+        if len(depth_rows) > len(shown):
+            h.append(f"<p class='truncated'>共 {len(depth_rows):,} 档，"
+                     f"已截断（仅显示前 {len(shown):,} 档）</p>")
 
     # 顶层目录 Top
-    h.append("<h2>顶层目录 Top（按递归大小）</h2>")
-    dirs = ov["top_dirs"]
-    rows = []
-    for d in dirs[:max_rows_per_section]:
-        rows.append([_esc(d["name"]), _esc(f"{d['file_count']:,}"),
-                     _esc(f"{d['dir_count']:,}"),
-                     _esc(fmt_bytes(d["total_bytes"]))])
-    h += _table(["目录", "文件数", "子目录数", "递归大小"], rows, num_cols={1, 2, 3})
-    if len(dirs) > max_rows_per_section:
-        h.append(f"<p class='truncated'>已截断（仅显示前 "
-                 f"{max_rows_per_section:,} 个目录）</p>")
+    if _want("topdirs"):
+        h.append("<h2>顶层目录 Top（按递归大小）</h2>")
+        dirs = ov["top_dirs"]
+        rows = []
+        for d in dirs[:max_rows_per_section]:
+            rows.append([_esc(d["name"]), _esc(f"{d['file_count']:,}"),
+                         _esc(f"{d['dir_count']:,}"),
+                         _esc(fmt_bytes(d["total_bytes"]))])
+        h += _table(["目录", "文件数", "子目录数", "递归大小"], rows, num_cols={1, 2, 3})
+        if len(dirs) > max_rows_per_section:
+            h.append(f"<p class='truncated'>已截断（仅显示前 "
+                     f"{max_rows_per_section:,} 个目录）</p>")
 
     # 跳过项摘要（按 reason=warning_type 计数）
-    h.append("<h2>跳过项摘要</h2>")
-    if ov["skipped_groups"]:
-        rows = [[_esc(g["warning_type"]), _esc(f"{g['n']:,}")]
-                for g in ov["skipped_groups"]]
-        h += _table(["原因（warning_type）", "条数"], rows, num_cols={1})
-    else:
-        h.append("<p class='muted'>采集期间没有跳过项。</p>")
+    if _want("skipped"):
+        h.append("<h2>跳过项摘要</h2>")
+        if ov["skipped_groups"]:
+            rows = [[_esc(g["warning_type"]), _esc(f"{g['n']:,}")]
+                    for g in ov["skipped_groups"]]
+            h += _table(["原因（warning_type）", "条数"], rows, num_cols={1})
+        else:
+            h.append("<p class='muted'>采集期间没有跳过项。</p>")
 
     h.append(f"<p class='muted'>生成耗时 {time.monotonic() - t0:.2f}s · "
              f"stats {'预计算直读' if precomputed else '实时聚合'} · cold-manifest</p>")

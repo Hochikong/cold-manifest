@@ -2,6 +2,8 @@
 
 import io
 import sqlite3
+import time
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -9,8 +11,10 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
-from ..catalog import find_snapshot
+from ..catalog import find_snapshot, snapshot_path
 from ..exporter import export_v1_csv_zip, iter_snapshot_csv
+from ..seal import build_fts, fts_available, fts_match_query
+from ..stats_cache import build_stats_cache, compute_stats, load_precomputed_stats
 from ..hash import ALLOWED_ALGOS, ALLOWED_POLICIES, run_hash_task
 from ..seal import fts_available, fts_match_query
 from ..stats_cache import compute_stats, load_precomputed_stats
@@ -656,18 +660,31 @@ def snapshot_report(
     request: Request,
     format: str = Query(default="html"),
     max_rows: int = Query(default=1000, ge=1, le=10000),
+    sections: "str | None" = Query(default=None),
 ):
     """快照自包含 HTML 报告：format=html（其他值 → 400）。
 
     头部元信息/SMART 摘要取自 catalog；聚合段优先 stats_precomputed 直读
     （旧库回退实时聚合，响应内容一致）。
+    sections：逗号分隔的段落名（overview,extensions,sizes,depth,topdirs,skipped），
+    默认全含；未知值 → 400。
     """
-    from ..report import generate_snapshot_report
+    from ..report import REPORT_SECTIONS, generate_snapshot_report
     from fastapi.responses import HTMLResponse
 
     if format != "html":
         raise HTTPException(status_code=400,
                             detail=f"非法 format：{format!r}（当前仅支持 html）")
+    section_list: "list[str] | None" = None
+    if sections is not None:
+        section_list = [s.strip() for s in sections.split(",") if s.strip()]
+        if not section_list:
+            raise HTTPException(status_code=400, detail="sections 不能为空")
+        unknown = [s for s in section_list if s not in REPORT_SECTIONS]
+        if unknown:
+            raise HTTPException(status_code=400,
+                                detail=f"未知 sections：{', '.join(unknown)}"
+                                       f"（允许 {'/'.join(REPORT_SECTIONS)}）")
     state = get_state(request)
     row = _require_snapshot(state, snapshot_id)
     conn = _snap_db(request, snapshot_id)
@@ -686,12 +703,214 @@ def snapshot_report(
     buf = io.StringIO()
     generate_snapshot_report(conn, buf, snapshot_id=snapshot_id,
                              snapshot_row=row, volume_row=vol,
-                             smart_row=smart_row, max_rows_per_section=max_rows)
+                             smart_row=smart_row, max_rows_per_section=max_rows,
+                             sections=section_list)
     return HTMLResponse(content=buf.getvalue(), media_type="text/html")
 
 
-# ---------------------------------------------------------------- 详情（最后注册：:path 转换器会吞子路径）
+# ---------------------------------------------------------------- 校验副本（verify-copy）
 
+
+class VerifyCopyBody(BaseModel):
+    scope: str = "sample"           # sample（默认抽检）| full（全部重算）
+    sample_size: int = 200
+    seed: "int | None" = None
+
+
+_VERIFY_SAMPLE_MAX = 5000
+
+
+@router.post("/{snapshot_id:path}/verify-copy")
+def verify_copy_ep(snapshot_id: str, body: VerifyCopyBody, request: Request) -> dict:
+    """同步校验盘上副本与（可选）源文件完整性，返回与 CLI verify-copy 同源的报告。
+
+    同步 def：FastAPI 自动放线程池执行，不阻塞事件循环；校验只读，不持写锁。
+    404=快照未注册/不存在；400=参数非法或校验无法进行（未封库/扫描根不可定位）。
+    """
+    from ..verify import VerifyError, verify_snapshot_copy
+
+    if body.scope not in ("sample", "full"):
+        raise HTTPException(status_code=400,
+                            detail=f"非法 scope：{body.scope!r}（允许 sample/full）")
+    if not isinstance(body.sample_size, int) or not (1 <= body.sample_size <= _VERIFY_SAMPLE_MAX):
+        raise HTTPException(status_code=400,
+                            detail=f"sample_size 须为 1–{_VERIFY_SAMPLE_MAX} 的整数："
+                                   f"{body.sample_size!r}")
+
+    state = get_state(request)
+    _require_snapshot(state, snapshot_id)
+    try:
+        return verify_snapshot_copy(
+            state.data_root, snapshot_id,
+            sample=0 if body.scope == "full" else body.sample_size,
+            seed=body.seed, full=body.scope == "full")
+    except VerifyError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+
+# ---------------------------------------------------------------- 构建 FTS / stats 预计算（任务化）
+
+_KIND_BUILD_FTS = "build_fts"
+_KIND_BUILD_STATS = "build_stats"
+
+
+def _evict_snapshot_pools(snapshot_id: str) -> None:
+    """就地重建索引/预计算后，逐出 API 进程内该快照的只读连接池缓存。
+
+    池内连接是 immutable 打开的：build_fts/build_stats 改了库文件后旧连接
+    看不到新表。任务在 API 进程内执行时同步逐出（uvicorn 的模块级 app）；
+    经 CLI 等其他途径执行时静默跳过。
+    """
+    try:
+        from ..server import app as _app
+        state = getattr(_app.state, "cldm", None)
+        if state is not None:
+            state.evict_snapshot(snapshot_id)
+    except Exception:
+        pass
+
+
+def _run_seal_upgrade(payload: dict, progress_cb: Any, cancel_event: Any = None,
+                      *, kind: str) -> dict:
+    """build_fts / build_stats 共用执行体：持 data_root 写锁，可写打开快照库就地重建。
+
+    参照 run_hash_task：锁被占 → RuntimeError（任务落 error）；快照库缺失 → LookupError。
+    """
+    from ..lockfile import DataRootLock, LockBusy
+
+    data_root = Path(payload["data_root"])
+    lock = DataRootLock(data_root)
+    try:
+        lock.acquire()
+    except LockBusy as e:
+        raise RuntimeError(f"数据根被占用：{e}") from None
+    try:
+        db_path = snapshot_path(data_root, payload["snapshot_id"])
+        if not db_path.is_file():
+            raise LookupError(f"快照库文件缺失：{payload['snapshot_id']}")
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            t0 = time.monotonic()
+            if kind == _KIND_BUILD_FTS:
+                count, tok = build_fts(conn)
+                conn.commit()
+                _evict_snapshot_pools(payload["snapshot_id"])
+                return {"built": True, "tokenizer": tok, "count": count,
+                        "seconds": round(time.monotonic() - t0, 3)}
+            keys = build_stats_cache(conn)
+            conn.commit()
+            _evict_snapshot_pools(payload["snapshot_id"])
+            return {"keys": keys, "seconds": round(time.monotonic() - t0, 3)}
+        finally:
+            conn.close()
+    finally:
+        lock.release()
+
+
+def _run_build_fts(payload: dict, progress_cb: Any, cancel_event: Any = None) -> dict:
+    return _run_seal_upgrade(payload, progress_cb, cancel_event, kind=_KIND_BUILD_FTS)
+
+
+def _run_build_stats(payload: dict, progress_cb: Any, cancel_event: Any = None) -> dict:
+    return _run_seal_upgrade(payload, progress_cb, cancel_event, kind=_KIND_BUILD_STATS)
+
+
+register_task_fn(_KIND_BUILD_FTS, _run_build_fts)
+register_task_fn(_KIND_BUILD_STATS, _run_build_stats)
+
+
+def _require_sealed(request: Request, snapshot_id: str) -> None:
+    """快照库 meta.status=sealed 才允许就地重建索引/预计算，否则 400。"""
+    conn = _snap_db(request, snapshot_id)
+    row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
+    if row is None or row[0] != "sealed":
+        raise HTTPException(status_code=400,
+                            detail=f"快照未封库，不能就地重建（meta.status={row[0] if row else None!r}）")
+
+
+@router.post("/{snapshot_id:path}/build-fts", status_code=201)
+def submit_build_fts(snapshot_id: str, request: Request) -> dict:
+    """提交 FTS5 全文索引构建任务（幂等重建）：404/400 未封库/409 同快照重复提交。"""
+    state = get_state(request)
+    _require_snapshot(state, snapshot_id)
+    _require_sealed(request, snapshot_id)
+    runner: TaskRunner = request.app.state.task_runner
+    payload = {"snapshot_id": snapshot_id, "data_root": str(state.data_root)}
+    task_id = runner.submit_dedup(_KIND_BUILD_FTS, payload, field="snapshot_id")
+    if task_id is None:
+        raise HTTPException(status_code=409, detail="同快照已有 pending/running 的 build_fts 任务")
+    return {"task_id": task_id, "status": "pending"}
+
+
+@router.post("/{snapshot_id:path}/build-stats", status_code=201)
+def submit_build_stats(snapshot_id: str, request: Request) -> dict:
+    """提交 stats_precomputed 预计算任务（幂等重建）：404/400 未封库/409 同快照重复提交。"""
+    state = get_state(request)
+    _require_snapshot(state, snapshot_id)
+    _require_sealed(request, snapshot_id)
+    runner: TaskRunner = request.app.state.task_runner
+    payload = {"snapshot_id": snapshot_id, "data_root": str(state.data_root)}
+    task_id = runner.submit_dedup(_KIND_BUILD_STATS, payload, field="snapshot_id")
+    if task_id is None:
+        raise HTTPException(status_code=409, detail="同快照已有 pending/running 的 build_stats 任务")
+    return {"task_id": task_id, "status": "pending"}
+
+
+# ---------------------------------------------------------------- PATCH 详情（pinned / notes）
+
+
+class SnapshotPatchBody(BaseModel):
+    pinned: "bool | None" = None
+    notes: "str | None" = None
+
+
+_NOTES_MAX = 2000
+
+
+@router.patch("/{snapshot_id:path}")
+def patch_snapshot(snapshot_id: str, body: SnapshotPatchBody, request: Request) -> dict:
+    """更新 catalog.snapshots 的 pinned / notes（两者都缺 → 400；notes ≤2000 字符）。
+
+    catalog 连接与 TaskRunner 共享：写事务沿用 tasks.submit 的 _lock 串行化约定，
+    短事务（单 UPDATE + commit）持锁执行，避免与工作线程写事务交错。
+    """
+    from ..catalog import validate_volume_id
+
+    if body.pinned is None and body.notes is None:
+        raise HTTPException(status_code=400, detail="pinned 与 notes 至少提供一个")
+    if body.notes is not None and len(body.notes) > _NOTES_MAX:
+        raise HTTPException(status_code=400,
+                            detail=f"notes 超长（最多 {_NOTES_MAX} 字符）：{len(body.notes)}")
+
+    try:
+        validate_volume_id(snapshot_id.split("/", 1)[0])
+    except Exception as e:  # LegacyImportError 等：非法 sid 一律 400
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+    state = get_state(request)
+    _require_snapshot(state, snapshot_id)
+    sets: "list[str]" = []
+    params: "list[Any]" = []
+    if body.pinned is not None:
+        sets.append("pinned = ?")
+        params.append(1 if body.pinned else 0)
+    if body.notes is not None:
+        sets.append("notes = ?")
+        params.append(body.notes)
+    params.append(snapshot_id)
+    runner: TaskRunner = request.app.state.task_runner
+    with runner._lock:  # 与 TaskRunner 共享 catalog 连接：写事务全程持锁
+        state.catalog.execute(
+            f"UPDATE snapshots SET {', '.join(sets)} WHERE snapshot_id = ?", params)
+        state.catalog.commit()
+    return snapshot_detail(snapshot_id, request)
+
+
+# ---------------------------------------------------------------- 报告 sections 过滤已在 report 端点支持
+
+# ---------------------------------------------------------------- 详情（最后注册：:path 转换器会吞子路径）
 
 @router.get("/{snapshot_id:path}")
 def snapshot_detail(snapshot_id: str, request: Request) -> dict:
