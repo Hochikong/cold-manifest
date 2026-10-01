@@ -29,7 +29,7 @@ import {
 } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAttachedDisks, useCreateCollect, useCancelTask, useTaskEvents, useBatch, useCollectPreflight } from '../api/hooks'
-import { isBatchCollectResponse, type BatchCollectCreateResponse, type Task, type Batch, type AttachedDisk } from '../api/client'
+import { apiErrorDetail, isBatchCollectResponse, type BatchCollectCreateResponse, type Task, type Batch, type AttachedDisk } from '../api/client'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatFileSize, formatNumber } from '../utils/format'
 
@@ -87,6 +87,9 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
     if (mode === 'progress' && isTerminal(task.status)) {
       qc.invalidateQueries({ queryKey: ['snapshots'] })
       qc.invalidateQueries({ queryKey: ['volumes'] })
+      qc.invalidateQueries({ queryKey: ['disks'] })
+      qc.invalidateQueries({ queryKey: ['snapshot'] })
+      qc.invalidateQueries({ queryKey: ['volume-trends'] })
       qc.invalidateQueries({ queryKey: ['tasks'] })
       setMode('done')
     }
@@ -97,6 +100,9 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
     if (mode === 'progress' && batch.status !== 'running') {
       qc.invalidateQueries({ queryKey: ['snapshots'] })
       qc.invalidateQueries({ queryKey: ['volumes'] })
+      qc.invalidateQueries({ queryKey: ['disks'] })
+      qc.invalidateQueries({ queryKey: ['snapshot'] })
+      qc.invalidateQueries({ queryKey: ['volume-trends'] })
       qc.invalidateQueries({ queryKey: ['tasks'] })
       setMode('done')
     }
@@ -140,8 +146,8 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
         setMode('progress')
       }
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      setSubmitError(msg)
+      // 后端 400/409 的中文 detail（如「数据根被占用」）优先展示
+      setSubmitError(apiErrorDetail(e))
     }
   }
 
@@ -153,8 +159,7 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
       await Promise.all(ids.map((id) => cancelTaskMutation.mutateAsync(id)))
       setCancelRequested(true)
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      setSubmitError(msg)
+      setSubmitError(apiErrorDetail(e))
     }
   }
 

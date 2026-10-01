@@ -102,6 +102,7 @@ export default function VolumeDetailDrawer({ volumeId, onClose }: VolumeDetailDr
                 <Table<VolumeDetailSnapshot>
                   rowKey="snapshot_id"
                   size="small"
+                  tableLayout="fixed"
                   columns={snapshotColumns}
                   dataSource={vol.snapshots}
                   pagination={{ pageSize: 8, hideOnSinglePage: true }}

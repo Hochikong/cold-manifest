@@ -111,3 +111,10 @@ code {
 .ant-table-cell {
   white-space: nowrap;
 }
+
+/* 长型号/序列号/UUID 等不可断行内容：描述列表单元格恢复正常换行
+   （展开行 td 的 nowrap 会继承进内嵌卡片，导致内容在卡片边缘被裁掉） */
+.ant-descriptions-item-content {
+  white-space: normal;
+  word-break: break-word;
+}

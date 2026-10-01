@@ -64,6 +64,7 @@ import {
   useTaskEvents,
 } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import EllipsisText from '../components/EllipsisText'
 import DuplicateReport from '../components/DuplicateReport'
 import HashPanel from '../components/HashPanel'
 import SkippedPanel from '../components/SkippedPanel'
@@ -72,7 +73,7 @@ import { VerifyCopyButton, VerifyCopyResultCard } from '../components/VerifyCopy
 import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
 import { dirNameOf, joinChildPath } from '../utils/path'
-import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, listEntries, searchEntries, getTree, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport } from '../api/client'
+import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, listEntries, searchEntries, getTree, apiErrorDetail, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport } from '../api/client'
 import axios from 'axios'
 
 const { Title, Text } = Typography
@@ -140,10 +141,7 @@ export default function SnapshotsPage() {
       await patchSnapshotMutation.mutateAsync({ snapshot_id: sid, body: { pinned } })
       message.success(pinned ? '已置顶' : '已取消置顶')
     } catch (e) {
-      const detail = axios.isAxiosError(e)
-        ? (typeof e.response?.data === 'string' ? e.response.data : (e.response?.data as { detail?: string } | undefined)?.detail)
-        : undefined
-      message.error(detail || (e instanceof Error ? e.message : '操作失败'))
+      message.error(apiErrorDetail(e) || '操作失败')
     } finally {
       setPinPendingId(null)
     }
@@ -210,7 +208,7 @@ export default function SnapshotsPage() {
           setDeleteError(typeof detail === 'string' ? detail : '删除被阻塞，请确认相关任务或对比')
         }
       } else {
-        setDeleteError(e instanceof Error ? e.message : String(e))
+        setDeleteError(apiErrorDetail(e))
       }
     }
   }
@@ -346,14 +344,28 @@ function SnapshotListView({
         )
       },
     },
-    { title: '快照 ID', dataIndex: 'snapshot_id', key: 'snapshot_id', ellipsis: true },
-    { title: '卷', dataIndex: 'volume_id', key: 'volume_id', ellipsis: true },
-    { title: '采集时间', dataIndex: 'collected_at', key: 'collected_at', render: (v: string) => formatDateTime(v) },
-    { title: '文件数', dataIndex: 'file_count', key: 'file_count', render: (v: number) => formatNumber(v) },
-    { title: '总大小', dataIndex: 'total_bytes', key: 'total_bytes', render: (v: number) => formatFileSize(v) },
+    {
+      title: '快照 ID',
+      dataIndex: 'snapshot_id',
+      key: 'snapshot_id',
+      ellipsis: true,
+      render: (v: string) => <EllipsisText value={v} code />,
+    },
+    {
+      title: '卷',
+      dataIndex: 'volume_id',
+      key: 'volume_id',
+      ellipsis: true,
+      width: 220,
+      render: (v: string) => <EllipsisText value={v} code />,
+    },
+    { title: '采集时间', dataIndex: 'collected_at', key: 'collected_at', width: 150, render: (v: string) => formatDateTime(v) },
+    { title: '文件数', dataIndex: 'file_count', key: 'file_count', width: 110, align: 'right' as const, render: (v: number) => formatNumber(v) },
+    { title: '总大小', dataIndex: 'total_bytes', key: 'total_bytes', width: 120, align: 'right' as const, render: (v: number) => formatFileSize(v) },
     {
       title: '操作',
       key: 'action',
+      width: 170,
       render: (_: unknown, record: { snapshot_id: string }) => (
         <Space>
           <Button type="primary" onClick={() => onSelect(record.snapshot_id)}>
@@ -400,7 +412,7 @@ function SnapshotListView({
       {loading && <Spin style={{ display: 'block', margin: '32px auto' }} />}
       <Card>
         {visibleRows?.length ? (
-          <Table rowKey="snapshot_id" size="small" columns={columns} dataSource={visibleRows} pagination={{ pageSize: 10 }} />
+          <Table rowKey="snapshot_id" size="small" tableLayout="fixed" columns={columns} dataSource={visibleRows} pagination={{ pageSize: 10 }} />
         ) : (
           <Empty description={pinnedOnly ? '暂无置顶快照' : volumeFilter ? '该卷暂无快照' : '暂无快照'} />
         )}
@@ -449,13 +461,7 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
       setStatsTaskId(res.task_id)
       message.success(`统计缓存重建任务已提交（${res.task_id.slice(0, 12)}…）`)
     } catch (e) {
-      if (axios.isAxiosError(e)) {
-        const detail = e.response?.data
-        const text = typeof detail === 'string' ? detail : (detail as { detail?: string } | undefined)?.detail
-        message.warning(text || '提交失败，请稍后重试')
-      } else {
-        message.error(e instanceof Error ? e.message : String(e))
-      }
+      message.warning(apiErrorDetail(e) || '提交失败，请稍后重试')
     }
   }
 
@@ -470,10 +476,7 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
       message.success('备注已保存')
       setNotesEditing(false)
     } catch (e) {
-      const detail = axios.isAxiosError(e)
-        ? (typeof e.response?.data === 'string' ? e.response.data : (e.response?.data as { detail?: string } | undefined)?.detail)
-        : undefined
-      message.error(detail || (e instanceof Error ? e.message : '保存失败'))
+      message.error(apiErrorDetail(e) || '保存失败')
     }
   }
 
@@ -736,10 +739,11 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
               <Table
                 rowKey="entry_id"
                 size="small"
+                tableLayout="fixed"
                 pagination={false}
                 scroll={{ y: 280 }}
                 columns={[
-                  { title: '名称', dataIndex: 'name', ellipsis: true },
+                  { title: '名称', dataIndex: 'name', ellipsis: true, render: (v: string) => <EllipsisText value={v} /> },
                   { title: '大小', dataIndex: 'total_bytes', render: (v: number) => formatFileSize(v), width: 120 },
                 ]}
                 dataSource={du.items}
@@ -775,11 +779,12 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
           <Table
             rowKey="entry_id"
             size="small"
+            tableLayout="fixed"
             pagination={false}
-            scroll={{ x: 'max-content', y: 400 }}
+            scroll={{ y: 400 }}
             columns={[
-              { title: '名称', dataIndex: 'name', ellipsis: true },
-              { title: '路径', dataIndex: 'path', ellipsis: true },
+              { title: '名称', dataIndex: 'name', ellipsis: true, render: (v: string) => <EllipsisText value={v} /> },
+              { title: '路径', dataIndex: 'path', ellipsis: true, render: (v: string) => <EllipsisText value={v} code /> },
               { title: '大小', dataIndex: 'size_bytes', render: (v: number) => formatFileSize(v), width: 120 },
               { title: '修改时间', dataIndex: 'mtime_ns', render: (v: string | null) => nsToDate(v), width: 160 },
             ]}
@@ -973,24 +978,28 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
       sorter: true,
       sortOrder: toAntSortOrder(sort === 'name', order),
       render: (_: string, record: Entry) => (
-        <Space>
-          {record.type === 'dir' ? <FolderOutlined /> : <FileOutlined />}
-          <Button
-            type="link"
-            style={{ padding: 0 }}
-            onClick={() => {
-              if (record.type === 'dir') {
-                const next = new URLSearchParams(searchParams)
-                next.set('parent_id', String(record.entry_id))
-                setSearchParams(next, { replace: true })
-              } else {
-                setDrawerEntry(record)
-              }
-            }}
-          >
-            {record.name}
-          </Button>
-        </Space>
+        <Tooltip title={record.name} placement="topLeft" mouseEnterDelay={0.3}>
+          <Space style={{ maxWidth: '100%' }}>
+            {record.type === 'dir' ? <FolderOutlined /> : <FileOutlined />}
+            <Button
+              type="link"
+              style={{ padding: 0, maxWidth: 480 }}
+              onClick={() => {
+                if (record.type === 'dir') {
+                  const next = new URLSearchParams(searchParams)
+                  next.set('parent_id', String(record.entry_id))
+                  setSearchParams(next, { replace: true })
+                } else {
+                  setDrawerEntry(record)
+                }
+              }}
+            >
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>
+                {record.name}
+              </span>
+            </Button>
+          </Space>
+        </Tooltip>
       ),
     },
     {
@@ -1145,10 +1154,10 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
               rowKey="entry_id"
               size="small"
               loading={entriesLoading}
+              tableLayout="fixed"
               columns={columns}
               dataSource={allItems}
               pagination={false}
-              scroll={{ x: 'max-content' }}
               onChange={onTableChange}
               onRow={(record) => ({
                 onContextMenu: (e) => rowMenu.open(e, browseTarget(record)),
@@ -1292,9 +1301,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
         if (e.response?.status === 409) {
           message.info('该快照已有构建任务在执行中，请等它完成')
         } else {
-          const detail = e.response?.data
-          const text = typeof detail === 'string' ? detail : (detail as { detail?: string } | undefined)?.detail
-          message.warning(text || '提交失败，请稍后重试')
+          message.warning(apiErrorDetail(e) || '提交失败，请稍后重试')
         }
       } else {
         message.error(e instanceof Error ? e.message : String(e))
@@ -1358,8 +1365,8 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   }
 
   const columns = [
-    { title: '名称', dataIndex: 'name', ellipsis: true },
-    { title: '路径', dataIndex: 'path', ellipsis: true },
+    { title: '名称', dataIndex: 'name', ellipsis: true, render: (v: string) => <EllipsisText value={v} /> },
+    { title: '路径', dataIndex: 'path', ellipsis: true, render: (v: string) => <EllipsisText value={v} code /> },
     { title: '类型', dataIndex: 'type', width: 80, render: (v: string) => (v === 'dir' ? '目录' : v === 'file' ? '文件' : v) },
     { title: '大小', dataIndex: 'size_bytes', width: 120, render: (v: number | null) => formatFileSize(v) },
     { title: '扩展名', dataIndex: 'ext', width: 100, render: (v: string) => v || '-' },
@@ -1474,10 +1481,10 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
               <Table
                 rowKey="entry_id"
                 size="small"
+                tableLayout="fixed"
                 columns={columns}
                 dataSource={results}
                 pagination={false}
-                scroll={{ x: 'max-content' }}
                 onRow={(record) => ({
                   onContextMenu: (e) => rowMenu.open(e, searchTarget(record)),
                 })}

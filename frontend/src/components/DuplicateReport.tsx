@@ -15,6 +15,7 @@ import {
   Statistic,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import {
@@ -25,7 +26,9 @@ import {
 } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import ErrorAlert from './ErrorAlert'
+import EllipsisText from './EllipsisText'
 import { useRowContextMenu } from '../hooks/useRowContextMenu'
+import { useShowApiError } from '../utils/apiError'
 import { formatFileSize, formatNumber } from '../utils/format'
 import { dirNameOf } from '../utils/path'
 import {
@@ -99,6 +102,7 @@ function isPolicyError(error: unknown): boolean {
 
 export default function DuplicateReport({ snapshotId }: { snapshotId: string }) {
   const { message } = App.useApp()
+  const showApiError = useShowApiError()
   const navigate = useNavigate()
   const qc = useQueryClient()
   const rowMenu = useRowContextMenu()
@@ -218,11 +222,10 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
     },
     onError: (e) => {
       const status = (e as { response?: { status?: number } }).response?.status
-      const detail = (e as { response?: { data?: { detail?: string } } }).response?.data?.detail
       if (status === 409) {
         message.info('该快照已有哈希任务在进行中，完成后即可切换档位')
       } else {
-        message.error(detail || '指纹任务创建失败，请稍后重试')
+        showApiError(e, '指纹任务创建失败')
       }
     },
   })
@@ -436,9 +439,10 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
                 <Table<DuplicateItem>
                   rowKey={(r) => r.hash_hex ?? r.name ?? String(r.size_bytes)}
                   size="small"
+                  tableLayout="fixed"
                   pagination={false}
                   loading={fetchingDuplicates || loadingMore}
-                  scroll={{ x: 'max-content' }}
+                  scroll={{ x: 880 }}
                   expandable={{
                     expandedRowRender: (record) => (
                       <Space orientation="vertical" style={{ width: '100%' }}>
@@ -470,7 +474,8 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
                             title: '文件名',
                             dataIndex: 'name',
                             width: 220,
-                            render: (v: string) => <Text code>{v}</Text>,
+                            ellipsis: true,
+                            render: (v: string) => <EllipsisText value={v} code />,
                           },
                         ]
                       : [
@@ -522,7 +527,7 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
                             title: '哈希',
                             dataIndex: 'hash_hex',
                             ellipsis: true,
-                            render: (v: string) => <Text code>{v}</Text>,
+                            render: (v: string) => <EllipsisText value={v} code />,
                           },
                         ]),
                     {
@@ -533,13 +538,15 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
                         const first = record.paths[0] || '-'
                         const rest = record.count - 1
                         return (
-                          <Text>
-                            {first}
-                            {rest > 0 ? (
-                              <Text type="secondary"> 等 {formatNumber(rest)} 条</Text>
-                            ) : null}
-                            {record.paths_truncated ? '（仅列部分）' : null}
-                          </Text>
+                          <Tooltip title={first} placement="topLeft" mouseEnterDelay={0.3}>
+                            <Text style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {first}
+                              {rest > 0 ? (
+                                <Text type="secondary"> 等 {formatNumber(rest)} 条</Text>
+                              ) : null}
+                              {record.paths_truncated ? '（仅列部分）' : null}
+                            </Text>
+                          </Tooltip>
                         )
                       },
                     },

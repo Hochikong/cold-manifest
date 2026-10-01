@@ -123,6 +123,7 @@ export default function SearchPage() {
       title: '名称',
       dataIndex: 'name',
       key: 'name',
+      width: 180,
       ellipsis: true,
       render: (_: string, record: GlobalSearchItem) => (
         <Space size={6}>
@@ -248,10 +249,10 @@ export default function SearchPage() {
           <Table<GlobalSearchItem>
             rowKey={(r) => `${r.snapshot_id}:${r.entry_id}`}
             size="small"
+            tableLayout="fixed"
             columns={columns}
             dataSource={items}
             pagination={false}
-            scroll={{ x: 'max-content' }}
             loading={isFetching && items.length > 0}
             onRow={(record) => ({
               onClick: () => navigate(snapshotBrowseUrl(record.snapshot_id, record.type === 'dir' ? record.path : dirNameOf(record.path))),

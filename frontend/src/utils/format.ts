@@ -55,3 +55,16 @@ export function formatRelativeTime(value: string | number | Date | null | undefi
   if (!d.isValid()) return '-'
   return d.fromNow()
 }
+
+/**
+ * 中间截断：保留首尾（序列号常靠头尾辨识），如 WD80EAZZ…3KL-1RTS。
+ * 超过 max 才截，配合悬浮显示完整值使用。
+ */
+export function truncateMiddle(value: string | null | undefined, max = 24): string {
+  if (value == null) return '-'
+  const s = String(value)
+  if (s.length <= max) return s
+  const head = Math.ceil((max - 1) / 2)
+  const tail = Math.floor((max - 1) / 2)
+  return `${s.slice(0, head)}…${s.slice(s.length - tail)}`
+}

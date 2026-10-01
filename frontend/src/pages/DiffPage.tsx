@@ -32,10 +32,12 @@ import {
 import ReactECharts from 'echarts-for-react'
 import { useSnapshots, useDiffs, useDiff, useDiffSummary, useDiffEntries, useCreateDiff } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import EllipsisText from '../components/EllipsisText'
 import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
+import { useShowApiError } from '../utils/apiError'
 import { formatFileSize, formatDateTime, nsToDate } from '../utils/format'
 import { dirNameOf } from '../utils/path'
-import { exportDiffUrl, diffReportUrl, listDiffEntries, type DiffEntry } from '../api/client'
+import { apiErrorDetail, exportDiffUrl, diffReportUrl, listDiffEntries, type DiffEntry } from '../api/client'
 
 const { Title, Text } = Typography
 
@@ -112,6 +114,7 @@ function DiffSelector() {
   const { data: snapshots, isLoading: snapLoading, error: snapError } = useSnapshots()
   const { data: diffs, isLoading: diffLoading, error: diffError } = useDiffs()
   const create = useCreateDiff()
+  const showApiError = useShowApiError()
   const navigate = useNavigate()
 
   const [a, setA] = useState<string | undefined>(undefined)
@@ -148,6 +151,11 @@ function DiffSelector() {
       {
         onSuccess: (res) => {
           navigate(`/diff?id=${res.diff_id}`)
+        },
+        // 后端 400（如「无法 ATTACH 快照库：…」）必须把中文原因展示出来，
+        // 不能只留一条 AxiosError 给控制台
+        onError: (e) => {
+          showApiError(e, '对比发起失败')
         },
       }
     )
@@ -249,7 +257,14 @@ function DiffSelector() {
             需要先在两个快照上算好 sha256 哈希，才能识别改名与同尺寸改写
           </Typography.Text>
         )}
-        {create.isError && <Alert style={{ marginTop: 16 }} type="error" title={String(create.error)} />}
+        {create.isError && (
+          <Alert
+            style={{ marginTop: 16 }}
+            type="error"
+            showIcon
+            title={apiErrorDetail(create.error)}
+          />
+        )}
       </Card>
 
       <Card title="历史对比">
@@ -259,16 +274,28 @@ function DiffSelector() {
           <Table
             rowKey="diff_id"
             size="small"
+            tableLayout="fixed"
             pagination={{ pageSize: 10 }}
             dataSource={diffs.items}
             columns={[
-              { title: 'ID', dataIndex: 'diff_id', render: (v: string) => <Button type="link" style={{ padding: 0 }} onClick={() => navigate(`/diff?id=${v}`)}>{v}</Button> },
-              { title: 'A', dataIndex: 'a', ellipsis: true },
-              { title: 'B', dataIndex: 'b', ellipsis: true },
-              { title: '创建时间', dataIndex: 'created_at', render: (v: string) => formatDateTime(v) },
-              { title: '耗时', dataIndex: 'duration_ms', render: (v: number) => `${(v / 1000).toFixed(1)} 秒` },
+              {
+                title: 'ID',
+                dataIndex: 'diff_id',
+                width: 280,
+                ellipsis: true,
+                render: (v: string) => (
+                  <Tooltip title={v}>
+                    <Button type="link" style={{ padding: 0 }} onClick={() => navigate(`/diff?id=${v}`)}>{v}</Button>
+                  </Tooltip>
+                ),
+              },
+              { title: 'A', dataIndex: 'a', ellipsis: true, render: (v: string) => <EllipsisText value={v} code /> },
+              { title: 'B', dataIndex: 'b', ellipsis: true, render: (v: string) => <EllipsisText value={v} code /> },
+              { title: '创建时间', dataIndex: 'created_at', width: 150, render: (v: string) => formatDateTime(v) },
+              { title: '耗时', dataIndex: 'duration_ms', width: 90, render: (v: number) => `${(v / 1000).toFixed(1)} 秒` },
               {
                 title: '差异',
+                width: 190,
                 render: (_: unknown, record: { summary: Record<string, number | null> }) => (
                   <Space size={4}>
                     <Tag color="green">+{record.summary?.added ?? 0}</Tag>
@@ -390,11 +417,12 @@ function DiffDetail({ diffId }: { diffId: string }) {
               <Table
                 rowKey="parent_dir"
                 size="small"
+                tableLayout="fixed"
                 pagination={false}
                 scroll={{ y: 320 }}
                 dataSource={summary.by_parent_dir}
                 columns={[
-                  { title: '目录', dataIndex: 'parent_dir', ellipsis: true },
+                  { title: '目录', dataIndex: 'parent_dir', ellipsis: true, render: (v: string) => <EllipsisText value={v} code /> },
                   { title: '变更数', dataIndex: 'count', width: 90 },
                   {
                     title: '净大小变化',
@@ -571,9 +599,11 @@ function DiffEntriesTable({
       sorter: true,
       sortOrder: sort === 'path' ? (order === 'asc' ? 'ascend' as const : 'descend' as const) : null,
       render: (v: string, record: DiffEntry) => (
-        <Button type="link" style={{ padding: 0 }} onClick={() => onRowClick(record)}>
-          {v}
-        </Button>
+        <Tooltip title={v} placement="topLeft" mouseEnterDelay={0.3}>
+          <Button type="link" style={{ padding: 0, maxWidth: '100%' }} onClick={() => onRowClick(record)}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{v}</span>
+          </Button>
+        </Tooltip>
       ),
     },
     {
@@ -653,10 +683,11 @@ function DiffEntriesTable({
         rowKey="id"
         size="small"
         loading={isLoading}
+        tableLayout="fixed"
         columns={columns}
         dataSource={allItems}
         pagination={false}
-        scroll={{ x: 'max-content' }}
+        scroll={{ x: 960 }}
         onChange={onTableChange}
         onRow={(record) => ({
           onContextMenu: (e) => rowMenu.open(e, rowTarget(record)),

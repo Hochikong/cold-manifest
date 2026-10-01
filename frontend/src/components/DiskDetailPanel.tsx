@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Card, Descriptions, Empty, Row, Col, Skeleton, Space, Table, Tag, Typography, Button } from 'antd'
+import { Card, Descriptions, Empty, Row, Col, Skeleton, Space, Table, Tag, Tooltip, Typography, Button } from 'antd'
 import { CheckCircleOutlined, ExclamationCircleOutlined, MedicineBoxOutlined } from '@ant-design/icons'
 import { useDisk } from '../api/hooks'
 import ErrorAlert from './ErrorAlert'
@@ -152,12 +152,24 @@ function VolumesCard({ volumes }: { volumes: DiskVolume[] }) {
           <Table
             rowKey="volume_id"
             size="small"
+            tableLayout="fixed"
             pagination={false}
             columns={[
-              { title: '卷 ID', dataIndex: 'volume_id', ellipsis: true, render: (v: string) => <Button type="link" style={{ padding: 0 }} onClick={() => setSelectedVolumeId(v)}>{v}</Button> },
-              { title: '文件系统', dataIndex: 'filesystem' },
-              { title: '标签', dataIndex: 'label', render: (v: string | null) => v || '-' },
-              { title: '容量', dataIndex: 'capacity_bytes', render: (v: number) => formatFileSize(v) },
+              {
+                title: '卷 ID',
+                dataIndex: 'volume_id',
+                ellipsis: true,
+                render: (v: string) => (
+                  <Tooltip title={v} placement="topLeft" mouseEnterDelay={0.3}>
+                    <Button type="link" style={{ padding: 0, maxWidth: '100%' }} onClick={() => setSelectedVolumeId(v)}>
+                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{v}</span>
+                    </Button>
+                  </Tooltip>
+                ),
+              },
+              { title: '文件系统', dataIndex: 'filesystem', width: 90, ellipsis: true },
+              { title: '标签', dataIndex: 'label', width: 130, ellipsis: true, render: (v: string | null) => v || '-' },
+              { title: '容量', dataIndex: 'capacity_bytes', width: 110, align: 'right' as const, render: (v: number) => formatFileSize(v) },
             ]}
             dataSource={volumes}
             onRow={(record) => ({
@@ -181,10 +193,21 @@ function SnapshotsCard({ snapshots, onSelect }: { snapshots: DiskSnapshot[]; onS
         <Table
           rowKey="snapshot_id"
           size="small"
+          tableLayout="fixed"
           pagination={{ pageSize: 5, hideOnSinglePage: true }}
-          scroll={{ x: 520 }}
+          scroll={{ x: 560 }}
           columns={[
-            { title: '快照 ID', dataIndex: 'snapshot_id', ellipsis: true, width: 170 },
+            {
+              title: '快照 ID',
+              dataIndex: 'snapshot_id',
+              ellipsis: true,
+              width: 170,
+              render: (v: string) => (
+                <Tooltip title={v} placement="topLeft" mouseEnterDelay={0.3}>
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{v}</span>
+                </Tooltip>
+              ),
+            },
             { title: '采集时间', dataIndex: 'collected_at', render: (v: string) => formatDateTime(v), width: 150 },
             { title: '文件数', dataIndex: 'file_count', render: (v: number) => formatNumber(v), width: 90, align: 'right' },
             { title: '总大小', dataIndex: 'total_bytes', render: (v: number) => formatFileSize(v), width: 90, align: 'right' },

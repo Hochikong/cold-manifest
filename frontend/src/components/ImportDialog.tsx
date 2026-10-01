@@ -162,7 +162,7 @@ export default function ImportDialog({ open, onClose }: ImportDialogProps) {
           return next
         })
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e)
+        const msg = apiErrorDetail(e)
         errors.push(`${c.volume_id}: ${msg}`)
         setJobs((prev) => {
           const next = [...prev]

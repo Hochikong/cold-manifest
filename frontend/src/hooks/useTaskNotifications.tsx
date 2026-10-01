@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import { App, Button } from 'antd'
 import { useNavigate } from 'react-router-dom'
+import { useQueryClient } from '@tanstack/react-query'
 import { useTasks } from '../api/hooks'
 import type { Task } from '../api/client'
 import { getTaskSummary, isTerminalStatus, statusLabel, taskTypeLabel } from '../utils/taskNotification'
@@ -93,6 +94,7 @@ export interface TaskNotification {
 export function useTaskNotifications() {
   const { notification } = App.useApp()
   const navigate = useNavigate()
+  const qc = useQueryClient()
   const { data } = useTasks({ limit: 20 }, true)
   const [notified, read] = useSyncExternalStore(
     useCallback((callback) => taskNotifyStore.subscribe(callback), []),
@@ -163,6 +165,45 @@ export function useTaskNotifications() {
     [notification, navigate]
   )
 
+  /**
+   * 任务终态后让受影响的数据查询失效：否则采集/导入完成后，
+   * 侧边菜单进的「快照」「磁盘」等列表页还是旧数据，要 F5 才能看到新快照。
+   * invalidateQueries 用前缀键：['snapshot'] 连详情、['volume-trends'] 连所有卷的趋势一起失效。
+   */
+  const invalidateForTask = useCallback(
+    (task: Task) => {
+      switch (task.type) {
+        case 'collect':
+        case 'import':
+          qc.invalidateQueries({ queryKey: ['snapshots'] })
+          qc.invalidateQueries({ queryKey: ['volumes'] })
+          qc.invalidateQueries({ queryKey: ['disks'] })
+          qc.invalidateQueries({ queryKey: ['volume-trends'] })
+          qc.invalidateQueries({ queryKey: ['volume-detail'] })
+          qc.invalidateQueries({ queryKey: ['snapshot'] })
+          qc.invalidateQueries({ queryKey: ['global-search'] })
+          break
+        case 'hash':
+          qc.invalidateQueries({ queryKey: ['snapshots'] })
+          qc.invalidateQueries({ queryKey: ['snapshot'] })
+          qc.invalidateQueries({ queryKey: ['hash-summary'] })
+          qc.invalidateQueries({ queryKey: ['duplicates'] })
+          break
+        case 'diff':
+          qc.invalidateQueries({ queryKey: ['diffs'] })
+          break
+        case 'build_fts':
+          qc.invalidateQueries({ queryKey: ['search'] })
+          qc.invalidateQueries({ queryKey: ['global-search'] })
+          break
+        case 'build_stats':
+          qc.invalidateQueries({ queryKey: ['snapshot-stats'] })
+          break
+      }
+    },
+    [qc]
+  )
+
   useEffect(() => {
     if (!data) return
 
@@ -178,9 +219,13 @@ export function useTaskNotifications() {
     const toNotify = terminalTasks.filter((task) => !notified.has(task.id))
     if (toNotify.length > 0) {
       taskNotifyStore.markNotified(toNotify.map((task) => task.id))
-      toNotify.forEach((task) => showNotification(task))
+      toNotify.forEach((task) => {
+        // 终态转移：先让数据列表失效（活跃页面立即重取，未挂载页面进页面时重取），再弹通知
+        invalidateForTask(task)
+        showNotification(task)
+      })
     }
-  }, [data, terminalTasks, notified, showNotification])
+  }, [data, terminalTasks, notified, showNotification, invalidateForTask])
 
   const notifications = useMemo(() => {
     return terminalTasks.map((task) => ({

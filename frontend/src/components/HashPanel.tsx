@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Alert,
@@ -22,10 +22,9 @@ import {
   ThunderboltOutlined,
 } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
-import axios from 'axios'
 import { useHashSummary, useSnapshot, useSubmitHash, useTaskEvents } from '../api/hooks'
 import { formatNumber } from '../utils/format'
-import type { HashTaskBody } from '../api/client'
+import { apiErrorDetail, type HashTaskBody, type HashTaskResult } from '../api/client'
 
 const { Text } = Typography
 
@@ -50,10 +49,12 @@ const SCOPE_LABEL: Record<string, string> = {
  * - 提交后内联跟踪任务进度，任务结束后自动刷新策略与计数。
  */
 export default function HashPanel({ snapshotId }: { snapshotId: string }) {
-  const { message } = App.useApp()
+  const { message, notification } = App.useApp()
   const navigate = useNavigate()
   const qc = useQueryClient()
   const submitHash = useSubmitHash()
+  // 最近一次提交的参数：任务结果里 scope 缺失时用来解释「为什么什么都没算」
+  const lastBodyRef = useRef<HashTaskBody | null>(null)
 
   const { data: snapshot } = useSnapshot(snapshotId)
   const meta = snapshot?.meta ?? {}
@@ -83,7 +84,48 @@ export default function HashPanel({ snapshotId }: { snapshotId: string }) {
   useEffect(() => {
     if (!task) return
     if (task.status === 'done') {
-      message.success('哈希任务完成，已刷新统计')
+      // 用后端 result 里的真实数字说话；字段缺失（旧后端）时退化为通用提示
+      const r = (task.result ?? {}) as HashTaskResult
+      const total = typeof r.total === 'number' ? r.total : null
+      const computed = typeof r.computed === 'number' ? r.computed : 0
+      const cached = typeof r.cached === 'number' ? r.cached : 0
+      const errors = typeof r.errors === 'number' ? r.errors : 0
+      const elapsed = typeof r.elapsed_s === 'number' ? r.elapsed_s : null
+      const scope = r.scope ?? lastBodyRef.current?.scope
+      if (total === 0) {
+        message.info({
+          content:
+            scope === 'candidates'
+              ? '没有需要计算的文件：快照里没有大小相同的候选文件，本次无需计算指纹'
+              : '没有需要计算的文件：范围内所有文件都已算过',
+          duration: 6,
+        })
+      } else if (total != null && computed === 0 && cached === 0 && errors === 0) {
+        message.info({
+          content: `哈希任务完成，但没有任何文件被处理（范围 ${formatNumber(total)} 个），统计未变化`,
+          duration: 6,
+        })
+      } else {
+        notification.success({
+          title: '哈希任务完成',
+          description: (
+            <Space orientation="vertical" size={0}>
+              <Text>
+                范围 {total != null ? formatNumber(total) : '—'} 个文件：本次计算{' '}
+                {formatNumber(computed)} 个
+                {cached > 0 ? `，缓存命中 ${formatNumber(cached)} 个` : ''}
+                {errors > 0 && <Text type="danger">，失败 {formatNumber(errors)} 个</Text>}
+              </Text>
+              {elapsed != null && <Text type="secondary">耗时 {elapsed.toFixed(1)} 秒</Text>}
+              {errors > 0 && (
+                <Text type="secondary">失败的文件已标记，下次续算时自动跳过</Text>
+              )}
+            </Space>
+          ),
+          placement: 'top',
+          duration: 8,
+        })
+      }
       qc.invalidateQueries({ queryKey: ['snapshot', snapshotId] })
       qc.invalidateQueries({ queryKey: ['hash-summary', snapshotId] })
       qc.invalidateQueries({ queryKey: ['duplicates', snapshotId] })
@@ -94,9 +136,10 @@ export default function HashPanel({ snapshotId }: { snapshotId: string }) {
       message.info('哈希任务已取消（已算部分保留）')
       qc.invalidateQueries({ queryKey: ['hash-summary', snapshotId] })
     }
-  }, [task, message, qc, snapshotId])
+  }, [task, message, notification, qc, snapshotId])
 
   const submit = async (body: HashTaskBody) => {
+    lastBodyRef.current = body
     try {
       const res = await submitHash.mutateAsync({ snapshot_id: snapshotId, body })
       setTaskId(res.task_id)
@@ -105,13 +148,7 @@ export default function HashPanel({ snapshotId }: { snapshotId: string }) {
         duration: 4,
       })
     } catch (e) {
-      if (axios.isAxiosError(e)) {
-        const detail = e.response?.data
-        const text = typeof detail === 'string' ? detail : (detail as { detail?: string } | undefined)?.detail
-        message.warning(text || '提交失败，请稍后重试')
-      } else {
-        message.error(e instanceof Error ? e.message : String(e))
-      }
+      message.warning(apiErrorDetail(e) || '提交失败，请稍后重试')
     }
   }
 
@@ -229,6 +266,22 @@ export default function HashPanel({ snapshotId }: { snapshotId: string }) {
                 <Button size="small" icon={<StopOutlined />} onClick={() => navigate('/tasks')}>
                   到任务页管理
                 </Button>
+              </Space>
+            }
+          />
+        )}
+
+        {task?.status === 'error' && (
+          <Alert
+            type="error"
+            showIcon
+            title="哈希任务失败"
+            description={
+              <Space orientation="vertical" size={0}>
+                <Text>{task.error ?? '未知错误'}</Text>
+                <Text type="secondary">
+                  常见原因：源盘未挂载或路径已变（「源目录不可用」）、快照库被其他任务占用。确认源盘接入后可重新提交。
+                </Text>
               </Space>
             }
           />

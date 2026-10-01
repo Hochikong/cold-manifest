@@ -554,6 +554,21 @@ export interface HashTaskResponse {
   status: string
 }
 
+/** 哈希任务 result 的已知字段（后端 run_hash_task 返回；字段缺失时不展示对应项）。 */
+export interface HashTaskResult {
+  snapshot_id?: string
+  algo?: string
+  policy?: string
+  scope?: 'incremental' | 'candidates' | 'group'
+  total?: number
+  computed?: number
+  cached?: number
+  errors?: number
+  bytes_hashed?: number
+  elapsed_s?: number
+  host_path?: string
+}
+
 /** 提交按需哈希任务（scope=candidates 只算大小重复的候选文件，通常秒级~分钟级）。 */
 export async function submitHashTask(snapshot_id: string, body: HashTaskBody): Promise<HashTaskResponse> {
   const { data } = await client.post(`/snapshots/${encodeURIComponent(snapshot_id)}/hash`, body)
@@ -833,7 +848,7 @@ export async function rebuildCatalog(dry_run: boolean): Promise<RebuildCatalogSu
   return data
 }
 
-/** 从 axios 错误里取后端 detail（字符串优先），退化到 error.message。 */
+/** 从 axios 错误里取后端 detail：字符串优先；{detail:{message}} 取 message；兜底 error.message。 */
 export function apiErrorDetail(e: unknown): string {
   if (axios.isAxiosError(e)) {
     const data: unknown = e.response?.data
@@ -841,7 +856,11 @@ export function apiErrorDetail(e: unknown): string {
     if (data && typeof data === 'object' && 'detail' in data) {
       const d = (data as { detail?: unknown }).detail
       if (typeof d === 'string' && d) return d
-      if (d && typeof d === 'object') return JSON.stringify(d)
+      if (d && typeof d === 'object') {
+        const m = (d as { message?: unknown }).message
+        if (typeof m === 'string' && m) return m
+        return JSON.stringify(d)
+      }
     }
   }
   return e instanceof Error ? e.message : String(e)

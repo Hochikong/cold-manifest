@@ -197,10 +197,10 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
           rowKey={(r) => `${r.path}\u0000${r.warning_type}`}
           size="small"
           loading={isLoading}
+          tableLayout="fixed"
           columns={columns}
           dataSource={items}
           pagination={false}
-          scroll={{ x: 'max-content' }}
           locale={{ emptyText: <Empty description={isLoading ? '加载中…' : '没有跳过项（采集完整）'} /> }}
         />
         {cursor && (

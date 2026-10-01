@@ -5,6 +5,8 @@ import { ReloadOutlined, StopOutlined, ApartmentOutlined } from '@ant-design/ico
 import { useTasks, useCancelTask, useBatch } from '../api/hooks'
 import { listTasks, type Task, type Batch, type TaskStatus } from '../api/client'
 import ErrorAlert from '../components/ErrorAlert'
+import EllipsisText from '../components/EllipsisText'
+import { useShowApiError } from '../utils/apiError'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatDateTime } from '../utils/format'
 
@@ -212,6 +214,7 @@ export default function TasksPage() {
   const error = multiMode ? multiError : singleError
 
   const cancelTaskMutation = useCancelTask()
+  const showApiError = useShowApiError()
 
   const handleCancel = (record: Task) => {
     Modal.confirm({
@@ -221,8 +224,13 @@ export default function TasksPage() {
       okButtonProps: { danger: true, icon: <StopOutlined /> },
       cancelText: '再等等',
       onOk: async () => {
-        await cancelTaskMutation.mutateAsync(record.id)
-        if (multiMode) void fetchMultiPage({}, false)
+        try {
+          await cancelTaskMutation.mutateAsync(record.id)
+          if (multiMode) void fetchMultiPage({}, false)
+        } catch (e) {
+          // 取消失败（任务已结束/后端拒绝）也要让用户看到原因
+          showApiError(e, '取消任务失败')
+        }
       },
     })
   }
@@ -233,6 +241,7 @@ export default function TasksPage() {
       dataIndex: 'id',
       ellipsis: true,
       width: 160,
+      render: (v: string) => <EllipsisText value={v} code />,
     },
     {
       title: '类型',
@@ -378,10 +387,11 @@ export default function TasksPage() {
           <Table
             rowKey="id"
             size="small"
+            tableLayout="fixed"
             columns={columns}
             dataSource={visibleItems}
             pagination={false}
-            scroll={{ x: 'max-content' }}
+            scroll={{ x: 960 }}
           />
           {hasMore && !typeFilter && (
             <div style={{ textAlign: 'center', marginTop: 16 }}>

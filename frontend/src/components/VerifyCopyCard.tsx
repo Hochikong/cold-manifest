@@ -14,9 +14,8 @@ import {
 } from 'antd'
 import { CloseOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
-import axios from 'axios'
 import { useVerifyCopy } from '../api/hooks'
-import type { VerifyCopyReport, VerifyCopySample } from '../api/client'
+import { apiErrorDetail, type VerifyCopyReport, type VerifyCopySample } from '../api/client'
 
 const { Text } = Typography
 
@@ -34,18 +33,6 @@ const SAMPLE_STATUS_META: Record<string, { color: string; label: string }> = {
 }
 
 type VerifyScope = 'sample' | 'full'
-
-function axiosDetail(e: unknown): string {
-  if (axios.isAxiosError(e)) {
-    const detail = e.response?.data
-    if (typeof detail === 'string') return detail
-    if (detail && typeof detail === 'object' && 'detail' in detail) {
-      const d = (detail as { detail?: unknown }).detail
-      if (typeof d === 'string') return d
-    }
-  }
-  return e instanceof Error ? e.message : String(e)
-}
 
 /**
  * 「校验盘上副本」按钮 + 范围选择弹窗：抽样 200（快）/ 全量（慢，附耗时提示）。
@@ -73,7 +60,7 @@ export function VerifyCopyButton({
       setOpen(false)
       onResult(report)
     } catch (e) {
-      setError(axiosDetail(e))
+      setError(apiErrorDetail(e))
     }
   }
 
@@ -234,6 +221,7 @@ export function VerifyCopyResultCard({
           <Table
             rowKey="path"
             size="small"
+            tableLayout="fixed"
             pagination={false}
             dataSource={abnormal.slice(0, 10)}
             columns={[
