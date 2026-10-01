@@ -403,22 +403,31 @@ export async function getVolumeTrends(volume_id: string, limit?: number): Promis
   return data
 }
 
+export type DuplicateMode = 'content' | 'name' | 'fingerprint'
+
 export interface DuplicateItem {
-  hash_hex: string
+  /** content/fingerprint 档：组哈希；name 档无此字段 */
+  hash_hex?: string
+  /** name 档：组内文件名（MIN(name) 二进制序） */
+  name?: string
   size_bytes: number
   count: number
-  wasted_bytes: number
+  /** name 档为 null（无法得知真实浪费） */
+  wasted_bytes: number | null
+  /** fingerprint 档：组内是否全部为完整哈希 */
+  verified?: boolean
   paths: string[]
   paths_truncated: boolean
 }
 
 export interface DuplicatesResponse {
   snapshot_id: string
-  hash_algo: string
+  mode: DuplicateMode
+  hash_algo: string | null
   min_size: number
   hashed_files: number
   duplicate_groups: number
-  total_wasted_bytes: number
+  total_wasted_bytes: number | null
   items: DuplicateItem[]
   has_more: boolean
   next_cursor: string | null
@@ -426,11 +435,29 @@ export interface DuplicatesResponse {
 
 export async function getDuplicates(
   snapshot_id: string,
-  params?: { min_size?: number; limit?: number; cursor?: string }
+  params?: { mode?: DuplicateMode; min_size?: number; limit?: number; cursor?: string }
 ): Promise<DuplicatesResponse> {
   const { data } = await client.get(`/snapshots/${encodeURIComponent(snapshot_id)}/duplicates`, {
     params,
   })
+  return data
+}
+
+export interface HashTaskBody {
+  algo?: 'sha256'
+  policy: 'full' | 'sampled'
+  root?: string
+  scope?: 'incremental' | 'candidates'
+}
+
+export interface HashTaskResponse {
+  task_id: string
+  status: string
+}
+
+/** 提交按需哈希任务（scope=candidates 只算大小重复的候选文件，通常秒级~分钟级）。 */
+export async function submitHashTask(snapshot_id: string, body: HashTaskBody): Promise<HashTaskResponse> {
+  const { data } = await client.post(`/snapshots/${encodeURIComponent(snapshot_id)}/hash`, body)
   return data
 }
 

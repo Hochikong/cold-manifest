@@ -12,6 +12,7 @@ import {
   listVolumes,
   getVolumeTrends,
   getDuplicates,
+  type DuplicateMode,
   listDiffs,
   createDiff,
   getDiff,
@@ -180,7 +181,7 @@ export function useVolumeTrends(volume_id: string | undefined, limit?: number) {
 
 export function useDuplicates(
   snapshot_id: string | undefined,
-  params?: { min_size?: number; limit?: number; cursor?: string }
+  params?: { mode?: DuplicateMode; min_size?: number; limit?: number; cursor?: string }
 ) {
   return useQuery({
     queryKey: ['duplicates', snapshot_id, params],
