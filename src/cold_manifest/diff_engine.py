@@ -50,7 +50,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .catalog import connect_catalog, snapshot_path
-from .db import open_snapshot
+from .db import file_uri, open_snapshot
 from .schema import DIFF_DDL
 
 _BATCH_SIZE = 10_000
@@ -131,11 +131,20 @@ def _sealed_snapshot(data_root: "str | Path", snapshot_id: str) -> Path:
         raise DiffError(f"非法快照 ID：{snapshot_id!r}（{e}）") from e
     if not db.is_file():
         raise DiffError(f"快照不存在：{snapshot_id}（{db}）")
-    conn = open_snapshot(db)
+    try:
+        conn = open_snapshot(db)
+    except sqlite3.Error as e:
+        raise DiffError(
+            f"无法打开快照库：{snapshot_id}（{db}）——路径含 .. 段或文件损坏/"
+            "无法打开，请检查路径与文件完整性") from e
     try:
         row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
         if not row or row[0] != "sealed":
             raise DiffError(f"快照未封库，不能参与 diff：{snapshot_id}")
+    except sqlite3.Error as e:
+        raise DiffError(
+            f"无法读取快照库：{snapshot_id}（{db}）——路径含 .. 段或文件损坏/"
+            "无法打开，请检查路径与文件完整性") from e
     finally:
         conn.close()
     return db
@@ -194,7 +203,7 @@ def _read_existing_status(db: Path) -> "str | None":
     if not db.is_file():
         return None
     try:
-        conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(file_uri(db, immutable=False), uri=True)
     except sqlite3.Error:
         return None
     try:
@@ -347,10 +356,15 @@ def _materialize_sql(conn: sqlite3.Connection, db_a: Path, db_b: Path,
     conn.execute("PRAGMA temp_store=FILE")
     conn.execute("PRAGMA cache_size=-65536")
     try:
-        conn.execute("ATTACH DATABASE ? AS sna",
-                     (f"file:{db_a.as_posix()}?mode=ro&immutable=1",))
-        conn.execute("ATTACH DATABASE ? AS snb",
-                     (f"file:{db_b.as_posix()}?mode=ro&immutable=1",))
+        try:
+            conn.execute("ATTACH DATABASE ? AS sna",
+                         (file_uri(db_a, immutable=True),))
+            conn.execute("ATTACH DATABASE ? AS snb",
+                         (file_uri(db_b, immutable=True),))
+        except sqlite3.Error as e:
+            raise DiffError(
+                f"无法 ATTACH 快照库：{db_a} / {db_b}——"
+                f"路径含 .. 段或无法打开（{e}）；请检查路径与文件完整性") from e
 
         # 1. matched 对（index-only，顺序）+ removed/added id 集合（index-only 反连接）
         conn.executescript(
@@ -659,6 +673,32 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
                           evidence=ev, reused=True,
                           elapsed_s=time.monotonic() - t0)
 
+    try:
+        return _materialize_new(data_root, a, b, opts, ohash, ojson, did, out_db, t0)
+    except DiffError as e:
+        # diff_runs 记 error（可读失败，不静默）：尽力而为，catalog 打不开则跳过
+        try:
+            cat = connect_catalog(data_root)
+            try:
+                cat.execute(
+                    "INSERT OR REPLACE INTO diff_runs(diff_id, a, b, options_hash, options_json,"
+                    " created_at, duration_ms, status, summary_json, result_path)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (did, a, b, ohash, ojson,
+                     datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     int((time.monotonic() - t0) * 1000), "error",
+                     json.dumps({"error": str(e)}, ensure_ascii=False), None))
+                cat.commit()
+            finally:
+                cat.close()
+        except Exception:
+            pass
+        raise
+
+
+def _materialize_new(data_root: Path, a: str, b: str, opts: dict, ohash: str,
+                     ojson: str, did: str, out_db: Path, t0: float) -> DiffResult:
+    """materialize_diff 的实际物化路径（失败由外层记 diff_runs error）。"""
     db_a = _sealed_snapshot(data_root, a)
     db_b = _sealed_snapshot(data_root, b)
     hash_enabled = opts["hash"] != "none"
@@ -666,6 +706,7 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
     ig_m = opts.get("ignore_mtime", False)
     ig_s = opts.get("ignore_size", False)
     show_id = opts.get("show_identical", False)
+    db_b = _sealed_snapshot(data_root, b)
 
     # case_insensitive 前置校验：path_norm 缺失即报错（不静默降级到精确 path）
     if ci:
@@ -745,7 +786,7 @@ def materialize_diff(data_root: "str | Path", a: str, b: str,
 
 
 def _read_summary(db: Path) -> dict:
-    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(file_uri(db, immutable=False), uri=True)
     try:
         row = conn.execute("SELECT value FROM diff_meta WHERE key='summary_json'").fetchone()
         return json.loads(row[0]) if row else {}
@@ -757,7 +798,7 @@ def _read_evidence(db: Path) -> "tuple[str | None, dict | None]":
     """读 diff_meta 的 evidence_level / evidence_json；旧库返回 (None, None)。"""
     if not db.is_file():
         return None, None
-    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(file_uri(db, immutable=False), uri=True)
     try:
         try:
             rows = dict(conn.execute(
@@ -781,7 +822,7 @@ def iter_diff_csv(db: Path, depth: "int | None" = None):
     type 取 A 侧（缺失取 B 侧）；type_changed 两侧类型都存在且不同时记 'a->b'
     （类型直接读 diff_entries.a_type/b_type，物化时已填充）。
     """
-    main = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    main = sqlite3.connect(file_uri(db, immutable=False), uri=True)
     try:
         where = "WHERE depth <= ?" if depth is not None else ""
         params = (depth,) if depth is not None else ()

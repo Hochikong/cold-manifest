@@ -19,8 +19,10 @@ def _default_data_root() -> str:
 
     与 serve / start.cmd / cldm.cmd 的口径保持一致，保证包内 CLI 与
     Web 服务默认使用同一个数据根（<包根>\\data）。
+    返回前 resolve()：start.cmd 的 %~dp0 展开会带 `..` 段，后续
+    file: URI 构造（db.file_uri）依赖归一化后的绝对路径。
     """
-    return os.environ.get("CLDM_DATA_ROOT") or "./data"
+    return str(Path(os.environ.get("CLDM_DATA_ROOT") or "./data").resolve())
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -865,6 +867,11 @@ def _cmd_import_db(args: argparse.Namespace) -> int:
 def main(argv: "list[str] | None" = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    # 统一归一化 --data-root：用户显式传入的路径可能含 `..` 段或相对段，
+    # 后续 file: URI 构造（db.file_uri）依赖归一化后的绝对路径。
+    if getattr(args, "data_root", None):
+        args.data_root = str(Path(args.data_root).resolve())
 
     if args.command == "serve":
         import uvicorn

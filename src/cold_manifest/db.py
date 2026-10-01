@@ -6,14 +6,34 @@ from pathlib import Path
 from .schema import CATALOG_DDL, SNAPSHOT_DDL
 
 
+def file_uri(path: "str | Path", *, immutable: bool = True) -> str:
+    """构造只读打开 SQLite 库的 file: URI（全项目唯一构造点）。
+
+    为什么必须统一走这里：Windows 上数据根常形如 `D:\\pkg\\bin\\..\\..\\data`
+    （start.cmd 的 %~dp0 展开），直接把未归一化路径手拼进
+    `file:{path}?mode=ro` 会让 SQLite 报 "unable to open database"——
+    SQLite 的 URI 解析不处理 `..` 段，Windows 盘符形态 `D:/...` 也必须
+    以 `file:///D:/...` 开头才能识别。此处先 `resolve()` 消掉 `..`/`.`
+    与符号链接，再用 `Path.as_uri()` 做百分号编码（空格、中文等），
+    最后追加 `mode=ro`（immutable=True 时加 `immutable=1`）。
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        raise ValueError(f"路径必须是绝对路径：{path}（请先 resolve()）")
+    p = p.resolve()
+    uri = p.as_uri() + "?mode=ro"
+    if immutable:
+        uri += "&immutable=1"
+    return uri
+
+
 def open_snapshot(path: "str | Path", check_same_thread: bool = True) -> sqlite3.Connection:
     """只读打开快照库。
 
     immutable=1 声明文件不再变化：跳过锁与缓存校验，只读查询最快
     （封库后的 snapshot.db 是不可变制品）。
     """
-    p = Path(path).resolve().as_posix()
-    conn = sqlite3.connect(f"file:{p}?mode=ro&immutable=1", uri=True,
+    conn = sqlite3.connect(file_uri(path, immutable=True), uri=True,
                            check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     return conn

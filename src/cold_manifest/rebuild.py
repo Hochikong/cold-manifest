@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import (connect_catalog, create_batch, validate_volume_id)
+from .db import file_uri
 from .seal import is_sealed
 
 
@@ -34,7 +35,7 @@ _TS_RE = re.compile(r"^\d{8}T\d{6}Z$")
 
 def read_snapshot_meta(db_path: "str | Path") -> dict:
     """只读读取快照库 meta 键值；库打不开/无 meta 表 → sqlite3.Error。"""
-    conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(file_uri(Path(db_path), immutable=False), uri=True)
     try:
         return {r[0]: r[1] for r in conn.execute("SELECT key, value FROM meta")}
     finally:
@@ -43,7 +44,7 @@ def read_snapshot_meta(db_path: "str | Path") -> dict:
 
 def read_snapshot_stats(db_path: "str | Path") -> dict:
     """从快照库实数统计（与 collect 封库期统计同口径）。"""
-    conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(file_uri(Path(db_path), immutable=False), uri=True)
     try:
         return {
             "file_count": conn.execute(

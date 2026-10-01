@@ -8,6 +8,7 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
+from .db import file_uri
 from .schema import SNAPSHOT_INDEXES_DDL
 from .stats_cache import build_stats_cache
 
@@ -178,7 +179,7 @@ def is_collect_orphan(ts_dir: Path) -> bool:
         return True
     resumable = (ts_dir / "scan_journal.jsonl").is_file()
     try:
-        conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(file_uri(db, immutable=False), uri=True)
     except sqlite3.Error:
         return False
     try:
@@ -198,7 +199,7 @@ def is_collect_orphan(ts_dir: Path) -> bool:
 def is_sealed(db_path) -> bool:
     """快照库是否已封库（meta 中存在 status=sealed）。库缺失/损坏 → False。"""
     try:
-        conn = sqlite3.connect(f"file:{Path(db_path).as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(file_uri(Path(db_path), immutable=False), uri=True)
     except sqlite3.Error:
         return False
     try:

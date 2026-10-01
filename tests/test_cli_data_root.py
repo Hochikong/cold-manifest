@@ -1,5 +1,6 @@
 """CLI --data-root 默认值（env 优先）与「快照未注册」报错带数据根提示。"""
 import os
+from pathlib import Path
 
 import pytest
 
@@ -13,7 +14,7 @@ def _clean_env(monkeypatch):
 
 def test_default_data_root_falls_back_to_dot_slash_data():
     args = _build_parser().parse_args(["hash", "VOL/20260101T000000Z"])
-    assert args.data_root == "./data"
+    assert args.data_root == str(Path("./data").resolve())
 
 
 def test_default_data_root_prefers_env(monkeypatch):

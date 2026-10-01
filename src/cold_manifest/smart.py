@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .db import file_uri
+
 # parse_smart 输出键（API/测试契约）
 SMART_KEYS = (
     "health",            # passed | failed | unavailable
@@ -236,7 +238,7 @@ def _read_meta_raw(db_path: Path) -> "str | None":
     if not db_path.is_file():
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path.resolve().as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(file_uri(db_path, immutable=False), uri=True)
     except sqlite3.Error:
         return None
     try:

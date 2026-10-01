@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from .db import init_catalog, open_catalog
+from .db import file_uri, init_catalog, open_catalog
 
 # volume_id 出现在文件路径中，禁止路径分隔符与 ..
 _VOLUME_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
@@ -274,7 +274,7 @@ def _read_snapshot_meta_scan_root(data_root: Path, snapshot_id: str) -> "str | N
     if not db.is_file():
         return None
     try:
-        conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(file_uri(db, immutable=False), uri=True)
     except sqlite3.Error:
         return None
     try:

@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .db import file_uri
 from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume, register_snapshot,
                       snapshot_path, validate_volume_id)
 from .schema import SNAPSHOT_TABLES_DDL
@@ -278,7 +279,7 @@ def _build_dir_rollup(conn: sqlite3.Connection) -> None:
 def _is_sealed(db_path: Path) -> bool:
     """快照库是否已封库（meta 中存在 status=sealed）。"""
     try:
-        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        conn = sqlite3.connect(file_uri(db_path, immutable=False), uri=True)
     except sqlite3.Error:
         return False
     try:

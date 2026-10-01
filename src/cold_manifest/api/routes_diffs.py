@@ -18,6 +18,7 @@ from ..diff_engine import (DiffError, diff_db_path, iter_diff_csv, materialize_d
                            _read_evidence)
 from ..report import generate_diff_report
 from .pagination import decode_cursor, encode_cursor
+from ..db import file_uri
 from .state import AppState, get_state
 
 router = APIRouter(prefix="/api/diffs", tags=["diffs"])
@@ -37,7 +38,7 @@ def _open_diff_ro(state: AppState, diff_id: str) -> sqlite3.Connection:
     db = diff_db_path(state.data_root, diff_id)
     if not db.is_file():
         raise HTTPException(status_code=404, detail=f"diff 不存在：{diff_id}")
-    conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(file_uri(db, immutable=False), uri=True)
     conn.row_factory = sqlite3.Row
     row = conn.execute("SELECT value FROM diff_meta WHERE key='status'").fetchone()
     if not row or row[0] != "done":

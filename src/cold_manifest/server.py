@@ -32,7 +32,9 @@ _FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 
 def _resolve_data_root(explicit: "str | None" = None) -> str:
-    return explicit or os.environ.get("CLDM_DATA_ROOT") or "./data"
+    # resolve()：CLDM_DATA_ROOT / start.cmd 传入的路径可能含 `..` 段，
+    # file: URI 构造（db.file_uri）依赖归一化后的绝对路径。
+    return str(Path(explicit or os.environ.get("CLDM_DATA_ROOT") or "./data").resolve())
 
 
 def create_app(data_root: "str | None" = None) -> FastAPI:

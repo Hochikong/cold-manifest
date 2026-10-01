@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any
 
+from .db import file_uri
+
 # 与 diff_engine._COUNTED / routes_diffs._CATEGORIES 一致；identical 不落库，只进摘要
 _SECTION_CATEGORIES = ("added", "removed", "type_changed", "size_changed",
                        "mtime_changed", "content_changed", "moved_or_renamed")
@@ -71,7 +73,7 @@ def _esc(v: Any) -> str:
 
 
 def _open_ro(db: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{Path(db).as_posix()}?mode=ro", uri=True)
+    conn = sqlite3.connect(file_uri(Path(db), immutable=False), uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
