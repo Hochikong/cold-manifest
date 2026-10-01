@@ -1,15 +1,18 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Card, Table, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal, Drawer } from 'antd'
+import { Card, Table, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal, Drawer, Select, Tooltip } from 'antd'
 import { ReloadOutlined, StopOutlined, ApartmentOutlined } from '@ant-design/icons'
 import { useTasks, useCancelTask, useBatch } from '../api/hooks'
-import { listTasks, type Task, type Batch } from '../api/client'
+import { listTasks, type Task, type Batch, type TaskStatus } from '../api/client'
 import ErrorAlert from '../components/ErrorAlert'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatDateTime } from '../utils/format'
 
 const { Text } = Typography
 const PAGE_SIZE = 20
+
+/** 后端 GET /api/tasks?status= 只接受单个状态（且不含 cancelling）；多选由前端并行请求合并。 */
+const FILTERABLE_STATUSES: TaskStatus[] = ['pending', 'running', 'done', 'error', 'cancelled']
 
 const statusMap: Record<Task['status'], { label: string; color: string }> = {
   pending: { label: '待处理', color: 'default' },
@@ -35,6 +38,19 @@ const batchStatusMap: Record<Batch['status'], { label: string; color: string }> 
   partial: { label: '部分完成', color: 'warning' },
 }
 
+function isActiveStatus(t: Task): boolean {
+  return t.status === 'pending' || t.status === 'running' || t.status === 'cancelling'
+}
+
+function byCreatedDesc(a: Task, b: Task): number {
+  return (b.created_at ?? '').localeCompare(a.created_at ?? '')
+}
+
+interface StatusCursor {
+  cursor: string | null
+  hasMore: boolean
+}
+
 export default function TasksPage() {
   const navigate = useNavigate()
   const [items, setItems] = useState<Task[]>([])
@@ -42,30 +58,104 @@ export default function TasksPage() {
   const [loadingMore, setLoadingMore] = useState(false)
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null)
 
-  const { data, isLoading, error } = useTasks({ limit: PAGE_SIZE }, true)
-  const cancelTaskMutation = useCancelTask()
+  const [statusFilter, setStatusFilter] = useState<TaskStatus[]>([])
+  const [typeFilter, setTypeFilter] = useState<Task['type'] | undefined>(undefined)
+  const multiMode = statusFilter.length >= 2
+
+  // 单请求模式（未筛选 / 单状态）：走 useTasks，活跃任务 4s 轮询
+  const { data, isLoading, error: singleError, refetch } = useTasks({ limit: PAGE_SIZE, status: statusFilter[0] }, !multiMode)
+
+  // 多状态并行合并
+  const [multiLoading, setMultiLoading] = useState(false)
+  const [multiError, setMultiError] = useState<unknown>(null)
+  const [cursors, setCursors] = useState<Record<string, StatusCursor>>({})
   const hasPagedRef = useRef(false)
+  const hasActiveRef = useRef(false)
 
   useEffect(() => {
-    if (data) {
-      if (!hasPagedRef.current) {
-        setItems(data.items)
-        setCursor(data.next_cursor)
-      } else {
-        setItems((prev) => {
-          const seen = new Set(data.items.map((t) => t.id))
-          const tail = prev.filter((t) => !seen.has(t.id))
-          return [...data.items, ...tail]
-        })
-      }
-    }
-  }, [data])
+    hasActiveRef.current = multiMode && items.some(isActiveStatus)
+  }, [multiMode, items])
 
-  const loadMore = async () => {
+  /** 清空累积，从头拉（筛选变化时由 onChange 调用）。 */
+  const resetPaging = useCallback(() => {
+    setItems([])
+    setCursor(null)
+    setCursors({})
+    setMultiError(null)
+    hasPagedRef.current = false
+  }, [])
+
+  const applyStatusFilter = (v: TaskStatus[]) => {
+    setStatusFilter(v)
+    resetPaging()
+  }
+
+  /** 拉一页（每状态各一页）并按创建时间倒序合并；append=false 时保留旧尾部去重（轮询不丢已加载页）。 */
+  const fetchMultiPage = useCallback(
+    async (cursorMap: Record<string, string | undefined>, append: boolean) => {
+      setMultiLoading(true)
+      try {
+        const results = await Promise.all(
+          statusFilter.map(async (s) => {
+            const res = await listTasks({ limit: PAGE_SIZE, status: s, cursor: cursorMap[s] })
+            return [s, res] as const
+          }),
+        )
+        const fresh = results.flatMap(([, r]) => r.items)
+        setItems((prev) => {
+          const seen = new Set(fresh.map((t) => t.id))
+          const base = prev.filter((t) => !seen.has(t.id))
+          const merged = append ? [...base, ...fresh] : [...fresh, ...base]
+          return merged.sort(byCreatedDesc)
+        })
+        setCursors(
+          Object.fromEntries(results.map(([s, r]) => [s, { cursor: r.next_cursor, hasMore: r.has_more }])),
+        )
+        setMultiError(null)
+      } catch (e) {
+        setMultiError(e)
+      } finally {
+        setMultiLoading(false)
+      }
+    },
+    [statusFilter],
+  )
+
+  // 多状态模式：首拉（延后一拍，避免 effect 内同步 setState）+ 活跃任务轮询
+  useEffect(() => {
+    if (!multiMode) return
+    const first = window.setTimeout(() => {
+      void fetchMultiPage({}, false)
+    }, 0)
+    const timer = window.setInterval(() => {
+      if (hasActiveRef.current) void fetchMultiPage({}, false)
+    }, 4_000)
+    return () => {
+      window.clearTimeout(first)
+      window.clearInterval(timer)
+    }
+  }, [multiMode, fetchMultiPage])
+
+  // 单请求模式：合并刷新数据（保留已翻页尾部）
+  useEffect(() => {
+    if (multiMode || !data) return
+    if (!hasPagedRef.current) {
+      setItems(data.items)
+      setCursor(data.next_cursor)
+    } else {
+      setItems((prev) => {
+        const seen = new Set(data.items.map((t) => t.id))
+        const tail = prev.filter((t) => !seen.has(t.id))
+        return [...data.items, ...tail]
+      })
+    }
+  }, [data, multiMode])
+
+  const loadMoreSingle = async () => {
     if (!cursor) return
     setLoadingMore(true)
     try {
-      const res = await listTasks({ limit: PAGE_SIZE, cursor })
+      const res = await listTasks({ limit: PAGE_SIZE, cursor, status: statusFilter[0] })
       hasPagedRef.current = true
       setItems((prev) => [...prev, ...res.items])
       setCursor(res.next_cursor)
@@ -73,6 +163,55 @@ export default function TasksPage() {
       setLoadingMore(false)
     }
   }
+
+  const loadMoreMulti = async () => {
+    const next: Record<string, string | undefined> = {}
+    for (const [s, c] of Object.entries(cursors)) {
+      if (c.hasMore && c.cursor) next[s] = c.cursor
+    }
+    if (Object.keys(next).length === 0) return
+    setLoadingMore(true)
+    try {
+      const results = await Promise.all(
+        statusFilter
+          .filter((s) => next[s])
+          .map(async (s) => {
+            const res = await listTasks({ limit: PAGE_SIZE, status: s, cursor: next[s] })
+            return [s, res] as const
+          }),
+      )
+      const fresh = results.flatMap(([, r]) => r.items)
+      setItems((prev) => {
+        const seen = new Set(prev.map((t) => t.id))
+        return [...prev, ...fresh.filter((t) => !seen.has(t.id))].sort(byCreatedDesc)
+      })
+      setCursors((prev) => {
+        const out = { ...prev }
+        for (const [s, r] of results) out[s] = { cursor: r.next_cursor, hasMore: r.has_more }
+        return out
+      })
+      hasPagedRef.current = true
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
+  const loadMore = () => (multiMode ? loadMoreMulti() : loadMoreSingle())
+  const refresh = () => {
+    if (multiMode) void fetchMultiPage({}, false)
+    else void refetch()
+  }
+
+  const visibleItems = useMemo(
+    () => (typeFilter ? items.filter((t) => t.type === typeFilter) : items),
+    [items, typeFilter],
+  )
+  const hasMore = multiMode
+    ? Object.values(cursors).some((c) => c.hasMore)
+    : cursor != null
+  const error = multiMode ? multiError : singleError
+
+  const cancelTaskMutation = useCancelTask()
 
   const handleCancel = (record: Task) => {
     Modal.confirm({
@@ -83,6 +222,7 @@ export default function TasksPage() {
       cancelText: '再等等',
       onOk: async () => {
         await cancelTaskMutation.mutateAsync(record.id)
+        if (multiMode) void fetchMultiPage({}, false)
       },
     })
   }
@@ -192,28 +332,58 @@ export default function TasksPage() {
 
   return (
     <Card>
-      <Space style={{ marginBottom: 16, justifyContent: 'space-between', width: '100%' }}>
+      <Space style={{ marginBottom: 12, justifyContent: 'space-between', width: '100%' }}>
         <Text strong style={{ fontSize: 16 }}>任务</Text>
-        <Button icon={<ReloadOutlined />} loading={isLoading} onClick={() => window.location.reload()}>
+        <Button icon={<ReloadOutlined />} loading={isLoading || multiLoading} onClick={refresh}>
           刷新
         </Button>
       </Space>
 
-      {error && <ErrorAlert error={error} />}
+      <Space wrap style={{ marginBottom: 16 }}>
+        <Select
+          mode="multiple"
+          allowClear
+          placeholder="全部状态"
+          style={{ minWidth: 280 }}
+          value={statusFilter}
+          onChange={applyStatusFilter}
+          maxTagCount="responsive"
+          options={FILTERABLE_STATUSES.map((s) => ({ value: s, label: statusMap[s].label }))}
+        />
+        <Tooltip title="类型筛选作用于已加载的任务（后端暂不支持按类型过滤）">
+          <Select
+            allowClear
+            placeholder="全部类型"
+            style={{ width: 150 }}
+            value={typeFilter}
+            onChange={(v) => setTypeFilter(v)}
+            options={(Object.keys(typeMap) as Task['type'][]).map((t) => ({ value: t, label: typeMap[t] }))}
+          />
+        </Tooltip>
+        {(statusFilter.length > 0 || typeFilter) && (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {statusFilter.length > 1 ? '多状态筛选并行查询后合并' : statusFilter.length === 1 ? '按状态过滤' : null}
+            {statusFilter.length > 0 && typeFilter ? '；' : ''}
+            {typeFilter ? '类型为前端过滤' : ''}
+          </Text>
+        )}
+      </Space>
 
-      {isLoading && !items.length ? (
+      {error ? <ErrorAlert error={error} /> : null}
+
+      {(isLoading || multiLoading) && !items.length ? (
         <Spin style={{ display: 'block', margin: '32px auto' }} />
-      ) : items.length ? (
+      ) : visibleItems.length ? (
         <>
           <Table
             rowKey="id"
             size="small"
             columns={columns}
-            dataSource={items}
+            dataSource={visibleItems}
             pagination={false}
             scroll={{ x: 'max-content' }}
           />
-          {cursor && (
+          {hasMore && !typeFilter && (
             <div style={{ textAlign: 'center', marginTop: 16 }}>
               <Button loading={loadingMore} onClick={loadMore}>
                 加载更多
@@ -222,7 +392,7 @@ export default function TasksPage() {
           )}
         </>
       ) : (
-        <Empty description="暂无任务" />
+        <Empty description={statusFilter.length || typeFilter ? '没有符合条件的任务' : '暂无任务'} />
       )}
 
       <BatchDrawer batchId={selectedBatchId} onClose={() => setSelectedBatchId(null)} />

@@ -28,6 +28,7 @@ import {
   Progress,
   App,
 } from 'antd'
+import type { TableProps } from 'antd'
 import {
   FolderOutlined,
   FileOutlined,
@@ -68,8 +69,10 @@ import HashPanel from '../components/HashPanel'
 import SkippedPanel from '../components/SkippedPanel'
 import OnDiskCopyBadge from '../components/OnDiskCopyBadge'
 import { VerifyCopyButton, VerifyCopyResultCard } from '../components/VerifyCopyCard'
+import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
-import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, listEntries, searchEntries, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport } from '../api/client'
+import { dirNameOf, joinChildPath } from '../utils/path'
+import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, listEntries, searchEntries, getTree, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport } from '../api/client'
 import axios from 'axios'
 
 const { Title, Text } = Typography
@@ -86,8 +89,34 @@ function getSnapshotDisplayName(snapshot_id: string) {
   return parts.length > 1 ? `${parts[0]} / ${parts[1]}` : snapshot_id
 }
 
-function sortArrow(order: Order) {
-  return order === 'asc' ? '↑' : '↓'
+function toTreeNode(d: TreeDir): TreeNodeData {
+  return { key: d.entry_id, title: d.name, entryId: d.entry_id, isLeaf: d.dir_count === 0, icon: <FolderOutlined /> }
+}
+
+interface DirChainNode {
+  entryId: number
+  children: TreeNodeData[]
+}
+
+/** 沿路径逐级走 tree 接口定位目录 entry_id；返回沿途节点用于展开目录树。找不到的段停在最后命中层。 */
+async function resolveDirChain(snapshotId: string, path: string): Promise<{ entryId: number; nodes: DirChainNode[] }> {
+  const segments = path.split('/').filter(Boolean)
+  const nodes: DirChainNode[] = []
+  let parentId = 0
+  let current = await getTree(snapshotId, parentId)
+  for (const seg of segments) {
+    const found = current.dirs.find((d) => d.name === seg)
+    if (!found) break
+    parentId = found.entry_id
+    current = await getTree(snapshotId, parentId)
+    nodes.push({ entryId: parentId, children: current.dirs.map(toTreeNode) })
+  }
+  return { entryId: parentId, nodes }
+}
+
+function toAntSortOrder(active: boolean, order: Order): 'ascend' | 'descend' | null {
+  if (!active) return null
+  return order === 'asc' ? 'ascend' : 'descend'
 }
 
 export default function SnapshotsPage() {
@@ -789,10 +818,49 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
   const [drawerEntry, setDrawerEntry] = useState<Entry | null>(null)
   const [treeData, setTreeData] = useState<TreeNodeData[]>([])
   const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([])
+  const rowMenu = useRowContextMenu()
 
   useEffect(() => {
     setParentId(parentIdParam)
   }, [parentIdParam])
+
+  // 全局搜索「打开所在快照浏览」：沿 open_path 逐级定位目录，并展开目录树沿途节点
+  const openPath = searchParams.get('open_path')
+  useEffect(() => {
+    if (openPath === null) return
+    let cancelled = false
+    const clean = openPath.replace(/^\/+|\/+$/g, '')
+    const finish = (parentIdResolved: number, nodes: DirChainNode[]) => {
+      if (cancelled) return
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.delete('open_path')
+          next.set('parent_id', String(parentIdResolved))
+          return next
+        },
+        { replace: true },
+      )
+      if (nodes.length) {
+        setExpandedKeys((prevKeys) => Array.from(new Set([...prevKeys, ...nodes.map((n) => n.entryId)])))
+        setTreeData((prev) => {
+          let merged = prev
+          for (const node of nodes) merged = updateTreeChildren(merged, node.entryId, node.children)
+          return merged
+        })
+      }
+    }
+    if (clean === '') {
+      finish(0, [])
+      return
+    }
+    void resolveDirChain(snapshotId, clean)
+      .then((r) => finish(r.entryId, r.nodes))
+      .catch(() => finish(0, []))
+    return () => {
+      cancelled = true
+    }
+  }, [openPath, snapshotId, setSearchParams])
 
   const { data: treeRoot, isLoading: treeLoading } = useTree(snapshotId, 0)
   const { data: entriesRes, isLoading: entriesLoading, error: entriesError } = useEntries(snapshotId, {
@@ -833,15 +901,7 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
 
   useEffect(() => {
     if (treeRoot?.dirs) {
-      setTreeData(
-        treeRoot.dirs.map((d) => ({
-          key: d.entry_id,
-          title: d.name,
-          entryId: d.entry_id,
-          isLeaf: d.dir_count === 0,
-          icon: <FolderOutlined />,
-        }))
-      )
+      setTreeData(treeRoot.dirs.map(toTreeNode))
     }
   }, [treeRoot])
 
@@ -849,13 +909,7 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
     async (node: TreeNodeData) => {
       const res = await fetch(`/api/snapshots/${encodeURIComponent(snapshotId)}/tree?parent_id=${node.entryId}`)
       const data = await res.json()
-      const children: TreeNodeData[] = data.dirs.map((d: TreeDir) => ({
-        key: d.entry_id,
-        title: d.name,
-        entryId: d.entry_id,
-        isLeaf: d.dir_count === 0,
-        icon: <FolderOutlined />,
-      }))
+      const children: TreeNodeData[] = data.dirs.map(toTreeNode)
       setTreeData((prev) => updateTreeChildren(prev, node.key, children))
     },
     [snapshotId]
@@ -890,20 +944,34 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
     }
   }
 
-  const toggleSort = (key: SortKey) => {
-    if (sort === key) {
-      setOrder(order === 'asc' ? 'desc' : 'asc')
-    } else {
-      setSort(key)
-      setOrder('asc')
+  const onTableChange: TableProps<Entry>['onChange'] = (_pagination, _filters, sorter) => {
+    const s = Array.isArray(sorter) ? sorter[0] : sorter
+    if (!s || !s.columnKey || !s.order) return
+    const key = s.columnKey as SortKey
+    const nextOrder: Order = s.order === 'descend' ? 'desc' : 'asc'
+    if (key === sort && nextOrder === order) return
+    setSort(key)
+    setOrder(nextOrder)
+  }
+
+  const browseTarget = (record: Entry): RowContextTarget => {
+    const path = joinChildPath(entriesRes?.parent_path, record.name)
+    return {
+      path,
+      name: record.name,
+      snapshotId,
+      openDirPath: record.type === 'dir' ? path : dirNameOf(path),
     }
   }
 
-  const columns = [
+  const columns: TableProps<Entry>['columns'] = [
     {
       title: '名称',
       dataIndex: 'name',
       key: 'name',
+      ellipsis: true,
+      sorter: true,
+      sortOrder: toAntSortOrder(sort === 'name', order),
       render: (_: string, record: Entry) => (
         <Space>
           {record.type === 'dir' ? <FolderOutlined /> : <FileOutlined />}
@@ -933,9 +1001,11 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
       render: (v: string) => (v === 'dir' ? '目录' : v === 'file' ? '文件' : v),
     },
     {
-      title: `大小 ${sort === 'size' ? sortArrow(order) : ''}`,
+      title: '大小',
       key: 'size',
       width: 140,
+      sorter: true,
+      sortOrder: toAntSortOrder(sort === 'size', order),
       render: (_: unknown, record: Entry) => {
         if (record.type === 'dir' && record.rollup) {
           return (
@@ -946,14 +1016,14 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
         }
         return formatFileSize(record.size_bytes)
       },
-      onHeaderCell: () => ({ onClick: () => toggleSort('size') }),
     },
     {
-      title: `修改时间 ${sort === 'mtime' ? sortArrow(order) : ''}`,
+      title: '修改时间',
       key: 'mtime',
       width: 170,
+      sorter: true,
+      sortOrder: toAntSortOrder(sort === 'mtime', order),
       render: (_: unknown, record: Entry) => nsToDate(record.mtime_ns),
-      onHeaderCell: () => ({ onClick: () => toggleSort('mtime') }),
     },
     {
       title: '扩展名',
@@ -1079,6 +1149,10 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
               dataSource={allItems}
               pagination={false}
               scroll={{ x: 'max-content' }}
+              onChange={onTableChange}
+              onRow={(record) => ({
+                onContextMenu: (e) => rowMenu.open(e, browseTarget(record)),
+              })}
               locale={{ emptyText: <Empty description="空目录" /> }}
             />
             {cursor && (
@@ -1091,6 +1165,7 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
           </Card>
         </Col>
       </Row>
+      {rowMenu.element}
 
       <Drawer
         title={drawerEntry?.name}
@@ -1151,6 +1226,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   const { message } = App.useApp()
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const rowMenu = useRowContextMenu()
   const [q, setQ] = useState('')
   const [mode, setMode] = useState<SearchMode>('prefix')
   const [typeFilter, setTypeFilter] = useState<string | undefined>(undefined)
@@ -1289,6 +1365,14 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     { title: '扩展名', dataIndex: 'ext', width: 100, render: (v: string) => v || '-' },
   ]
 
+  // 快照内搜索后端无 sort 参数（按 path 固定排序），不提供表头排序
+  const searchTarget = (record: SearchItem): RowContextTarget => ({
+    path: record.path,
+    name: record.name,
+    snapshotId,
+    openDirPath: record.type === 'dir' ? record.path : dirNameOf(record.path),
+  })
+
   const placeholder = mode === 'fulltext' ? '输入关键词（至少 3 个字符）…' : '输入关键词前缀…'
   const infoDescription =
     mode === 'fulltext'
@@ -1387,7 +1471,17 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
         <Card title={`搜索结果（${formatNumber(results.length)} 条）`}>
           {results.length ? (
             <>
-              <Table rowKey="entry_id" size="small" columns={columns} dataSource={results} pagination={false} scroll={{ x: 'max-content' }} />
+              <Table
+                rowKey="entry_id"
+                size="small"
+                columns={columns}
+                dataSource={results}
+                pagination={false}
+                scroll={{ x: 'max-content' }}
+                onRow={(record) => ({
+                  onContextMenu: (e) => rowMenu.open(e, searchTarget(record)),
+                })}
+              />
               {cursor && (
                 <div style={{ textAlign: 'center', marginTop: 16 }}>
                   <Button loading={loadingMore} onClick={loadMore}>加载更多</Button>
@@ -1399,6 +1493,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
           )}
         </Card>
       )}
+      {rowMenu.element}
 
       {!hasSearched && (
         <Alert

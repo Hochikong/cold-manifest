@@ -9,7 +9,9 @@ import {
   getTree,
   getDu,
   searchEntries,
+  globalSearch,
   listVolumes,
+  getVolumeDetail,
   getVolumeTrends,
   getDuplicates,
   getSkipped,
@@ -42,6 +44,7 @@ import {
   deleteSnapshot,
   type ListEntriesParams,
   type SearchParams,
+  type GlobalSearchParams,
   type DiffEntriesParams,
   type DiffCreateBody,
   type ImportCreateBody,
@@ -129,6 +132,26 @@ export function useVolumes() {
     queryKey: ['volumes'],
     queryFn: listVolumes,
     staleTime: 60_000,
+  })
+}
+
+/** 跨快照全局搜索；enabled 由调用方按「关键词 ≥2 字符」传入。 */
+export function useGlobalSearch(params: GlobalSearchParams, enabled: boolean) {
+  return useQuery({
+    queryKey: ['global-search', params],
+    queryFn: () => globalSearch(params),
+    enabled,
+    staleTime: 15_000,
+  })
+}
+
+/** 卷详情（身份 + 该卷快照列表）。 */
+export function useVolumeDetail(volume_id: string | undefined) {
+  return useQuery({
+    queryKey: ['volume-detail', volume_id],
+    queryFn: () => getVolumeDetail(volume_id!),
+    enabled: !!volume_id,
+    staleTime: 30_000,
   })
 }
 

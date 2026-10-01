@@ -20,6 +20,7 @@ import {
   Drawer,
   Badge,
 } from 'antd'
+import type { TableProps } from 'antd'
 import {
   SwapOutlined,
   PlayCircleOutlined,
@@ -29,8 +30,10 @@ import {
 import ReactECharts from 'echarts-for-react'
 import { useSnapshots, useDiffs, useDiff, useDiffSummary, useDiffEntries, useCreateDiff } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
 import { formatFileSize, formatDateTime, nsToDate } from '../utils/format'
-import { exportDiffUrl, diffReportUrl, type DiffEntry } from '../api/client'
+import { dirNameOf } from '../utils/path'
+import { exportDiffUrl, diffReportUrl, listDiffEntries, type DiffEntry } from '../api/client'
 
 const { Title, Text } = Typography
 
@@ -423,7 +426,7 @@ function DiffDetail({ diffId }: { diffId: string }) {
           </Space>
         }
       >
-        <DiffEntriesTable diffId={diffId} category={category} onRowClick={setDrawerEntry} />
+        <DiffEntriesTable diffId={diffId} category={category} onRowClick={setDrawerEntry} aSnapshotId={diff?.a ?? ''} />
       </Card>
 
       <Drawer
@@ -438,24 +441,31 @@ function DiffDetail({ diffId }: { diffId: string }) {
   )
 }
 
+type DiffSortKey = 'path' | 'size_delta'
+
 function DiffEntriesTable({
   diffId,
   category,
   onRowClick,
+  aSnapshotId,
 }: {
   diffId: string
   category: string | undefined
   onRowClick: (e: DiffEntry) => void
+  aSnapshotId: string
 }) {
   const [allItems, setAllItems] = useState<DiffEntry[]>([])
   const [cursor, setCursor] = useState<string | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
+  const [sort, setSort] = useState<DiffSortKey>('path')
+  const [order, setOrder] = useState<'asc' | 'desc'>('asc')
+  const rowMenu = useRowContextMenu()
 
   const { data, isLoading, error } = useDiffEntries(diffId, {
     category,
     limit: 200,
-    sort: 'path',
-    order: 'asc',
+    sort,
+    order,
   })
 
   useEffect(() => {
@@ -468,20 +478,39 @@ function DiffEntriesTable({
   const loadMore = async () => {
     if (!cursor) return
     setLoadingMore(true)
-    const res = await fetch(
-      `/api/diffs/${diffId}/entries?limit=200&sort=path&order=asc${category ? `&category=${category}` : ''}&cursor=${encodeURIComponent(cursor)}`
-    )
-    const json = await res.json()
-    setAllItems((prev) => [...prev, ...json.items])
-    setCursor(json.next_cursor)
-    setLoadingMore(false)
+    try {
+      const res = await listDiffEntries(diffId, { category, limit: 200, sort, order, cursor })
+      setAllItems((prev) => [...prev, ...res.items])
+      setCursor(res.next_cursor)
+    } finally {
+      setLoadingMore(false)
+    }
   }
+
+  const onTableChange: TableProps<DiffEntry>['onChange'] = (_pagination, _filters, sorter) => {
+    const s = Array.isArray(sorter) ? sorter[0] : sorter
+    if (!s || !s.columnKey || !s.order) return
+    const key = s.columnKey as DiffSortKey
+    const nextOrder = s.order === 'descend' ? 'desc' : 'asc'
+    if (key === sort && nextOrder === order) return
+    setSort(key)
+    setOrder(nextOrder)
+  }
+
+  const rowTarget = (record: DiffEntry): RowContextTarget => ({
+    path: record.path,
+    snapshotId: aSnapshotId,
+    openDirPath: dirNameOf(record.path),
+  })
 
   const columns = [
     {
       title: '路径',
       dataIndex: 'path',
+      key: 'path',
       ellipsis: true,
+      sorter: true,
+      sortOrder: sort === 'path' ? (order === 'asc' ? 'ascend' as const : 'descend' as const) : null,
       render: (v: string, record: DiffEntry) => (
         <Button type="link" style={{ padding: 0 }} onClick={() => onRowClick(record)}>
           {v}
@@ -517,6 +546,19 @@ function DiffEntriesTable({
       ),
     },
     {
+      title: '大小变化',
+      dataIndex: 'size_delta',
+      key: 'size_delta',
+      width: 120,
+      sorter: true,
+      sortOrder: sort === 'size_delta' ? (order === 'asc' ? 'ascend' as const : 'descend' as const) : null,
+      render: (v: number | null) => (
+        <Text style={{ color: v == null || v === 0 ? undefined : v > 0 ? '#52c41a' : '#ff4d4f' }}>
+          {v == null || v === 0 ? '—' : `${v > 0 ? '+' : ''}${formatFileSize(v)}`}
+        </Text>
+      ),
+    },
+    {
       title: 'A 修改时间',
       dataIndex: 'a_mtime_ns',
       width: 170,
@@ -541,6 +583,10 @@ function DiffEntriesTable({
         dataSource={allItems}
         pagination={false}
         scroll={{ x: 'max-content' }}
+        onChange={onTableChange}
+        onRow={(record) => ({
+          onContextMenu: (e) => rowMenu.open(e, rowTarget(record)),
+        })}
         locale={{ emptyText: <Empty description="无差异文件" /> }}
       />
       {cursor && (
@@ -548,6 +594,7 @@ function DiffEntriesTable({
           <Button loading={loadingMore} onClick={loadMore}>加载更多</Button>
         </div>
       )}
+      {rowMenu.element}
     </div>
   )
 }

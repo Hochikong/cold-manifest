@@ -6,6 +6,7 @@ import DiffPage from './pages/DiffPage'
 import DisksPage from './pages/DisksPage'
 import TasksPage from './pages/TasksPage'
 import SettingsPage from './pages/SettingsPage'
+import SearchPage from './pages/SearchPage'
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
         <Route path="/diff" element={<DiffPage />} />
         <Route path="/disks" element={<DisksPage />} />
         <Route path="/tasks" element={<TasksPage />} />
+        <Route path="/search" element={<SearchPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Route>
     </Routes>

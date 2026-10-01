@@ -940,4 +940,84 @@ export async function getSettings(): Promise<SettingsResponse> {
   return data
 }
 
+// ---------------------------------------------------------------- 全局搜索（顶栏 / Ctrl+K）
+
+/** 跨快照搜索命中行（GET /api/search；只搜已封存快照，最多最近 20 个）。 */
+export interface GlobalSearchItem {
+  snapshot_id: string
+  volume_id: string
+  collected_at: string | null
+  entry_id: number
+  path: string
+  name: string
+  type: 'file' | 'dir'
+  size_bytes: number | null
+  mtime_ns: number | null
+}
+
+export interface GlobalSearchResponse {
+  q: string
+  mode: string
+  items: GlobalSearchItem[]
+  has_more: boolean
+  next_cursor: string | null
+  /** snapshots = 实际扫过的快照数；fulltext_used = 是否至少一库真正走了全文索引 */
+  scanned: { snapshots: number; fulltext_used: boolean }
+}
+
+export interface GlobalSearchParams {
+  /** 至少 2 个字符（后端强制，strip 后判断） */
+  q: string
+  mode?: 'prefix' | 'fulltext'
+  limit?: number
+  cursor?: string
+  volume_id?: string
+  snapshot_id?: string
+  /** 后端只支持 file | dir */
+  type?: 'file' | 'dir'
+}
+
+export async function globalSearch(params: GlobalSearchParams): Promise<GlobalSearchResponse> {
+  const { data } = await client.get<GlobalSearchResponse>('/search', { params })
+  return data
+}
+
+// ---------------------------------------------------------------- 卷详情
+
+/** GET /api/volumes/{id} 返回的快照行（按采集时间升序）。 */
+export interface VolumeDetailSnapshot {
+  snapshot_id: string
+  batch_id: string | null
+  collected_at: string | null
+  status: string
+  hash_policy: string | null
+  file_count: number | null
+  dir_count: number | null
+  total_bytes: number | null
+  max_depth: number | null
+  skipped_count: number | null
+}
+
+/** 卷详情 = volumes 行 + 所属磁盘身份 + 该卷全部快照。 */
+export interface VolumeDetail {
+  volume_id: string
+  disk_id: string
+  partition_index: number | null
+  partition_uuid: string | null
+  volume_serial_hex: string | null
+  filesystem: string
+  label: string | null
+  capacity_bytes: number | null
+  notes: string | null
+  physical_model: string | null
+  physical_serial: string | null
+  disk_capacity_bytes: number | null
+  snapshots: VolumeDetailSnapshot[]
+}
+
+export async function getVolumeDetail(volume_id: string): Promise<VolumeDetail> {
+  const { data } = await client.get<VolumeDetail>(`/volumes/${encodeURIComponent(volume_id)}`)
+  return data
+}
+
 export default client

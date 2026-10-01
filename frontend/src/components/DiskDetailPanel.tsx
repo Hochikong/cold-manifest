@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Card, Descriptions, Empty, Row, Col, Skeleton, Space, Table, Tag, Typography, Button } from 'antd'
 import { CheckCircleOutlined, ExclamationCircleOutlined, MedicineBoxOutlined } from '@ant-design/icons'
@@ -5,6 +6,7 @@ import { useDisk } from '../api/hooks'
 import ErrorAlert from './ErrorAlert'
 import SmartTrendsChart from './SmartTrendsChart'
 import VolumeTrendsChart from './VolumeTrendsChart'
+import VolumeDetailDrawer from './VolumeDetailDrawer'
 import { formatDateTime, formatFileSize, formatNumber } from '../utils/format'
 import type { DiskVolume, DiskSnapshot, SmartItem } from '../api/client'
 
@@ -136,23 +138,35 @@ function HealthCard({ smart }: { smart: SmartItem | { health: string; temperatur
 }
 
 function VolumesCard({ volumes }: { volumes: DiskVolume[] }) {
+  const [selectedVolumeId, setSelectedVolumeId] = useState<string | null>(null)
   return (
-    <Card title="卷列表" size="small">
+    <Card
+      title="卷列表"
+      size="small"
+      extra={volumes.length > 0 ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>点击行查看卷详情</Typography.Text> : undefined}
+    >
       {volumes.length === 0 ? (
         <Empty description="该盘没有注册卷" />
       ) : (
-        <Table
-          rowKey="volume_id"
-          size="small"
-          pagination={false}
-          columns={[
-            { title: '卷 ID', dataIndex: 'volume_id', ellipsis: true },
-            { title: '文件系统', dataIndex: 'filesystem' },
-            { title: '标签', dataIndex: 'label', render: (v: string | null) => v || '-' },
-            { title: '容量', dataIndex: 'capacity_bytes', render: (v: number) => formatFileSize(v) },
-          ]}
-          dataSource={volumes}
-        />
+        <>
+          <Table
+            rowKey="volume_id"
+            size="small"
+            pagination={false}
+            columns={[
+              { title: '卷 ID', dataIndex: 'volume_id', ellipsis: true, render: (v: string) => <Button type="link" style={{ padding: 0 }} onClick={() => setSelectedVolumeId(v)}>{v}</Button> },
+              { title: '文件系统', dataIndex: 'filesystem' },
+              { title: '标签', dataIndex: 'label', render: (v: string | null) => v || '-' },
+              { title: '容量', dataIndex: 'capacity_bytes', render: (v: number) => formatFileSize(v) },
+            ]}
+            dataSource={volumes}
+            onRow={(record) => ({
+              onClick: () => setSelectedVolumeId(record.volume_id),
+              style: { cursor: 'pointer' },
+            })}
+          />
+          <VolumeDetailDrawer volumeId={selectedVolumeId} onClose={() => setSelectedVolumeId(null)} />
+        </>
       )}
     </Card>
   )

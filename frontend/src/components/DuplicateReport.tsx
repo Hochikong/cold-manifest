@@ -25,7 +25,9 @@ import {
 } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import ErrorAlert from './ErrorAlert'
+import { useRowContextMenu } from '../hooks/useRowContextMenu'
 import { formatFileSize, formatNumber } from '../utils/format'
+import { dirNameOf } from '../utils/path'
 import {
   getDuplicates,
   submitHashTask,
@@ -99,6 +101,7 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
   const { message } = App.useApp()
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const rowMenu = useRowContextMenu()
   const { data: settings } = useSettings()
   const { data: snapshot } = useSnapshot(snapshotId)
 
@@ -440,10 +443,18 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
                     expandedRowRender: (record) => (
                       <Space orientation="vertical" style={{ width: '100%' }}>
                         {record.paths.map((p, idx) => (
-                          <Text key={idx}>
-                            <FileTextOutlined style={{ marginRight: 8 }} />
-                            {p}
-                          </Text>
+                          <div
+                            key={idx}
+                            style={{ cursor: 'context-menu' }}
+                            onContextMenu={(e) =>
+                              rowMenu.open(e, { path: p, snapshotId, openDirPath: dirNameOf(p) })
+                            }
+                          >
+                            <Text>
+                              <FileTextOutlined style={{ marginRight: 8 }} />
+                              {p}
+                            </Text>
+                          </div>
                         ))}
                         {record.paths_truncated && (
                           <Text type="warning">仅列出前 20 条路径，完整清单请用 CLI 导出 CSV。</Text>
@@ -555,6 +566,7 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
           </Card>
         </>
       )}
+      {rowMenu.element}
     </div>
   )
 }

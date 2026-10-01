@@ -1,4 +1,4 @@
-import { Layout, Menu, Input, Space, Typography } from 'antd'
+import { Layout, Menu, Space, Typography } from 'antd'
 import {
   DashboardOutlined,
   DatabaseOutlined,
@@ -10,9 +10,9 @@ import {
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useTaskNotifications } from '../hooks/useTaskNotifications'
 import NotificationBell from '../components/NotificationBell'
+import GlobalSearch from '../components/GlobalSearch'
 
 const { Sider, Header, Content } = Layout
-const { Search } = Input
 
 const NAV_ITEMS = [
   { key: '/overview', icon: <DashboardOutlined />, label: '总览' },
@@ -65,16 +65,11 @@ export default function AppLayout() {
           <Space style={{ width: '100%', justifyContent: 'space-between' }}>
             <Typography.Text strong>冷备清单 · 元数据采集与比对</Typography.Text>
             <Space>
+              <GlobalSearch />
               <NotificationBell
                 notifications={notifications}
                 unreadCount={unreadCount}
                 onMarkAllRead={markAllRead}
-              />
-              {/* 占位搜索框：后续由 designer 决定全局搜索行为 */}
-              <Search
-                placeholder="搜索快照 / 路径…"
-                style={{ width: 280 }}
-                disabled
               />
             </Space>
           </Space>
