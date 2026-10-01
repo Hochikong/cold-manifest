@@ -42,6 +42,7 @@ import {
   listDisks,
   getDisk,
   getDiskSmartHistory,
+  readDiskSmartNow,
   collectPreflight,
   deleteSnapshot,
   type ListEntriesParams,
@@ -180,6 +181,13 @@ export function useDiskSmartHistory(disk_id: string | undefined) {
     queryFn: () => getDiskSmartHistory(disk_id!),
     enabled: !!disk_id,
     staleTime: 60_000,
+  })
+}
+
+/** 现场读取 SMART（不写库）；404=盘不在线，ok=false=读失败（原因在 message/attempts）。 */
+export function useDiskSmartRead() {
+  return useMutation({
+    mutationFn: (disk_id: string) => readDiskSmartNow(disk_id),
   })
 }
 

@@ -28,7 +28,7 @@ import {
   WarningOutlined,
 } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
-import { useAttachedDisks, useCreateCollect, useCancelTask, useTaskEvents, useBatch, useCollectPreflight } from '../api/hooks'
+import { useAttachedDisks, useCreateCollect, useCancelTask, useTaskEvents, useBatch, useCollectPreflight, useSnapshot, useDisk } from '../api/hooks'
 import { apiErrorDetail, isBatchCollectResponse, type BatchCollectCreateResponse, type Task, type Batch, type AttachedDisk } from '../api/client'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatFileSize, formatNumber } from '../utils/format'
@@ -343,6 +343,9 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
                 description={<DoneDescription task={singleTask} />}
               />
             )}
+            {singleTask.status === 'done' && singleTask.result?.snapshot_id && (
+              <CollectSmartHint snapshotId={singleTask.result.snapshot_id} />
+            )}
             {singleTask.status === 'cancelled' && (
               <Alert type="warning" showIcon title="已取消" description={singleTask.message ?? '采集任务已被取消'} />
             )}
@@ -505,9 +508,12 @@ function BatchChildTaskRow({ index, taskId, plannedVolume, onViewSnapshot }: Bat
       </div>
       {task.status === 'done' && task.result?.snapshot_id && (
         <div style={{ marginTop: 8 }}>
-          <Button type="link" style={{ padding: 0 }} onClick={() => onViewSnapshot(task.result!.snapshot_id!)}>
-            查看快照
-          </Button>
+          <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+            <Button type="link" style={{ padding: 0 }} onClick={() => onViewSnapshot(task.result!.snapshot_id!)}>
+              查看快照
+            </Button>
+            <CollectSmartHint snapshotId={task.result!.snapshot_id!} />
+          </Space>
         </div>
       )}
     </div>
@@ -695,6 +701,33 @@ function PreflightSection({ path }: { path: string }) {
               ))}
             </Space>
           )}
+        </Space>
+      }
+    />
+  )
+}
+
+/**
+ * 采集完成后检查这块盘的 SMART 是否读取失败（disk 详情的 smart_error 正好指向
+ * 本次快照时才提示，避免老快照的失败误报）。给出可操作的建议，而不是默默略过。
+ */
+function CollectSmartHint({ snapshotId }: { snapshotId: string }) {
+  const { data: snap } = useSnapshot(snapshotId)
+  const { data: disk } = useDisk(snap?.disk_id)
+  const err = disk?.smart_error
+  if (!err || err.snapshot_id !== snapshotId) return null
+  return (
+    <Alert
+      type="warning"
+      showIcon
+      title="SMART 未能读取（不影响元数据采集）"
+      description={
+        <Space orientation="vertical" size={4} style={{ width: '100%' }}>
+          <Text>{err.smart_error}</Text>
+          <Text type="secondary">
+            常见处理：安装 smartmontools；以管理员/root 身份运行；USB 桥接盘加 <Text code>-d sat</Text>。
+            盘接好后可在磁盘页点「现在读取 SMART」重试。
+          </Text>
         </Space>
       }
     />

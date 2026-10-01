@@ -1,4 +1,5 @@
-import { Card, Table, Typography, Empty, Spin } from 'antd'
+import { Card, Table, Typography, Empty, Spin, Tag } from 'antd'
+import { CheckCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons'
 import { useDisks } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
@@ -56,6 +57,17 @@ export default function DisksPage() {
       render: (v: string | null) => v || '-',
     },
     { title: '容量', dataIndex: 'capacity_bytes', key: 'capacity_bytes', width: 100, align: 'right' as const, render: (v: number) => formatFileSize(v) },
+    {
+      title: '健康',
+      key: 'health',
+      width: 90,
+      render: (_: unknown, record: Disk) => {
+        const health = record.latest_smart?.health
+        if (health === 'passed') return <Tag color="success" icon={<CheckCircleOutlined />}>正常</Tag>
+        if (health === 'failed') return <Tag color="error" icon={<ExclamationCircleOutlined />}>异常</Tag>
+        return <Tag>未采集</Tag>
+      },
+    },
     { title: '卷数', dataIndex: 'volume_count', key: 'volume_count', width: 70, align: 'right' as const, render: (v: number) => formatNumber(v) },
     { title: '快照数', dataIndex: 'snapshot_count', key: 'snapshot_count', width: 80, align: 'right' as const, render: (v: number) => formatNumber(v) },
   ]

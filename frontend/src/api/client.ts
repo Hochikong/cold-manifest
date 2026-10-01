@@ -402,6 +402,10 @@ export interface DiskDetail extends Disk {
   notes: string | null
   volumes: DiskVolume[]
   snapshots: DiskSnapshot[]
+  /** 详情接口返回 disk_smart 全行（含 raw_json/source），比列表摘要更全 */
+  latest_smart: LatestSmartFull | null
+  /** 最新一个带 meta.smart_error 的快照（解释「为什么没有 SMART」） */
+  smart_error: SmartErrorInfo | null
 }
 
 export async function getDisk(disk_id: string): Promise<DiskDetail> {
@@ -434,6 +438,91 @@ export interface SmartHistoryResponse {
 export async function getDiskSmartHistory(disk_id: string): Promise<SmartHistoryResponse> {
   const { data } = await client.get(`/disks/${encodeURIComponent(disk_id)}/smart`)
   return data
+}
+
+/** 盘详情里的 smart_error（最新一个带 meta.smart_error 的快照）：解释「为什么没有 SMART」。 */
+export interface SmartErrorInfo {
+  smart_error: string
+  smart_error_raw: string | null
+  snapshot_id: string
+}
+
+/** 盘详情返回的 latest_smart：disk_smart 全行 + source（catalog=历史表，meta=老快照 meta 现场解析）。 */
+export interface LatestSmartFull extends LatestSmart {
+  start_stop_ct: number | null
+  spin_up_ms: number | null
+  device_type: string | null
+  raw_json: string | null
+  snapshot_id?: string
+  source?: string
+}
+
+/** POST /disks/{id}/smart/read 单次尝试记录。 */
+export interface SmartReadAttempt {
+  device_type: string
+  rc: number | null
+  error: string | null
+  stderr_excerpt: string
+}
+
+/** parse_smart 输出（含真盘身份字段 model/serial/firmware）。 */
+export interface ParsedSmart {
+  health: string
+  temperature_c: number | null
+  power_on_hours: number | null
+  reallocated_ct: number | null
+  pending_ct: number | null
+  start_stop_ct: number | null
+  spin_up_ms: number | null
+  device_type: string | null
+  model: string | null
+  serial: string | null
+  firmware: string | null
+}
+
+/** 现场读取 SMART 返回（不写库）。ok=false 时 message/attempts/raw_excerpt 给出人话原因。 */
+export interface SmartReadResult {
+  disk_id: string
+  device: string
+  ok: boolean
+  device_type: string
+  reason: string | null
+  message: string | null
+  raw_excerpt: string
+  attempts: SmartReadAttempt[]
+  parsed: ParsedSmart | null
+}
+
+/** 对当前插着的盘现场读一次 SMART；盘不在线时后端 404（由调用方处理）。 */
+export async function readDiskSmartNow(disk_id: string): Promise<SmartReadResult> {
+  const { data } = await client.post(`/disks/${encodeURIComponent(disk_id)}/smart/read`, {})
+  return data
+}
+
+/** 真盘身份（来自 smartctl：-i 段）。 */
+export interface SmartIdentity {
+  model: string | null
+  serial: string | null
+  firmware: string | null
+  capacity_bytes: number | null
+}
+
+/** 从 smartctl 原始 JSON 文本解析真盘身份；坏 JSON/全空返回 null（前端本地解析，不发请求）。 */
+export function parseSmartIdentity(raw_json: string | null | undefined): SmartIdentity | null {
+  if (!raw_json) return null
+  try {
+    const j = JSON.parse(raw_json) as Record<string, unknown>
+    if (!j || typeof j !== 'object') return null
+    const model = (j.model_name as string | undefined) || (j.device_model as string | undefined) || null
+    const serial = ((j.serial_number as string | undefined) || '').trim() || null
+    const firmware = (j.firmware_version as string | undefined) || null
+    const cap = (j.user_capacity as { bytes?: number } | undefined)?.bytes
+    const capacity_bytes = typeof cap === 'number' ? cap : null
+    if (!model && !serial && !firmware && capacity_bytes == null) return null
+    return { model, serial, firmware, capacity_bytes }
+  } catch {
+    return null
+  }
 }
 
 export interface PreflightBody {

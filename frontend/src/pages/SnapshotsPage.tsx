@@ -199,13 +199,15 @@ export default function SnapshotsPage() {
       }
     } catch (e) {
       if (axios.isAxiosError(e) && e.response?.status === 409) {
-        const detail = e.response.data
-        if (detail && typeof detail === 'object' && 'message' in detail) {
+        // 409 响应体形如 {"detail": {message, diffs, tasks}}；detail 也可能是字符串或其他
+        const body = e.response.data as { detail?: unknown } | undefined
+        const detail = body?.detail
+        if (detail && typeof detail === 'object' && 'message' in (detail as Record<string, unknown>)) {
           const blocked = detail as DeleteSnapshotBlocked
           setDeleteBlocked(blocked)
           setDeleteError(blocked.message)
         } else {
-          setDeleteError(typeof detail === 'string' ? detail : '删除被阻塞，请确认相关任务或对比')
+          setDeleteError(typeof detail === 'string' && detail ? detail : '删除被阻塞，请确认相关任务或对比')
         }
       } else {
         setDeleteError(apiErrorDetail(e))
@@ -1537,6 +1539,7 @@ function DeleteSnapshotModal({
   onCancel: () => void
   onConfirm: () => void
 }) {
+  const navigate = useNavigate()
   if (!target) return null
 
   const hasForceRequirement = !!blocked && (blocked.diffs.length > 0 || blocked.tasks.length > 0)
@@ -1584,10 +1587,34 @@ function DeleteSnapshotModal({
               <Space orientation="vertical" size="small" style={{ width: '100%' }}>
                 <Text>{blocked!.message}</Text>
                 {blocked!.diffs.length > 0 && (
-                  <Text type="secondary">关联对比：{blocked!.diffs.join(', ')}</Text>
+                  <div>
+                    <Text type="secondary">关联对比（点击查看）：</Text>
+                    <div style={{ marginTop: 4 }}>
+                      {blocked!.diffs.map((id) => (
+                        <Button
+                          key={id}
+                          type="link"
+                          size="small"
+                          style={{ padding: 0, marginRight: 12 }}
+                          icon={<LinkOutlined />}
+                          onClick={() => navigate(`/diff?id=${encodeURIComponent(id)}`)}
+                        >
+                          <Text code>{id}</Text>
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
                 )}
                 {blocked!.tasks.length > 0 && (
-                  <Text type="secondary">活跃任务：{blocked!.tasks.join(', ')}</Text>
+                  <div>
+                    <Text type="secondary">活跃任务：</Text>
+                    {blocked!.tasks.map((id) => (
+                      <Text key={id} code style={{ marginRight: 8 }}>{id}</Text>
+                    ))}
+                    <Button type="link" size="small" style={{ padding: 0 }} onClick={() => navigate('/tasks')}>
+                      到任务页查看
+                    </Button>
+                  </div>
                 )}
                 <Checkbox checked={force} onChange={(e) => forceChange(e.target.checked)}>
                   我已确认，同时删除相关对比（<Text code>force=true</Text>）
@@ -1597,7 +1624,7 @@ function DeleteSnapshotModal({
           />
         )}
 
-        {error && !hasForceRequirement && <Alert type="error" showIcon message={error} />}
+        {error && !hasForceRequirement && <Alert type="error" showIcon title={error} />}
       </Space>
     </Modal>
   )
