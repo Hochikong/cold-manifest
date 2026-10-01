@@ -44,7 +44,18 @@ packaging\windows\cldm.cmd verify-copy VOL_P0\20260101T000000Z --sample 200
 
 :: 导出 CSV（默认写到**当前目录**，用 --output 指定路径）
 packaging\windows\cldm.cmd export VOL_P0\20260101T000000Z --format csv --output snap.csv
+
+:: 服务报"database disk image is malformed"时先自查（只读，不改任何数据）
+:: 退出码 0=正常（多半是"假损坏"，重启服务即可）；1=真损坏，重新采集
+packaging\windows\cldm.cmd integrity-check VOL_P0\20260101T000000Z
+packaging\windows\cldm.cmd integrity-check --all
+
+:: 给磁盘/分区起速记名（Web 对比历史等处会显示昵称；省略名字=清除）
+packaging\windows\cldm.cmd nickname disk <磁盘序列号> 仓库盘
+packaging\windows\cldm.cmd nickname volume <SN>_P1 备份分区
 ```
+
+> `integrity-check` 与 `nickname` 都作用于 catalog/快照库所在的数据根：在包根执行（用包根 `data\`）即可与 Web 服务看到同一份数据；在其他目录跑才需要 `--data-root`。昵称只存在 catalog 里，重新采集不会覆盖。
 
 > 写互斥：同一 data_root 同时只允许一个写者（采集/清扫）。并发执行会提示"data_root 被占用"，等待对方完成后重试；进程崩溃锁自动释放。
 > 断点续采：大卷采集被中断（崩溃/取消/断电）后，用 `collect --resume` 续接该卷最新的未封库采集，已完成部分自动跳过，结果与一次完整扫描一致。
@@ -56,6 +67,8 @@ packaging\windows\cldm.cmd export VOL_P0\20260101T000000Z --format csv --output 
 - **长路径（>260 字符）**：Windows 默认 `MAX_PATH` 260。深目录树可能采集不全。建议开启系统长路径：注册表 `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 1` 后重启；Python 3.6+ 会自动跟随该开关。若不能改注册表，尽量把包和 data 根放在短路径下（如 `C:\cldm\`）。
 - **数据根与盘上副本**：数据根（默认 `data\`）存放快照 SQLite 库与 catalog；每份快照会同时在**被采集盘上**写一份 `_coldmanifest` 副本目录（含封库库与 sha256 旁车 json），作为随盘冷备。请确保目标盘有少量剩余空间（约为该卷元数据量，通常几百 MB 以内）。
 - **smartctl**：默认尝试调用 smartctl 读取 SMART/真实序列号；未安装时自动降级（`smart_status=unavailable`），不影响采集，也可 `--no-smartctl` 显式跳过。
+- **SMART 与 USB 桥（本机 USB 盘实测）**：Windows 上 smartctl 对 USB 桥盘直接用 `\\.\PhysicalDriveN` 常报 `Invalid argument`，而 `smartctl --scan` 给出的 `/dev/sdN` + `-d sat` 能读到真盘身份。工具已自动处理：先跑 `--scan` 建立磁盘编号 → 设备名的映射，再按类型兜底链（自动 → `-d sat` → `-d sat,12` → 扫描建议 → 常见桥芯片专用参数）逐个尝试，`-d sat` 即"通过 USB 桥按 SATA 协议透传读 SMART"。个别桥仍读不到时可用环境变量覆盖：`CLDM_SMARTCTL_DEVICE`（直接指定设备串，如 `/dev/sdc`）与 `CLDM_SMARTCTL_ARGS`（额外透传参数）；采集 meta 里会记 `smart_attempts_json`（每次尝试的参数与报错），磁盘页「现在读取 SMART」也会显示失败原因（权限不足请以管理员运行）。
+- **假损坏自查**：若 Web 页面报"快照库读取失败，可能被并发写入影响"，通常是"假损坏"（文件没坏，重启服务即恢复）；可先 `cldm.cmd integrity-check <快照ID>` 确认——退出码 0 就放心重启，退出码 1 才是真损坏需重新采集。
 - **编码**：控制台输出为 UTF-8；如出现乱码，先执行 `chcp 65001`。
 
 ## 常见问题

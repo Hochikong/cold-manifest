@@ -17,7 +17,7 @@
 
 **建议修复顺序**：P0-2（URI 空格编码）→ P0-1（删除时未关 DB 连接）→ P0-3（WAL on exFAT）→ P1-1（控制台编码）→ P1-4（CSV BOM）→ 其余按需排期。
 
-> **状态速览（2026-10-01 更新）**：P0-1/2/3、P1-1/2/3、P2-1/2/3/7/8 **已修复**；P1-4 以「大小写改名提示」方案落地（不自动改默认口径）；P2-4/5/6 保留为文档建议，未改代码。逐条证据见文末「修复验证证据」。
+> **状态速览（2026-10-01 更新）**：P0-1/2/3、P1-1/2/3、P2-1/2/3/7/8 **已修复**；P1-4 以「大小写改名提示」方案落地（不自动改默认口径）；P2-4/5/6 保留为文档建议，未改代码。逐条证据见文末「修复验证证据」。**本轮追加（实机反馈，2026-10）：P0-9「假损坏」（immutable 连接 + 封库后就地写）已修复，P2-3 结论已按真机实测更正**——见对应条目。
 
 ---
 
@@ -189,11 +189,11 @@
 
 ### P2-3 smartctl Windows 设备路径可能不对（USB 桥）
 
-> ✅ **已修复**（提交 68ada3f）：`smart.py` 在 Windows 下优先返回 `\\.\PhysicalDrive<N>`（磁盘索引来自 probe 层），盘符仅作回退。
+> ✅ **已修复，结论按真机实测更正（2026-10 本轮）**：真机（Windows USB 桥）实测 `\\.\PhysicalDriveN` 直接喂给 smartctl 常报 `Invalid argument`，而 `smartctl --scan` 给出的是 `/dev/sdN`（如 `/dev/sdc -d sat`）。现在 `smart.py` 的设备定位链为：`CLDM_SMARTCTL_DEVICE` 环境变量覆盖 → `--scan` 第 N 行（优先 JSON、回退文本解析，进程内缓存；顺序与 PhysicalDrive 编号一致）→ `\\.\PhysicalDriveN` 兜底 → 盘符；类型走兜底链 auto → sat → sat,12 → 扫描建议 → 桥专用（usbjmicron/usbsunplus/usbprolific/jms56x）。判定"读到数据"只看退出码低 2 位（bit0 命令行错误、bit1 设备打不开），健康告警位（8/16/32/64/128）不算失败、由 parse_smart 推断健康等级。可用 `CLDM_SMARTCTL_DEVICE` / `CLDM_SMARTCTL_ARGS` 覆盖。
 
 - **触发场景**：Windows 下 USB 桥接硬盘，smartctl 对盘符（`E:`）常无效，需用 `\\.\PhysicalDriveN`。代码已尝试 `-d sat` 回退，但设备路径本身仍可能是盘符。
 - **证据**：`src/cold_manifest/smart.py:186-188` `device_for_path` 在 Windows 下仅返回盘符；`probe/windows.py:278` 在 smartctl 分支里会尝试用 `PhysicalDrive{idx}`，但 `smart.py` 的独立调用（如 `check_smartctl` / CLI 直接调）仍走盘符。
-- **建议修法**：`smart.py:device_for_path` 在 Windows 下也尝试通过 `probe/windows.py` 的磁盘索引获取 `PhysicalDriveN`，或至少把 `probe_path_win` 解析出的 disk index 缓存到 catalog/volumes 表，供后续 SMART 查询使用。
+- ~~建议修法~~（已被本轮实现取代）：见上方更正后的结论；采集 meta 现记录 `smart_attempts_json`（每次尝试的参数/退出码/stderr 片段），失败原因归类为 permission_denied / device_type_unknown / not_found / timeout / other 并给可读文案。
 - **Linux 回归测试**：mock `probe_path_win` 返回 `disk.index=3`，断言 `device_for_path("E:\\")` 返回 `\\.\PhysicalDrive3`。
 
 ---
@@ -252,6 +252,22 @@
   - `src/cold_manifest/cli.py:456` `conn = sqlite3.connect(db.as_posix())`
 - **建议修法**：改为 `conn = sqlite3.connect(str(db))`，与全项目其余非 URI 连接（如 `db.py:46`）保持一致。
 - **Linux 回归测试**：不影响功能，纯代码规范，改后现有测试应全过。
+
+---
+
+## 本轮追加（2026-10 实机反馈）
+
+### P0-9 服务报 "database disk image is malformed"（"假损坏"）——已修复
+
+> ✅ **已修复**。结论：根因不是文件损坏，而是 `immutable=1` 连接的前提不成立——封库后哈希回填（hash）、FTS/统计补建（build-fts / build-stats）仍会**就地写**快照库，immutable 向 SQLite 声明"文件永不变化"，写入后旧连接读到错乱页就报假 malformed（文件没坏，重启服务即恢复）。
+
+- **修了什么**：
+  1. 全部读路径弃用 immutable，统一 `db.open_snapshot`（`mode=ro` 普通只读）；
+  2. 写快照库的任务（hash / build-fts / build-stats / 删除）在**写前、写后**都把连接池里该快照的连接逐出（`AppState.evict_snapshot`），不留旧连接；
+  3. API 注册 sqlite3.DatabaseError 全局处理器（`install_snapshot_error_handler`）：malformed → 409 + 可读中文提示（"可能被并发写入影响，请重启后重试；仍失败用 `cldm integrity-check` 自查"），不再是裸 500 + traceback；
+  4. 新增 CLI `cldm integrity-check <快照ID>`（或 `--all`）：只读跑 `PRAGMA quick_check`（异常时升级 `integrity_check`），用于区分假损坏与真损坏；退出码 0=正常 / 1=损坏或缺失。
+- **没做什么**：未引入写库排他队列（写任务本身持数据根写锁/串行，现状够用）；历史已产生的错乱读不会自愈，重启服务或等写后驱逐即可。
+- **真机复验**：见 `docs/Windows-真机复验清单.md`「本轮复测点」。
 
 ---
 

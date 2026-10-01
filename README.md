@@ -12,8 +12,10 @@
 - **按需哈希**：默认关闭；full/sampled 两档、候选指纹、单组精验，`(size, mtime, path)` 缓存；查重三档（文件名/指纹/内容）。
 - **副本校验**：`verify-copy` 抽样/全量校验盘上副本。
 - **导入/登记**：v1 三件套导入；外部 snapshot.db 就地登记（`import-db`）。
-- **运维**：快照删除（含盘上副本）、catalog 重建（预演 + 执行）、FTS/统计补建。
-- **Web UI**：7 个路由页（总览/快照/对比/磁盘/任务/搜索/设置）；星标置顶、按卷筛选、哈希面板、HTML 报告分节、右键菜单、服务端排序、卷详情抽屉、设置页数据修复卡片。
+- **磁盘健康**：采集时自动读取 SMART（温度/通电小时/坏道计数，拿得到才写），磁盘页健康卡可「现在读取 SMART」现场诊断（失败给原因：权限/设备类型/超时）。
+- **昵称**：给磁盘/分区起速记名（`cldm nickname` 或 `PATCH /api/disks/{id}`、`PATCH /api/volumes/{id}`），比对历史里直接显示昵称而不是一长串 ID。
+- **运维**：快照删除（含盘上副本；被对比引用时需勾选强制）、快照库完整性自查（`integrity-check`，区分"假损坏"与真损坏）、catalog 重建（预演 + 执行）、FTS/统计补建。
+- **Web UI**：7 个路由页（总览/快照/对比/磁盘/任务/搜索/设置）；星标置顶、按卷筛选、哈希面板、HTML 报告分节、右键菜单、服务端排序、卷详情抽屉、设置页数据修复卡片、表格列宽可拖拽（按表记忆，表头右键重置）、对比历史分页「加载更多」。
 
 ## CLI（`cldm`）
 
@@ -31,6 +33,8 @@ verify-copy       校验盘上副本（--sample --full）
 build-fts         补建 FTS 全文索引
 build-stats       补建统计预计算
 delete            删除快照（--on-disk keep|delete --force）
+nickname          设置/清除磁盘或分区昵称（nickname disk|volume <id> [名字]）
+integrity-check   快照库完整性自查（只读 PRAGMA quick_check；退出码 0 正常 / 1 损坏）
 rebuild-catalog   重建 catalog（--dry-run 预演）
 ```
 
@@ -60,7 +64,7 @@ zip 包解压即用（Windows：`start.cmd` / `cldm.cmd`，已处理 UTF-8 控�
 
 ## 查询 API（只读面摘录）
 
-`cldm serve` 之外也可直接 `CLDM_DATA_ROOT=<数据根> uvicorn cold_manifest.server:app`。快照库以 `immutable=1` 只读打开并做 LRU 连接池（上限 16）。端点统一前缀 `/api`（全量清单见 `docs/升级方案-v0.3.md` 附录 A，OpenAPI 见 `/docs`）：
+`cldm serve` 之外也可直接 `CLDM_DATA_ROOT=<数据根> uvicorn cold_manifest.server:app`。快照库以 `mode=ro` 只读打开并做 LRU 连接池（上限 16）；写库任务（哈希/补建索引/补建统计）写前、写后都会逐出池内该快照的连接，避免读到半新半旧页。端点统一前缀 `/api`（全量清单见 `docs/升级方案-v0.3.md` 附录 A，OpenAPI 见 `/docs`）：
 
 ```
 GET  /api/snapshots                        # 快照列表（预计算统计 + pinned）
@@ -69,8 +73,12 @@ GET  /api/snapshots/{sid}/entries          # 浏览（keyset 游标，type/ext/s
 GET  /api/snapshots/{sid}/search           # 单快照搜索（prefix | fulltext）
 GET  /api/search                           # 跨快照全局搜索（顶栏 Ctrl/Cmd+K）
 POST /api/diffs                            # 发起对比（口径开关；结果物化后分页查询）
+GET  /api/diffs?limit=&cursor=             # 对比历史（keyset 游标，limit 1..200 默认 50，含昵称标签 labels）
 GET  /api/snapshots/{sid}/duplicates       # 查重三档
 POST /api/snapshots/{sid}/hash             # 按需哈希任务
+PATCH /api/disks/{disk_id}                 # 磁盘昵称（{"nickname": "..."}，空串/null 清除）
+PATCH /api/volumes/{volume_id}             # 分区昵称（同上）
+POST /api/disks/{disk_id}/smart/read       # 现场读一次 SMART（诊断，不写历史）
 ```
 
 约定：列表/搜索一律 keyset 游标分页（`limit` ≤ 500，响应 `{items, next_cursor, has_more}`，不返回总数）；`*_ns` 时间戳序列化为字符串防 JS 精度丢失，`*_bytes` 为数字；未知 snapshot_id → 404，参数非法 → 400。
