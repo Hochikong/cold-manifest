@@ -412,7 +412,7 @@ def _cmd_build_fts(args: argparse.Namespace) -> int:
             print(f"错误：快照不存在：{args.snapshot_id}（{db}）", file=sys.stderr)
             return 2
 
-    conn = sqlite3.connect(db.as_posix())
+    conn = sqlite3.connect(str(db))
     try:
         row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
         if not row or row[0] != "sealed":
@@ -455,7 +455,7 @@ def _cmd_build_stats(args: argparse.Namespace) -> int:
             print(f"错误：快照不存在：{args.snapshot_id}（{db}）", file=sys.stderr)
             return 2
 
-    conn = sqlite3.connect(db.as_posix())
+    conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("SELECT value FROM meta WHERE key='status'").fetchone()
@@ -864,7 +864,24 @@ def _cmd_import_db(args: argparse.Namespace) -> int:
 
 # ---- main -------------------------------------------------------------------
 
+def _reconfigure_console_utf8() -> None:
+    """Windows 控制台编码兜底（P1-1）：cmd 默认 OEM 代码页（如 GBK/936），
+    遇到中文/箭头等字符可能直接 UnicodeEncodeError 崩溃。stdout/stderr 是
+    io.TextIOWrapper 时强制 UTF-8 + replace，任何编码环境下都只降级不崩。
+    """
+    if os.name != "nt":
+        return
+    import io
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv: "list[str] | None" = None) -> int:
+    _reconfigure_console_utf8()
     parser = _build_parser()
     args = parser.parse_args(argv)
 

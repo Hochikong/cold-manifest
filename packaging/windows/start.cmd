@@ -1,6 +1,9 @@
 @echo off
 rem cold-manifest web server launcher. Default data root: <package root>\data
 rem NOTE: keep this file ASCII-only (cmd.exe parses batch files in the OEM codepage)
+rem Force UTF-8 console codepage + Python IO encoding (P1-1: avoid GBK encode crashes)
+chcp 65001 >nul
+set "PYTHONIOENCODING=utf-8"
 setlocal
 cd /d "%~dp0..\.."
 

@@ -1,5 +1,6 @@
 """SQLite 连接辅助：快照库只读打开，catalog 可写（WAL）。"""
 
+import logging
 import sqlite3
 from pathlib import Path
 
@@ -45,7 +46,17 @@ def open_catalog(path: "str | Path", check_same_thread: bool = True) -> sqlite3.
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # WAL 回退（P0-3）：journal_mode 是查询——SQLite 返回实际生效的模式。
+    # exFAT/FAT32 等不支持共享内存文件的文件系统上 WAL 会静默失败（返回
+    # 原模式，常见为 delete），此时确保为 DELETE 并降级 synchronous。
+    # 以返回值为准，不做平台/文件系统探测。
+    mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    if mode != "wal":
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        logging.getLogger(__name__).warning(
+            "catalog 库不支持 WAL（journal_mode=%s，常见于 exFAT/FAT32），"
+            "已回退 DELETE 日志模式（synchronous=NORMAL）", mode)
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

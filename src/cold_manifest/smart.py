@@ -177,14 +177,18 @@ def check_smartctl() -> "str | None":
     return resolved
 
 
-def device_for_path(path: "str | Path") -> "str | None":
+def device_for_path(path: "str | Path", disk_index: "int | None" = None) -> "str | None":
     """定位 path 所在物理盘设备。
 
     Linux：/proc/mounts 找挂载点 → 分区设备名去掉分区号（sda1→/dev/sda，
-    nvme0n1p1→/dev/nvme0n1）；Windows：盘符（E:）。
+    nvme0n1p1→/dev/nvme0n1）；Windows：优先 ``\\\\.\\PhysicalDrive<N>``
+    （盘号由调用方从 PowerShell 磁盘序号解析传入，参照 probe/windows.py；
+    盘符形态 E: 对 USB 桥接盘常无效），拿不到盘号再退回盘符。
     定位失败抛 ProbeError（调用方转 warning）。
     """
     if sys.platform == "win32":
+        if isinstance(disk_index, int):
+            return f"\\\\.\\PhysicalDrive{disk_index}"
         letter = str(Path(path).resolve())[:2].rstrip(":")
         if len(letter) == 1 and letter.isalpha():
             return f"{letter}:"

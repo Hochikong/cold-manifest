@@ -1,6 +1,9 @@
 @echo off
 rem cold-manifest CLI wrapper. Example: cldm.cmd collect D:\ --serial XXX
 rem NOTE: keep this file ASCII-only (cmd.exe parses batch files in the OEM codepage)
+rem Force UTF-8 console codepage + Python IO encoding (P1-1: avoid GBK encode crashes)
+chcp 65001 >nul
+set "PYTHONIOENCODING=utf-8"
 setlocal
 set "HERE=%~dp0..\.."
 if not exist "%HERE%\.venv-win\Scripts\cldm.exe" (

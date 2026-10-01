@@ -107,15 +107,24 @@ def export_v1_csv(conn: sqlite3.Connection, out_dir: Path) -> None:
 
 
 def export_v1_csv_zip(conn: sqlite3.Connection, snapshot_id: str) -> Path:
-    """三件套写入临时 zip（外部下载用），返回路径；调用方负责 unlink 清理。"""
+    """三件套写入临时 zip（外部下载用），返回路径；调用方负责 unlink 清理。
+
+    生成过程放在 try/except 里：zip 写入中途崩溃（磁盘满/任务取消/进程
+    异常）时 unlink 半成品，避免临时 zip 残留堆积（P2-7）。正常路径的
+    删除责任仍在调用方（响应流结束后 unlink）。
+    """
     fd, tmp_name = tempfile.mkstemp(prefix=f"{snapshot_id.replace('/', '_')}_v1_", suffix=".zip")
     os.close(fd)
     tmp = Path(tmp_name)
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-        with tempfile.TemporaryDirectory() as td:
-            export_v1_csv(conn, Path(td))
-            for name in ("metadata.csv", "tree.csv", "warnings.csv"):
-                zf.write(Path(td) / name, arcname=name)
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            with tempfile.TemporaryDirectory() as td:
+                export_v1_csv(conn, Path(td))
+                for name in ("metadata.csv", "tree.csv", "warnings.csv"):
+                    zf.write(Path(td) / name, arcname=name)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return tmp
 
 

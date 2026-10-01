@@ -29,6 +29,29 @@ FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 # progress_cb 每 ~1 万条回调一次
 _PROGRESS_INTERVAL = 10_000
 
+# Windows 保留设备名（P2-1）：CON/PRN/NUL/AUX/COM1-9/LPT1-9，
+# 含带扩展名的形态（CON.txt 同样非法）；不区分大小写。
+_DANGEROUS_BASENAMES = frozenset(
+    ["CON", "PRN", "NUL", "AUX"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
+
+
+def _is_dangerous_name(name: str) -> bool:
+    """Windows 非法文件/目录名：保留设备名（含 .ext 形态）、末尾 `.` 或
+    空格、含冒号（NTFS 交替数据流 ADS 语法 `name:stream`）。不区分大小写。
+    仅在 Windows 生效——Linux 下 `:` 与末尾空格是合法名字，不误伤。
+    """
+    stem = name.split(".", 1)[0].upper()
+    if stem in _DANGEROUS_BASENAMES:
+        return True
+    if name != name.rstrip(". "):
+        return True
+    if ":" in name:
+        return True
+    return False
+
 
 @dataclass
 class ScanStats:
@@ -141,6 +164,7 @@ def scan_tree(
     journal_cb: "Callable[[str], None] | None" = None,
     skip_subtrees: "set[str] | None" = None,
     one_filesystem: bool = True,
+    check_dangerous_names: "bool | None" = None,
 ) -> ScanStats:
     """cancel_event：目录粒度取消检查（threading.Event），置位时抛 ScanCancelled。
 
@@ -154,12 +178,21 @@ def scan_tree(
     （/proc、/sys、网络盘等）不属于本卷，不应进快照。Windows 上子目录的
     非 follow st_dev 恒为 0，视为未知放行（见 _is_cross_fs 注释）。跨文件
     系统采集（跨盘比对挂载结构）传 False。
+
+    check_dangerous_names：Windows 保留名/末尾点空格/冒号（ADS）检查
+    （P2-1），命中记 skipped('dangerous_name') 且不产出条目。None（默认）
+    表示仅 Windows 生效（os.name=='nt'）；Linux 上 `:` 等是合法名字，
+    传 True 可强制开启（测试用）。
     """
     stats = ScanStats()
     t0 = time.monotonic()
     root = os.fspath(root)
     matcher = _ExcludeMatcher(list(exclude_globs or []))
     skip = skip_subtrees if skip_subtrees is not None else frozenset()
+    if check_dangerous_names is None:
+        # _WIN 沿用模块级平台判定（测试通过替换 _WIN/os 模拟 Windows）；
+        # getattr 兜底：os 可能被测试替换为缺 name 属性的 fake 模块
+        check_dangerous_names = _WIN or getattr(os, "name", "") == "nt"
 
     root_st = os.stat(root)
     root_name = os.path.basename(os.path.abspath(root)) or root
@@ -246,6 +279,12 @@ def scan_tree(
             continue
         if exclude_hidden and _is_hidden(name, entry):
             writer.add_skipped(rel, "hidden", "scan")
+            stats.skipped += 1
+            continue
+        if check_dangerous_names and _is_dangerous_name(name):
+            # Windows 非法名（保留设备名/末尾点空格/冒号 ADS）：这类名字
+            # 无法在 NTFS 上重建，写入必失败——不产出条目，留痕对账。
+            writer.add_skipped(rel, "dangerous_name", "scan")
             stats.skipped += 1
             continue
 
