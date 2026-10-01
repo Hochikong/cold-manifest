@@ -30,7 +30,7 @@
 
 - **列宽可拖拽（持久化 + 重置）** ✅：主要表格（浏览/明细/任务/查重等）基于 `ResizableTable` 组件——有数字宽度的列可拖拽（最小 64px），按表持久化到 localStorage（`cldm_colw:<tableId>`），表头右键重置该表全部列宽。
 - **比对历史分页加载更多** ✅：`/diff` 页历史列表走 `GET /api/diffs?limit=&cursor=`（keyset 游标，默认 50 条），底部「加载更多」；每行显示昵称标签（labels.a / labels.b）。
-- **昵称（磁盘/卷）展示与编辑** ◐：编辑入口当前为 CLI `cldm nickname` 与 API `PATCH /api/disks/{id}`、`PATCH /api/volumes/{id}`；**前端编辑界面未实现**。展示：对比历史列表已显示昵称标签；快照列表/卷详情 API 已返回 `label` 字段，但前端尚未渲染——未实现。
+- **昵称（磁盘/卷）展示与编辑** ✅：磁盘页首列、磁盘详情卡、卷详情抽屉均可行内编辑（铅笔进入，Enter 保存 / Esc 取消 / 失焦保存，空串清除，≤64 字符）；采集对话框可选填并在采集成功后自动写入。展示：快照列表/详情用 `label` 作主标题（快照 ID 退为次要信息）、对比页 A/B 选择器与历史列显示标签、CLI `cldm nickname` 与 API `PATCH /api/disks/{id}`、`PATCH /api/volumes/{id}` 均可设置。
 - **磁盘健康卡 / 现在读取 SMART** ✅：`DiskDetailPanel` 健康卡显示健康/温度/通电小时/重映射/待定扇区；右上角「现在读取 SMART」按钮现场读一次（`POST /api/disks/{id}/smart/read`，不写历史），失败给出原因（权限不足 / 设备类型无法识别 / 超时等）与原始 stderr 片段。
 - **删除被阻塞时的 force 流程** ✅：删除快照被对比引用阻塞时，删除弹窗列出受影响的对比，需勾选「我已确认，同时删除相关对比（force=true）」才能确认。
 
