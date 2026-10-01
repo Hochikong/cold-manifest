@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Alert, Button, Card, Collapse, Descriptions, Empty, Row, Col, Skeleton, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { Alert, App, Button, Card, Collapse, Descriptions, Empty, Row, Col, Skeleton, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { CheckCircleOutlined, ExclamationCircleOutlined, MedicineBoxOutlined, ThunderboltOutlined } from '@ant-design/icons'
-import { useDisk, useDiskSmartRead } from '../api/hooks'
+import { useDisk, useDiskSmartRead, useSetDiskNickname } from '../api/hooks'
 import ErrorAlert from './ErrorAlert'
+import NicknameEditor from './NicknameEditor'
 import SmartTrendsChart from './SmartTrendsChart'
 import VolumeTrendsChart from './VolumeTrendsChart'
 import VolumeDetailDrawer from './VolumeDetailDrawer'
@@ -97,6 +98,19 @@ function SourceTag({ text }: { text: string }) {
 }
 
 function IdentityCard({ disk, liveParsed, liveLabel }: { disk: DiskDetail; liveParsed: ParsedSmart | null; liveLabel: string | null }) {
+  const { message } = App.useApp()
+  const setNickname = useSetDiskNickname()
+
+  const saveNickname = async (nickname: string) => {
+    try {
+      await setNickname.mutateAsync({ disk_id: disk.disk_id, nickname })
+      message.success(nickname ? '昵称已保存' : '昵称已清除')
+    } catch (e) {
+      message.error(apiErrorDetail(e) || '昵称保存失败')
+      throw e
+    }
+  }
+
   // 真盘身份：优先现场读取，其次最近一次采集存的 smartctl 原始 JSON；都没有再回落系统探测 / USB 桥
   const smartIdentity = liveParsed
     ? { model: liveParsed.model, serial: liveParsed.serial, firmware: liveParsed.firmware, capacity_bytes: null as number | null }
@@ -125,6 +139,9 @@ function IdentityCard({ disk, liveParsed, liveLabel }: { disk: DiskDetail; liveP
         />
       )}
       <Descriptions size="small" column={1} bordered>
+        <Descriptions.Item label="昵称">
+          <NicknameEditor value={disk.nickname} onSave={saveNickname} />
+        </Descriptions.Item>
         <Descriptions.Item label="磁盘 ID"><Text code>{disk.disk_id}</Text></Descriptions.Item>
         <Descriptions.Item label="真盘型号">
           <Space size={0} wrap>

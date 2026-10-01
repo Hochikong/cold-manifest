@@ -1,10 +1,11 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Button, Descriptions, Drawer, Empty, Space, Spin, Tabs, Tag, Typography } from 'antd'
+import { App, Button, Descriptions, Drawer, Empty, Space, Spin, Tabs, Tag, Typography } from 'antd'
 import type { TableProps } from 'antd'
-import { useVolumeDetail } from '../api/hooks'
-import type { VolumeDetailSnapshot } from '../api/client'
+import { useSetVolumeNickname, useVolumeDetail } from '../api/hooks'
+import { apiErrorDetail, type VolumeDetailSnapshot } from '../api/client'
 import ErrorAlert from './ErrorAlert'
+import NicknameEditor from './NicknameEditor'
 import VolumeTrendsChart from './VolumeTrendsChart'
 import ResizableTable from './ResizableTable'
 import { formatDateTime, formatFileSize, formatNumber } from '../utils/format'
@@ -24,8 +25,21 @@ const STATUS_COLORS: Record<string, string> = {
 
 export default function VolumeDetailDrawer({ volumeId, onClose }: VolumeDetailDrawerProps) {
   const navigate = useNavigate()
+  const { message } = App.useApp()
   const [tab, setTab] = useState('identity')
   const { data: vol, isLoading, error } = useVolumeDetail(volumeId ?? undefined)
+  const setNickname = useSetVolumeNickname()
+
+  const saveNickname = async (nickname: string) => {
+    if (!vol) return
+    try {
+      await setNickname.mutateAsync({ volume_id: vol.volume_id, nickname })
+      message.success(nickname ? '昵称已保存' : '昵称已清除')
+    } catch (e) {
+      message.error(apiErrorDetail(e) || '昵称保存失败')
+      throw e
+    }
+  }
 
   const close = () => {
     setTab('identity')
@@ -68,7 +82,7 @@ export default function VolumeDetailDrawer({ volumeId, onClose }: VolumeDetailDr
   ]
 
   return (
-    <Drawer title={volumeId ? `卷详情：${volumeId}` : '卷详情'} size={680} open={!!volumeId} onClose={close}>
+    <Drawer title={volumeId ? `卷详情：${vol?.nickname || volumeId}` : '卷详情'} size={680} open={!!volumeId} onClose={close}>
       {error && <ErrorAlert error={error} />}
       {isLoading && <Spin style={{ display: 'block', margin: '32px auto' }} />}
       {vol && (
@@ -81,6 +95,22 @@ export default function VolumeDetailDrawer({ volumeId, onClose }: VolumeDetailDr
               label: '身份',
               children: (
                 <Descriptions size="small" column={1} bordered>
+                  <Descriptions.Item label="昵称">
+                    <NicknameEditor value={vol.nickname} onSave={saveNickname} />
+                  </Descriptions.Item>
+                  <Descriptions.Item label="所属磁盘">
+                    <Button
+                      type="link"
+                      style={{ padding: 0 }}
+                      title="打开磁盘页"
+                      onClick={() => {
+                        close()
+                        navigate('/disks')
+                      }}
+                    >
+                      {vol.disk_nickname || vol.disk_id}
+                    </Button>
+                  </Descriptions.Item>
                   <Descriptions.Item label="卷 ID">{vol.volume_id}</Descriptions.Item>
                   <Descriptions.Item label="磁盘 ID">{vol.disk_id}</Descriptions.Item>
                   <Descriptions.Item label="磁盘型号">{vol.physical_model || '-'}</Descriptions.Item>

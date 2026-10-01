@@ -68,7 +68,7 @@ function EvidenceTag({ level, evidence }: { level?: string; evidence?: Record<st
   if (!level) return <Tag>未知</Tag>
   const isHash = level === 'hash'
   const tooltip = (
-    <Space direction="vertical" size={0}>
+    <Space orientation="vertical" size={0}>
       <Text>{isHash ? '哈希级＝内容变更由完整哈希判定，可信。' : '大小+时间＝未启用哈希时的退化口径，同名同大小同时间的改写可能漏判。'}</Text>
       {evidence && (
         <div>
@@ -198,10 +198,15 @@ function DiffSelector() {
 
   const snapshotOptions = useMemo(
     () =>
-      (snapshots?.items || []).map((s) => ({
-        value: s.snapshot_id,
-        label: `${s.volume_id} / ${s.snapshot_id.split('/')[1]}`,
-      })),
+      (snapshots?.items || []).map((s) => {
+        const ts = s.snapshot_id.split('/')[1] ?? s.snapshot_id
+        // 有昵称用 label（如「视频分区（移动硬盘A） · DEMO01_P0」），没有回落 卷ID / 时间戳目录
+        const name = s.label || `${s.volume_id} / ${ts}`
+        return {
+          value: s.snapshot_id,
+          label: `${name} / ${formatDateTime(s.collected_at)}`,
+        }
+      }),
     [snapshots]
   )
 

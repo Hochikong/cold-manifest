@@ -1,19 +1,41 @@
-import { Card, Typography, Empty, Spin, Tag } from 'antd'
+import { App, Card, Typography, Empty, Spin, Tag } from 'antd'
 import { CheckCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons'
-import { useDisks } from '../api/hooks'
+import { useDisks, useSetDiskNickname } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
+import NicknameEditor from '../components/NicknameEditor'
 import DiskDetailPanel from '../components/DiskDetailPanel'
 import ResizableTable from '../components/ResizableTable'
 import { formatFileSize, formatNumber, truncateMiddle } from '../utils/format'
-import type { Disk } from '../api/client'
+import { apiErrorDetail, type Disk } from '../api/client'
 
 const { Title } = Typography
 
 export default function DisksPage() {
+  const { message } = App.useApp()
   const { data, isLoading, error } = useDisks()
+  const setNickname = useSetDiskNickname()
+
+  const saveNickname = async (disk_id: string, nickname: string) => {
+    try {
+      await setNickname.mutateAsync({ disk_id, nickname })
+      message.success(nickname ? '昵称已保存' : '昵称已清除')
+    } catch (e) {
+      message.error(apiErrorDetail(e) || '昵称保存失败')
+      throw e
+    }
+  }
 
   const columns = [
+    {
+      title: '昵称',
+      dataIndex: 'nickname',
+      key: 'nickname',
+      width: 200,
+      render: (_: string | null, record: Disk) => (
+        <NicknameEditor value={record.nickname} onSave={(nick) => saveNickname(record.disk_id, nick)} />
+      ),
+    },
     {
       title: '磁盘 ID',
       dataIndex: 'disk_id',

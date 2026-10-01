@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   Modal,
@@ -14,6 +14,7 @@ import {
   Form,
   Collapse,
   Divider,
+  App,
 } from 'antd'
 import {
   FolderOpenOutlined,
@@ -29,7 +30,7 @@ import {
 } from '@ant-design/icons'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAttachedDisks, useCreateCollect, useCancelTask, useTaskEvents, useBatch, useCollectPreflight, useSnapshot, useDisk } from '../api/hooks'
-import { apiErrorDetail, isBatchCollectResponse, type BatchCollectCreateResponse, type Task, type Batch, type AttachedDisk } from '../api/client'
+import { apiErrorDetail, getSnapshot, isBatchCollectResponse, patchDiskNickname, patchVolumeNickname, type BatchCollectCreateResponse, type Task, type Batch, type AttachedDisk } from '../api/client'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatFileSize, formatNumber } from '../utils/format'
 
@@ -49,6 +50,7 @@ interface CollectDialogProps {
 export default function CollectDialog({ open, onClose }: CollectDialogProps) {
   const navigate = useNavigate()
   const qc = useQueryClient()
+  const { message } = App.useApp()
   const createCollectMutation = useCreateCollect()
   const cancelTaskMutation = useCancelTask()
 
@@ -61,6 +63,7 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
   const [path, setPath] = useState(() => localStorage.getItem(LAST_COLLECT_PATH_KEY) || DEFAULT_PATH)
   const [serial, setSerial] = useState('')
   const [volumeId, setVolumeId] = useState('')
+  const [nickname, setNickname] = useState('')
   const [excludeGlobsText, setExcludeGlobsText] = useState('')
   const [excludeHidden, setExcludeHidden] = useState(false)
   const [smartctl, setSmartctl] = useState(true)
@@ -80,7 +83,47 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
     setBatchResponse(null)
     setSubmitError(null)
     setCancelRequested(false)
+    setNickname('')
   }, [open])
+
+  /**
+   * 采集成功后把填写的昵称打到本次的盘（以及卷）上。
+   * 失败不阻塞主流程：只给一条温和提示，稍后可在磁盘页手动补设。
+   */
+  const applyNickname = useCallback(
+    async (snapshotIds: string[]) => {
+      const nick = nickname.trim()
+      if (!nick || snapshotIds.length === 0) return
+      try {
+        const diskIds = new Set<string>()
+        const volumeIds = new Set<string>()
+        for (const sid of snapshotIds) {
+          try {
+            const snap = await getSnapshot(sid)
+            if (snap.disk_id) diskIds.add(snap.disk_id)
+            if (snap.volume_id) volumeIds.add(snap.volume_id)
+          } catch {
+            // 单个快照详情读不到就跳过该卷，不影响其余
+          }
+        }
+        await Promise.all([
+          ...[...diskIds].map((d) => patchDiskNickname(d, nick)),
+          ...[...volumeIds].map((v) => patchVolumeNickname(v, nick)),
+        ])
+        qc.invalidateQueries({ queryKey: ['disks'] })
+        qc.invalidateQueries({ queryKey: ['disk'] })
+        qc.invalidateQueries({ queryKey: ['volumes'] })
+        qc.invalidateQueries({ queryKey: ['volume-detail'] })
+        qc.invalidateQueries({ queryKey: ['snapshots'] })
+        qc.invalidateQueries({ queryKey: ['snapshot'] })
+        qc.invalidateQueries({ queryKey: ['diffs'] })
+        message.success(`昵称「${nick}」已设置`)
+      } catch {
+        message.warning('昵称设置失败，不影响本次采集；可稍后在磁盘页手动设置')
+      }
+    },
+    [nickname, qc, message],
+  )
 
   useEffect(() => {
     if (!task) return
@@ -91,9 +134,12 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
       qc.invalidateQueries({ queryKey: ['snapshot'] })
       qc.invalidateQueries({ queryKey: ['volume-trends'] })
       qc.invalidateQueries({ queryKey: ['tasks'] })
+      if (task.status === 'done') {
+        void applyNickname(task.result?.snapshot_id ? [task.result.snapshot_id] : [])
+      }
       setMode('done')
     }
-  }, [task, mode, qc])
+  }, [task, mode, qc, applyNickname])
 
   useEffect(() => {
     if (!batch) return
@@ -104,9 +150,16 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
       qc.invalidateQueries({ queryKey: ['snapshot'] })
       qc.invalidateQueries({ queryKey: ['volume-trends'] })
       qc.invalidateQueries({ queryKey: ['tasks'] })
+      // 批次里所有成功的卷共享同一块盘：盘只打一次昵称，每个卷各打一次
+      const doneSnapshotIds = (batch.tasks ?? [])
+        .filter((t) => t.status === 'done' && t.result?.snapshot_id)
+        .map((t) => t.result!.snapshot_id!)
+      if (doneSnapshotIds.length > 0) {
+        void applyNickname(doneSnapshotIds)
+      }
       setMode('done')
     }
-  }, [batch, mode, qc])
+  }, [batch, mode, qc, applyNickname])
 
   const excludeGlobs = useMemo(() => {
     return excludeGlobsText
@@ -236,6 +289,16 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
                 />
               </Form.Item>
             )}
+
+            <Form.Item label="昵称（可选）" extra="设置后可在磁盘/卷/对比页辨认">
+              <Input
+                placeholder="例如：视频盘 A"
+                allowClear
+                maxLength={64}
+                value={nickname}
+                onChange={(e) => setNickname(e.target.value)}
+              />
+            </Form.Item>
 
             <Form.Item label="排除规则（每行一条 glob）">
               <TextArea

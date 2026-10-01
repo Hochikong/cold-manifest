@@ -34,6 +34,9 @@ export interface Snapshot {
   disk_id: string
   filesystem: string
   label: string | null
+  /** 卷昵称 / 盘昵称（label 未设时为 null） */
+  volume_nickname: string | null
+  disk_nickname: string | null
   volume_capacity_bytes: number
   physical_model: string
   physical_serial: string | null
@@ -325,6 +328,10 @@ export interface Volume {
   volume_serial_hex: string | null
   filesystem: string
   label: string | null
+  /** 用户昵称（PATCH /volumes/{id} 设置） */
+  nickname: string | null
+  /** 所属磁盘昵称 */
+  disk_nickname: string | null
   capacity_bytes: number
   physical_model: string
   physical_serial: string | null
@@ -356,6 +363,8 @@ export interface Disk {
   physical_model: string | null
   physical_serial: string | null
   bridge_model: string | null
+  /** 用户昵称（PATCH /disks/{id} 设置） */
+  nickname: string | null
   capacity_bytes: number
   interface_type: string | null
   first_seen: string
@@ -383,6 +392,7 @@ export interface DiskVolume {
   volume_serial_hex: string | null
   filesystem: string
   label: string | null
+  nickname: string | null
   capacity_bytes: number
   notes: string | null
 }
@@ -410,6 +420,18 @@ export interface DiskDetail extends Disk {
 
 export async function getDisk(disk_id: string): Promise<DiskDetail> {
   const { data } = await client.get(`/disks/${encodeURIComponent(disk_id)}`)
+  return data
+}
+
+/** 设置/清除磁盘昵称（PATCH /disks/{id}）；空串 = 清除，≤64 字符，未知 id → 404。 */
+export async function patchDiskNickname(disk_id: string, nickname: string): Promise<{ disk_id: string; nickname: string | null }> {
+  const { data } = await client.patch(`/disks/${encodeURIComponent(disk_id)}`, { nickname })
+  return data
+}
+
+/** 设置/清除卷昵称（PATCH /volumes/{id}）；空串 = 清除，非法 volume_id → 400，未知 → 404。 */
+export async function patchVolumeNickname(volume_id: string, nickname: string): Promise<{ volume_id: string; nickname: string | null }> {
+  const { data } = await client.patch(`/volumes/${encodeURIComponent(volume_id)}`, { nickname })
   return data
 }
 
@@ -1175,6 +1197,10 @@ export interface VolumeDetail {
   volume_serial_hex: string | null
   filesystem: string
   label: string | null
+  /** 用户昵称（PATCH /volumes/{id} 设置） */
+  nickname: string | null
+  /** 所属磁盘昵称 */
+  disk_nickname: string | null
   capacity_bytes: number | null
   notes: string | null
   physical_model: string | null

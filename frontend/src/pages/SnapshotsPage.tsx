@@ -74,7 +74,7 @@ import { VerifyCopyButton, VerifyCopyResultCard } from '../components/VerifyCopy
 import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
 import { dirNameOf, joinChildPath } from '../utils/path'
-import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, listEntries, searchEntries, getTree, apiErrorDetail, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport } from '../api/client'
+import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, listEntries, searchEntries, getTree, apiErrorDetail, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport, type Snapshot } from '../api/client'
 import axios from 'axios'
 
 const { Title, Text } = Typography
@@ -130,6 +130,8 @@ export default function SnapshotsPage() {
 
   const [volumeFilter, setVolumeFilter] = useState<string | undefined>(undefined)
   const { data: snapshots, isLoading: listLoading, error: listError, refetch: refetchSnapshots } = useSnapshots(volumeFilter)
+  // 详情页标题用 label（与列表/对比页同口径）；与 SnapshotOverview 共享同一查询缓存
+  const { data: snapshotMeta } = useSnapshot(snapshotId)
   const deleteMutation = useDeleteSnapshot()
 
   // 置顶状态由列表行自带的 pinned 字段提供（PATCH 后 invalidate ['snapshots'] 刷新）
@@ -253,13 +255,14 @@ export default function SnapshotsPage() {
 
   return (
     <div>
-      <Space align="center" style={{ marginBottom: 16 }}>
+      <Space align="center" style={{ marginBottom: 16 }} wrap>
         <Button icon={<ArrowLeftOutlined />} onClick={() => navigate('/snapshots')}>
           返回列表
         </Button>
         <Title level={4} style={{ margin: 0 }}>
-          快照：{getSnapshotDisplayName(snapshotId)}
+          快照：{snapshotMeta?.label || getSnapshotDisplayName(snapshotId)}
         </Title>
+        {!!snapshotMeta?.label && <Text type="secondary" code copyable={{ tooltips: ['复制快照 ID', '已复制'] }}>{snapshotId}</Text>}
       </Space>
       <Tabs
         activeKey={activeTab}
@@ -300,7 +303,7 @@ function SnapshotListView({
   onSelect,
   onDelete,
 }: {
-  snapshots?: { snapshot_id: string; volume_id: string; collected_at: string; file_count: number; total_bytes: number; pinned: boolean }[]
+  snapshots?: Snapshot[]
   loading: boolean
   error: unknown
   volumeFilter: string | undefined
@@ -348,11 +351,20 @@ function SnapshotListView({
       },
     },
     {
-      title: '快照 ID',
+      title: '快照',
       dataIndex: 'snapshot_id',
       key: 'snapshot_id',
       ellipsis: true,
-      render: (v: string) => <EllipsisText value={v} code />,
+      render: (v: string, record: Snapshot) =>
+        record.label ? (
+          // 有昵称时 label 作主标题，快照 ID 退为次要信息
+          <Space orientation="vertical" size={0} style={{ display: 'flex' }}>
+            <Text strong style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{record.label}</Text>
+            <Text type="secondary" code style={{ fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{v}</Text>
+          </Space>
+        ) : (
+          <EllipsisText value={v} code />
+        ),
     },
     {
       title: '卷',
@@ -607,6 +619,8 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
         <Space orientation="vertical" style={{ width: '100%' }} size="small">
           <Text>快照 ID：<Text code>{snapshot?.snapshot_id}</Text></Text>
           <Text>卷 ID：<Text code>{snapshot?.volume_id}</Text></Text>
+          {snapshot?.volume_nickname && <Text>卷昵称：{snapshot.volume_nickname}</Text>}
+          {snapshot?.disk_nickname && <Text>磁盘昵称：{snapshot.disk_nickname}</Text>}
           <Text>采集时间：{formatDateTime(snapshot?.collected_at)}</Text>
           <Text>哈希策略：{snapshot?.hash_policy}</Text>
           <Text>跳过项：{formatNumber(snapshot?.skipped_count)}</Text>

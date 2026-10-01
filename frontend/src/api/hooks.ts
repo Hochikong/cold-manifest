@@ -42,6 +42,8 @@ import {
   getSettings,
   listDisks,
   getDisk,
+  patchDiskNickname,
+  patchVolumeNickname,
   getDiskSmartHistory,
   readDiskSmartNow,
   collectPreflight,
@@ -173,6 +175,37 @@ export function useDisk(disk_id: string | undefined) {
     queryFn: () => getDisk(disk_id!),
     enabled: !!disk_id,
     staleTime: 60_000,
+  })
+}
+
+/** 昵称保存成功后需要一起失效的查询：磁盘/卷/快照（含 label）/对比历史都带昵称。 */
+function invalidateNicknameQueries(qc: ReturnType<typeof useQueryClient>) {
+  qc.invalidateQueries({ queryKey: ['disks'] })
+  qc.invalidateQueries({ queryKey: ['disk'] })
+  qc.invalidateQueries({ queryKey: ['volumes'] })
+  qc.invalidateQueries({ queryKey: ['volume-detail'] })
+  qc.invalidateQueries({ queryKey: ['snapshots'] })
+  qc.invalidateQueries({ queryKey: ['snapshot'] })
+  qc.invalidateQueries({ queryKey: ['diffs'] })
+}
+
+/** 设置/清除磁盘昵称；空串 = 清除。成功后磁盘/卷/快照/对比缓存一致刷新。 */
+export function useSetDiskNickname() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ disk_id, nickname }: { disk_id: string; nickname: string }) =>
+      patchDiskNickname(disk_id, nickname),
+    onSuccess: () => invalidateNicknameQueries(qc),
+  })
+}
+
+/** 设置/清除卷昵称；空串 = 清除。成功后磁盘/卷/快照/对比缓存一致刷新。 */
+export function useSetVolumeNickname() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ volume_id, nickname }: { volume_id: string; nickname: string }) =>
+      patchVolumeNickname(volume_id, nickname),
+    onSuccess: () => invalidateNicknameQueries(qc),
   })
 }
 
