@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import {
+  App,
   Card,
   Row,
   Col,
@@ -28,17 +29,19 @@ import {
   DownloadOutlined,
   ArrowLeftOutlined,
   FilterOutlined,
+  DeleteOutlined,
 } from '@ant-design/icons'
 import ReactECharts from 'echarts-for-react'
-import { useSnapshots, useDiffs, useDiff, useDiffSummary, useDiffEntries, useCreateDiff } from '../api/hooks'
+import { useSnapshots, useDiffs, useDiff, useDiffSummary, useDiffEntries, useCreateDiff, useDeleteDiff } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
 import ResizableTable from '../components/ResizableTable'
+import CursorPager from '../components/CursorPager'
 import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
 import { useShowApiError } from '../utils/apiError'
 import { formatFileSize, formatDateTime, nsToDate } from '../utils/format'
 import { dirNameOf } from '../utils/path'
-import { apiErrorDetail, exportDiffUrl, diffReportUrl, listDiffEntries, listDiffs, type DiffEntry, type DiffRun } from '../api/client'
+import { apiErrorDetail, exportDiffUrl, diffReportUrl, type DiffEntry, type DiffRun } from '../api/client'
 
 const { Title, Text } = Typography
 
@@ -112,40 +115,50 @@ export default function DiffPage() {
 }
 
 function DiffSelector() {
+  const { modal, message } = App.useApp()
   const { data: snapshots, isLoading: snapLoading, error: snapError } = useSnapshots()
-  // 历史对比列表：首页 20 条，has_more 时点「加载更多」追加（keyset cursor，不整页重拉）
-  const { data: firstPage, isLoading: diffLoading, error: diffError } = useDiffs({ limit: 20 })
-  const [moreItems, setMoreItems] = useState<DiffRun[]>([])
-  const [cursor, setCursor] = useState<string | null>(null)
-  const [hasMore, setHasMore] = useState(false)
-  const [loadingMore, setLoadingMore] = useState(false)
   const create = useCreateDiff()
+  const del = useDeleteDiff()
   const showApiError = useShowApiError()
   const navigate = useNavigate()
 
-  // 首页数据变化（刷新 / 发起新对比后 invalidate）→ 重置追加页（渲染期同步，避免 effect 级联）
-  const [syncedFirst, setSyncedFirst] = useState(firstPage)
-  if (firstPage !== syncedFirst) {
-    setSyncedFirst(firstPage)
-    setMoreItems([])
-    setCursor(firstPage?.next_cursor ?? null)
-    setHasMore(firstPage?.has_more ?? false)
+  // 历史对比列表：cursor 栈分页（上一页 = 栈内回退，下一页 = next_cursor 入栈）
+  const [historySize, setHistorySize] = useState(20)
+  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  const historyIndex = cursorStack.length - 1
+  const { data: historyPage, isLoading: diffLoading, error: diffError } = useDiffs({
+    limit: historySize,
+    cursor: cursorStack[historyIndex] ?? undefined,
+  })
+  const historyItems = historyPage?.items ?? []
+
+  const changeHistorySize = (n: number) => {
+    setHistorySize(n)
+    setCursorStack([null])
   }
 
-  const loadMoreDiffs = async () => {
-    if (!cursor) return
-    setLoadingMore(true)
-    try {
-      const res = await listDiffs({ limit: 20, cursor })
-      setMoreItems((prev) => [...prev, ...res.items])
-      setCursor(res.next_cursor)
-      setHasMore(res.has_more)
-    } finally {
-      setLoadingMore(false)
-    }
+  const confirmDeleteDiff = (record: DiffRun) => {
+    modal.confirm({
+      title: '删除这份对比结果？',
+      content: `将删除 ${record.diff_id} 的对比结果（不影响两侧快照），删除后不可恢复。`,
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () =>
+        new Promise<void>((resolve, reject) => {
+          del.mutate(record.diff_id, {
+            onSuccess: () => {
+              message.success('对比结果已删除')
+              resolve()
+            },
+            onError: (e) => {
+              showApiError(e, '删除失败')
+              reject(e)
+            },
+          })
+        }),
+    })
   }
-
-  const diffItems = useMemo(() => [...(firstPage?.items || []), ...moreItems], [firstPage, moreItems])
 
   const historyColumns: TableProps<DiffRun>['columns'] = [
     {
@@ -184,6 +197,22 @@ function DiffSelector() {
           <Tag color="red">-{record.summary?.removed ?? 0}</Tag>
           <Tag color="orange">~{record.summary?.size_changed ?? 0}</Tag>
         </Space>
+      ),
+    },
+    {
+      title: '操作',
+      width: 70,
+      render: (_, record) => (
+        <Tooltip title="删除这份对比结果">
+          <Button
+            type="text"
+            size="small"
+            danger
+            aria-label={`删除对比 ${record.diff_id}`}
+            icon={<DeleteOutlined />}
+            onClick={() => confirmDeleteDiff(record)}
+          />
+        </Tooltip>
       ),
     },
   ]
@@ -346,7 +375,7 @@ function DiffSelector() {
       <Card title="历史对比">
         {diffLoading ? (
           <Skeleton active />
-        ) : diffItems.length ? (
+        ) : historyItems.length ? (
           <>
             <ResizableTable<DiffRun>
               tableId="diff-history"
@@ -355,16 +384,22 @@ function DiffSelector() {
               tableLayout="fixed"
               pagination={false}
               scroll={{ x: 'max-content' }}
-              dataSource={diffItems}
+              dataSource={historyItems}
               columns={historyColumns}
             />
-            {hasMore && (
-              <div style={{ textAlign: 'center', marginTop: 16 }}>
-                <Button loading={loadingMore} onClick={() => void loadMoreDiffs()}>
-                  加载更多（已加载 {diffItems.length} 条）
-                </Button>
-              </div>
-            )}
+            <CursorPager
+              pageSize={historySize}
+              onPageSizeChange={changeHistorySize}
+              canPrev={historyIndex > 0}
+              onPrev={() => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))}
+              canNext={historyPage?.has_more ?? false}
+              onNext={() => {
+                if (historyPage?.next_cursor) {
+                  setCursorStack((s) => [...s, historyPage.next_cursor!])
+                }
+              }}
+              hint={`第 ${historyIndex + 1} 页 · 本页 ${historyItems.length} 条`}
+            />
           </>
         ) : (
           <Empty description="暂无对比记录" />
@@ -543,6 +578,9 @@ function DiffDetail({ diffId }: { diffId: string }) {
           onPrefixChange={setPrefix}
           onRowClick={setDrawerEntry}
           aSnapshotId={diff?.a ?? ''}
+          bSnapshotId={diff?.b ?? ''}
+          aLabel={diff?.labels?.a || diff?.a || 'A'}
+          bLabel={diff?.labels?.b || diff?.b || 'B'}
         />
       </Card>
 
@@ -567,6 +605,9 @@ function DiffEntriesTable({
   onPrefixChange,
   onRowClick,
   aSnapshotId,
+  bSnapshotId,
+  aLabel,
+  bLabel,
 }: {
   diffId: string
   category: string | undefined
@@ -575,14 +616,22 @@ function DiffEntriesTable({
   onPrefixChange: (v: string) => void
   onRowClick: (e: DiffEntry) => void
   aSnapshotId: string
+  bSnapshotId: string
+  aLabel: string
+  bLabel: string
 }) {
-  const [allItems, setAllItems] = useState<DiffEntry[]>([])
-  const [cursor, setCursor] = useState<string | null>(null)
-  const [loadingMore, setLoadingMore] = useState(false)
+  const [pageSize, setPageSize] = useState(50)
+  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
+  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
   const [sort, setSort] = useState<DiffSortKey>('path')
   const [order, setOrder] = useState<'asc' | 'desc'>('asc')
   const rowMenu = useRowContextMenu()
   const prefixTimer = useRef<number | null>(null)
+  const tableTopRef = useRef<HTMLDivElement | null>(null)
+  const mountedRef = useRef(false)
+
+  const pageIndex = cursorStack.length - 1
+  const cursor = cursorStack[pageIndex]
 
   // 输入框本地值；URL 外部变化（回退/前进/清空标签）时在渲染期同步回输入框。
   // 防抖写在 onChange 里，400ms 后写回 URL。
@@ -603,35 +652,38 @@ function DiffEntriesTable({
   const { data, isLoading, error } = useDiffEntries(diffId, {
     category,
     path_prefix: trimmedPrefix || undefined,
-    limit: 200,
+    limit: pageSize,
     sort,
     order,
+    cursor: cursor ?? undefined,
   })
+  const items = data?.items ?? []
 
+  // 筛选条件变化 → 重置回第一页（渲染期同步，避免 effect 级联）
+  const filterKey = `${category ?? ''}\u0000${trimmedPrefix}\u0000${sort}\u0000${order}`
+  const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
+  if (filterKey !== syncedFilterKey) {
+    setSyncedFilterKey(filterKey)
+    setCursorStack([null])
+  }
+
+  // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
   useEffect(() => {
-    if (data) {
-      setAllItems(data.items)
-      setCursor(data.next_cursor)
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
     }
-  }, [data])
+    tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [pageIndex, pageSize])
 
-  const loadMore = async () => {
-    if (!cursor) return
-    setLoadingMore(true)
-    try {
-      const res = await listDiffEntries(diffId, {
-        category,
-        path_prefix: trimmedPrefix || undefined,
-        limit: 200,
-        sort,
-        order,
-        cursor,
-      })
-      setAllItems((prev) => [...prev, ...res.items])
-      setCursor(res.next_cursor)
-    } finally {
-      setLoadingMore(false)
-    }
+  const goNext = () => {
+    const nc = data?.next_cursor
+    if (data?.has_more && nc) setCursorStack((s) => [...s, nc])
+  }
+  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
+  const changePageSize = (n: number) => {
+    setPageSize(n)
+    setCursorStack([null])
   }
 
   const onTableChange: TableProps<DiffEntry>['onChange'] = (_pagination, _filters, sorter) => {
@@ -644,11 +696,22 @@ function DiffEntriesTable({
     setOrder(nextOrder)
   }
 
-  const rowTarget = (record: DiffEntry): RowContextTarget => ({
-    path: record.path,
-    snapshotId: aSnapshotId,
-    openDirPath: dirNameOf(record.path),
-  })
+  /** changed 类两侧都在：右键菜单给 A/B 两个打开项；added 只在 B、removed 只在 A。 */
+  const rowTarget = (record: DiffEntry): RowContextTarget => {
+    const bPath = record.b_path || record.path
+    const aItem = { snapshotId: aSnapshotId, dir: dirNameOf(record.path), label: `在 A · ${aLabel} 中浏览` }
+    const bItem = { snapshotId: bSnapshotId, dir: dirNameOf(bPath), label: `在 B · ${bLabel} 中浏览` }
+    if (record.category === 'added') return { path: bPath, extraOpenItems: [bItem] }
+    if (record.category === 'removed') return { path: record.path, extraOpenItems: [aItem] }
+    if (
+      record.category === 'type_changed' || record.category === 'size_changed' ||
+      record.category === 'mtime_changed' || record.category === 'content_changed' ||
+      record.category === 'moved_or_renamed' || record.category === 'identical'
+    ) {
+      return { path: record.path, extraOpenItems: [aItem, bItem] }
+    }
+    return { path: record.path, snapshotId: aSnapshotId, openDirPath: dirNameOf(record.path) }
+  }
 
   const columns = [
     {
@@ -723,6 +786,7 @@ function DiffEntriesTable({
 
   return (
     <div>
+      <div ref={tableTopRef} />
       {error && <ErrorAlert error={error} />}
       <Space wrap style={{ marginBottom: 12 }} align="center">
         <Input
@@ -746,7 +810,7 @@ function DiffEntriesTable({
         loading={isLoading}
         tableLayout="fixed"
         columns={columns}
-        dataSource={allItems}
+        dataSource={items}
         pagination={false}
         scroll={{ x: 'max-content' }}
         onChange={onTableChange}
@@ -755,11 +819,15 @@ function DiffEntriesTable({
         })}
         locale={{ emptyText: <Empty description="无差异文件" /> }}
       />
-      {cursor && (
-        <div style={{ textAlign: 'center', marginTop: 16 }}>
-          <Button loading={loadingMore} onClick={loadMore}>加载更多</Button>
-        </div>
-      )}
+      <CursorPager
+        pageSize={pageSize}
+        onPageSizeChange={changePageSize}
+        canPrev={pageIndex > 0}
+        onPrev={goPrev}
+        canNext={data?.has_more ?? false}
+        onNext={goNext}
+        hint={`第 ${pageIndex + 1} 页 · 本页 ${items.length} 条`}
+      />
       {rowMenu.element}
     </div>
   )

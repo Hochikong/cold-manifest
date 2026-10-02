@@ -26,6 +26,7 @@ import {
   type SnapshotPatchBody,
   listDiffs,
   createDiff,
+  deleteDiff,
   getDiff,
   getDiffSummary,
   listDiffEntries,
@@ -76,6 +77,7 @@ export function useSnapshots(volume_id?: string) {
     queryKey: ['snapshots', volume_id],
     queryFn: () => listSnapshots(volume_id),
     staleTime: 60_000,
+    refetchOnMount: 'always',
   })
 }
 
@@ -85,6 +87,7 @@ export function useSnapshot(snapshot_id: string | undefined) {
     queryFn: () => getSnapshot(snapshot_id!),
     enabled: !!snapshot_id,
     staleTime: 60_000,
+    refetchOnMount: 'always',
   })
 }
 
@@ -138,6 +141,7 @@ export function useVolumes() {
     queryKey: ['volumes'],
     queryFn: listVolumes,
     staleTime: 60_000,
+    refetchOnMount: 'always',
   })
 }
 
@@ -166,6 +170,7 @@ export function useDisks() {
     queryKey: ['disks'],
     queryFn: listDisks,
     staleTime: 60_000,
+    refetchOnMount: 'always',
   })
 }
 
@@ -244,7 +249,22 @@ export function useDeleteSnapshot() {
       qc.invalidateQueries({ queryKey: ['snapshots'] })
       qc.invalidateQueries({ queryKey: ['disks'] })
       qc.invalidateQueries({ queryKey: ['volumes'] })
+      // force 级联删了对比；任务/趋势/盘与卷详情也可能随之变化
+      qc.invalidateQueries({ queryKey: ['diffs'] })
+      qc.invalidateQueries({ queryKey: ['tasks'] })
+      qc.invalidateQueries({ queryKey: ['volume-trends'] })
+      qc.invalidateQueries({ queryKey: ['disk'] })
+      qc.invalidateQueries({ queryKey: ['volume-detail'] })
     },
+  })
+}
+
+/** 删除对比结果（物化库 + catalog 行）；成功后刷新对比列表。 */
+export function useDeleteDiff() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (diff_id: string) => deleteDiff(diff_id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['diffs'] }),
   })
 }
 
@@ -305,6 +325,7 @@ export function useDiffs(params: ListDiffsParams = {}) {
     queryKey: ['diffs', params],
     queryFn: () => listDiffs(params),
     staleTime: 30_000,
+    refetchOnMount: 'always',
   })
 }
 
@@ -379,6 +400,7 @@ export function useTasks(params: ListTasksParams = {}, autoRefresh = false) {
     queryKey: ['tasks', params],
     queryFn: () => listTasks(params),
     staleTime: 5_000,
+    refetchOnMount: 'always',
     refetchInterval: (query) => {
       if (!autoRefresh) return false
       const tasks = query.state.data as { items: Task[] } | undefined

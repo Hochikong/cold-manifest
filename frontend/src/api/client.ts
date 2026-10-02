@@ -763,6 +763,17 @@ export async function getDiff(diff_id: string): Promise<DiffRun> {
   return data
 }
 
+export interface DiffDeleteResponse {
+  diff_id: string
+  deleted: boolean
+}
+
+/** 删除对比结果（物化库 + catalog 行）；不影响两侧快照。running → 409。 */
+export async function deleteDiff(diff_id: string): Promise<DiffDeleteResponse> {
+  const { data } = await client.delete(`/diffs/${diff_id}`)
+  return data
+}
+
 export interface DiffSummary {
   diff_id: string
   total_changes: number

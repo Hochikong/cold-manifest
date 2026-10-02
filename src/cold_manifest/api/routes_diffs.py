@@ -64,6 +64,27 @@ def _require_diff_run(state: AppState, diff_id: str) -> Any:
     return row
 
 
+@router.delete("/{diff_id}")
+def delete_diff(diff_id: str, request: Request) -> dict:
+    """删除对比结果：物化库 <data_root>/_diffs/<diff_id>.db + catalog diff_runs 行。
+
+    - 未登记 → 404；物化库不存在也幂等删行；
+    - status == 'running' → 409（物化进行中，删除会撕裂）；
+    - 不影响两侧快照。
+    """
+    state = get_state(request)
+    run = _require_diff_run(state, diff_id)
+    status = run["status"] if "status" in run.keys() else None
+    if status == "running":
+        raise HTTPException(status_code=409, detail=f"对比正在物化，请稍后再删除：{diff_id}")
+    db = diff_db_path(state.data_root, diff_id)
+    if db.is_file():
+        db.unlink()
+    state.catalog.execute("DELETE FROM diff_runs WHERE diff_id=?", (diff_id,))
+    state.catalog.commit()
+    return {"diff_id": diff_id, "deleted": True}
+
+
 # ---------------------------------------------------------------- 物化
 
 

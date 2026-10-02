@@ -5,6 +5,15 @@ import { CopyOutlined, FolderOpenOutlined } from '@ant-design/icons'
 import { useNavigate } from 'react-router-dom'
 import { baseNameOf, dirNameOf, snapshotBrowseUrl } from '../utils/path'
 
+/** 「打开所在快照浏览」单侧打开项（对比行等多侧场景）。 */
+export interface RowContextOpenItem {
+  snapshotId: string
+  /** 定位到的目录 */
+  dir: string
+  /** 菜单文案，如「在 A · 移动盘 中浏览」 */
+  label: string
+}
+
 /** 行级右键菜单目标：至少要有完整路径；知道所属快照才启用「打开所在快照浏览」。 */
 export interface RowContextTarget {
   /** 完整路径（含名称） */
@@ -15,6 +24,8 @@ export interface RowContextTarget {
   snapshotId?: string
   /** 「打开所在快照浏览」定位到的目录；缺省取 path 的父目录（目录行通常传自身） */
   openDirPath?: string
+  /** 多侧打开项；提供后优先于 snapshotId 单项（单项时直接平铺，多项时收进子菜单） */
+  extraOpenItems?: RowContextOpenItem[]
 }
 
 export interface RowContextMenuState {
@@ -76,6 +87,12 @@ export default function RowContextMenuOverlay({ state, onClose }: { state: RowCo
     }
   }
 
+  const openItems: RowContextOpenItem[] = target.extraOpenItems?.length
+    ? target.extraOpenItems
+    : target.snapshotId
+      ? [{ snapshotId: target.snapshotId, dir: target.openDirPath ?? dirNameOf(target.path), label: '' }]
+      : []
+
   const items: MenuProps['items'] = [
     {
       key: 'copy-path',
@@ -96,18 +113,34 @@ export default function RowContextMenuOverlay({ state, onClose }: { state: RowCo
       },
     },
   ]
-  if (target.snapshotId) {
-    const dir = target.openDirPath !== undefined ? target.openDirPath : dirNameOf(target.path)
+  if (openItems.length === 1) {
+    items.push(
+      { type: 'divider' },
+      {
+        key: 'open-in-snapshot',
+        icon: <FolderOpenOutlined />,
+        label: openItems[0].label || '打开所在快照浏览',
+        onClick: () => {
+          navigate(snapshotBrowseUrl(openItems[0].snapshotId, openItems[0].dir))
+          onClose()
+        },
+      },
+    )
+  } else if (openItems.length > 1) {
     items.push(
       { type: 'divider' },
       {
         key: 'open-in-snapshot',
         icon: <FolderOpenOutlined />,
         label: '打开所在快照浏览',
-        onClick: () => {
-          navigate(snapshotBrowseUrl(target.snapshotId!, dir))
-          onClose()
-        },
+        children: openItems.map((it, i) => ({
+          key: `open-in-snapshot-${i}`,
+          label: it.label || '打开所在快照浏览',
+          onClick: () => {
+            navigate(snapshotBrowseUrl(it.snapshotId, it.dir))
+            onClose()
+          },
+        })),
       },
     )
   }
