@@ -129,11 +129,13 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
 
       <SmartTrendsChart disk_id={disk_id} />
 
+      {/* 卷列表 / 快照时间线：<1200（xl）堆叠成整行，避免两张表并排挤成窄列；
+          宽屏并排时表格内部保留各自的横向滚动（scroll.x），不撑破面板。 */}
       <Row gutter={[16, 16]}>
-        <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
+        <Col xs={24} xl={12} style={{ minWidth: 0, display: 'flex' }}>
           <VolumesCard volumes={disk.volumes} />
         </Col>
-        <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
+        <Col xs={24} xl={12} style={{ minWidth: 0, display: 'flex' }}>
           <SnapshotsCard snapshots={disk.snapshots} onSelect={(id) => navigate(`/snapshots?snapshot=${encodeURIComponent(id)}&tab=overview`)} />
         </Col>
       </Row>
@@ -334,14 +336,30 @@ function HealthCard({
     </Descriptions>
   )
 
-  // 现场读取失败：原因 + 尝试记录，整段可复制
+  // 现场读取失败：原因 + 扫描表/候选链/尝试记录，整段可复制
+  const scan = readResult && !readResult.ok ? readResult.scan_info : null
   const diagText = readResult && !readResult.ok
     ? [
         `原因：${readResult.message ?? '未知'}`,
         readResult.reason ? `类别：${readResult.reason}` : null,
         `设备：${readResult.device || '-'}`,
+        scan?.devices?.length
+          ? `扫描表（smartctl --scan）：\n${scan.devices.map((d) => `  ${d.device}${d.type ? `  (type: ${d.type})` : ''}`).join('\n')}`
+          : null,
+        scan?.candidates?.length
+          ? `候选链：\n${scan.candidates.map((c) => `  ${c.device || '-'}  -d ${c.type || 'default'}  (来源: ${c.source || '未知'})`).join('\n')}`
+          : null,
+        scan?.device_used ? `生效设备：${scan.device_used}` : null,
+        scan?.capacity_check === 'mismatch'
+          ? '容量软校验：mismatch（扫描映射候选的实际容量与该盘枚举容量差 >20%，已剔除该候选，存在拿错盘风险）'
+          : null,
         ...readResult.attempts.map((a, i) =>
-          `尝试 ${i + 1}（-d ${a.device_type}）：${a.error ? `错误 ${a.error}` : `退出码 ${a.rc ?? '-'}`}${a.stderr_excerpt ? `\n  ${a.stderr_excerpt}` : ''}`,
+          [
+            `尝试 ${i + 1}：设备 ${a.device || '-'} · -d ${a.device_type}`,
+            a.exit_status != null || a.rc != null ? `  rc/exit_status：${a.exit_status ?? a.rc ?? '-'}` : null,
+            a.error ? `  错误：${a.error}` : null,
+            a.stderr_excerpt ? `  stderr：${a.stderr_excerpt}` : null,
+          ].filter(Boolean).join('\n'),
         ),
         readResult.raw_excerpt ? `输出片段：\n${readResult.raw_excerpt}` : null,
       ].filter(Boolean).join('\n')
@@ -402,18 +420,53 @@ function HealthCard({
               <Space orientation="vertical" size={6} style={{ width: '100%' }}>
                 <Text strong>{readResult.message || '读取失败，原因未知'}</Text>
                 {readResult.reason && <Text type="secondary">失败类别：{readResult.reason}</Text>}
+                {scan?.capacity_check === 'mismatch' && (
+                  <Alert
+                    type="warning"
+                    showIcon
+                    title="容量软校验不匹配"
+                    description="扫描映射候选的实际容量与该盘枚举容量差超过 20%，已剔除该候选（存在拿错盘风险）。请核对设备映射，必要时手动指定设备路径。"
+                  />
+                )}
+                {(scan?.devices?.length || scan?.candidates?.length) && (
+                  <div>
+                    {scan?.devices?.length ? (
+                      <>
+                        <Text type="secondary">扫描表（smartctl --scan）：</Text>
+                        {scan.devices.map((d) => (
+                          <div key={d.device} style={{ fontSize: 12 }}>
+                            <Text code>{d.device}</Text>{d.type ? <Text type="secondary"> · type {d.type}</Text> : null}
+                          </div>
+                        ))}
+                      </>
+                    ) : null}
+                    {scan?.candidates?.length ? (
+                      <>
+                        <Text type="secondary">候选链（实际尝试顺序）：</Text>
+                        {scan.candidates.map((c, i) => (
+                          <div key={i} style={{ fontSize: 12 }}>
+                            <Text code>{c.device || '-'}</Text>
+                            <Text type="secondary"> · -d {c.type || 'default'} · 来源 {c.source || '未知'}</Text>
+                          </div>
+                        ))}
+                      </>
+                    ) : null}
+                    {scan?.device_used ? <Text type="secondary">生效设备：<Text code>{scan.device_used}</Text></Text> : null}
+                  </div>
+                )}
                 {readResult.attempts.length > 0 && (
                   <div>
                     <Text type="secondary">尝试记录（共 {readResult.attempts.length} 次）：</Text>
                     {readResult.attempts.map((a, i) => (
                       <div key={i} style={{ fontSize: 12, marginTop: 2 }}>
-                        <Text code>-d {a.device_type}</Text>{' '}
-                        {a.error ? <Text type="danger">错误：{a.error}</Text> : <Text type="secondary">退出码：{a.rc ?? '-'}</Text>}
+                        <Text code>{a.device || '-'} · -d {a.device_type}</Text>{' '}
+                        {a.error ? <Text type="danger">错误：{a.error}</Text> : <Text type="secondary">rc/exit_status：{a.exit_status ?? a.rc ?? '-'}</Text>}
                         {a.stderr_excerpt && <Text type="secondary"> · {a.stderr_excerpt}</Text>}
                       </div>
                     ))}
                   </div>
                 )}
+                <RawOutputBlock text={diagText ?? ''} title="错误详情（扫描表 / 候选链 / 尝试记录）" />
                 <RawOutputBlock text={readResult.raw_excerpt} title="错误输出" />
                 <Text copyable={{ text: diagText ?? '', tooltips: ['复制诊断信息', '已复制'] }} style={{ fontSize: 12 }}>
                   复制完整诊断信息
@@ -451,6 +504,8 @@ function HealthCard({
                   <Space orientation="vertical" size={6} style={{ width: '100%' }}>
                     <Text>{disk.smart_error.smart_error}</Text>
                     <Text type="secondary" style={{ fontSize: 12 }}>来自快照 {disk.smart_error.snapshot_id}</Text>
+                    {/* 采集路径的 smart_error 后端只返回 smart_error / smart_error_raw / snapshot_id，
+                        没有 scan_info / attempts / capacity_check（那些字段仅现场读取接口返回）——缺则不渲染，不伪造。 */}
                     <RawOutputBlock text={disk.smart_error.smart_error_raw ?? ''} title="错误详情" />
                   </Space>
                 }
@@ -499,10 +554,12 @@ function VolumesCard({ volumes }: { volumes: DiskVolume[] }) {
             size="small"
             tableLayout="fixed"
             pagination={false}
+            scroll={{ x: 480 }}
             columns={[
               {
                 title: '卷 ID',
                 dataIndex: 'volume_id',
+                width: 150,
                 ellipsis: true,
                 render: (v: string) => (
                   <Tooltip title={v} placement="topLeft" mouseEnterDelay={0.3}>
@@ -513,7 +570,8 @@ function VolumesCard({ volumes }: { volumes: DiskVolume[] }) {
                 ),
               },
               { title: '文件系统', dataIndex: 'filesystem', width: 90, ellipsis: true },
-              { title: '标签', dataIndex: 'label', width: 130, ellipsis: true, render: (v: string | null) => v || '-' },
+              // 标签列不设固定宽度 → 自适应占满剩余空间（长标签在卡内省略，Tooltip 兜底）
+              { title: '标签', dataIndex: 'label', ellipsis: true, render: (v: string | null) => v || '-' },
               { title: '容量', dataIndex: 'capacity_bytes', width: 110, align: 'right' as const, render: (v: number) => formatFileSize(v) },
             ]}
             dataSource={volumes}
@@ -558,7 +616,7 @@ function SnapshotsCard({ snapshots, onSelect }: { snapshots: DiskSnapshot[]; onS
             {
               title: '操作',
               key: 'action',
-              width: 60,
+              width: 80, // 固定宽度不压缩：「查看」链接需要完整展示
               render: (_: unknown, record: DiskSnapshot) => (
                 <Button type="link" style={{ padding: 0 }} onClick={() => onSelect(record.snapshot_id)}>
                   查看

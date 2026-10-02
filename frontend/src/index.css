@@ -112,6 +112,15 @@ code {
   white-space: nowrap;
 }
 
+/* 展开行（磁盘详情面板等）：td 恢复正常换行并允许长词断行。
+   上面的全局 nowrap 会继承进内嵌卡片（Alert 描述 / 说明段落），
+   导致长文案在卡片右边缘被裁掉——修复必须作用在这个层级，
+   大表格单元格的 nowrap + ellipsis 规则保持不受影响。 */
+.ant-table-expanded-row > .ant-table-cell {
+  white-space: normal;
+  word-break: break-word;
+}
+
 /* 长型号/序列号/UUID 等不可断行内容：描述列表单元格恢复正常换行
    （展开行 td 的 nowrap 会继承进内嵌卡片，导致内容在卡片边缘被裁掉） */
 .ant-descriptions-item-content {

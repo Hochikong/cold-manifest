@@ -510,6 +510,22 @@ export interface SmartReadAttempt {
   rc: number | null
   error: string | null
   stderr_excerpt: string
+  /** 诊断补充字段（后端 read_smart_verbose 返回，旧响应可能缺） */
+  device?: string
+  argv?: string
+  exit_status?: number | null
+  stdout_messages?: string
+  ok?: boolean
+}
+
+/** 现场读取的映射结论：smartctl --scan 扫描表 / 候选链 / 生效设备 / 容量软校验。 */
+export interface SmartScanInfo {
+  devices?: { device: string; type: string }[]
+  candidates?: { device: string; type: string; source: string }[]
+  device_used?: string | null
+  mapped_from_scan?: boolean
+  /** 容量软校验结果：null=通过/未校验，"mismatch"=扫描映射疑似错盘被剔除 */
+  capacity_check?: string | null
 }
 
 /** parse_smart 输出（含真盘身份字段 model/serial/firmware）。 */
@@ -539,6 +555,9 @@ export interface SmartReadResult {
   raw_excerpt: string
   attempts: SmartReadAttempt[]
   parsed: ParsedSmart | null
+  exit_status?: number | null
+  device_candidates?: string[] | null
+  scan_info?: SmartScanInfo | null
 }
 
 /** 对当前插着的盘现场读一次 SMART；盘不在线时后端 404（由调用方处理）。 */
