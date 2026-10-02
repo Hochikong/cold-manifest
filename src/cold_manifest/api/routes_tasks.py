@@ -8,7 +8,7 @@ from typing import Iterator, Literal
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from ..tasks import TaskRunner
+from ..tasks import TaskDeleteBlocked, TaskRunner
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -72,6 +72,26 @@ def cancel_task(task_id: str, request: Request) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e)) from None
     return {"status": status}
+
+
+@router.delete("/{task_id}")
+def delete_task(task_id: str, request: Request) -> dict:
+    """删除任务登记行（仅终态任务 done/error/cancelled）。
+
+    边界：只删 catalog.tasks 里的登记行，不删任务产出的快照/对比/文件
+    ——快照有独立的删除入口（DELETE /api/snapshots/{snapshot_id}）。
+    典型场景：快照被删后任务跳转 404，此时允许把任务行清掉。
+    """
+    runner: TaskRunner = request.app.state.task_runner
+    try:
+        runner.delete_task(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}") from None
+    except TaskDeleteBlocked:
+        raise HTTPException(
+            status_code=409,
+            detail="任务正在运行或排队中，请先取消或等它结束") from None
+    return {"deleted": True, "task_id": task_id}
 
 
 @router.get("/{task_id}/events")

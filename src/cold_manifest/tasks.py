@@ -39,6 +39,10 @@ _TERMINAL_STATUSES = ("done", "error", "cancelled")
 _log = logging.getLogger(__name__)
 
 
+class TaskDeleteBlocked(Exception):
+    """任务处于 pending/running（非终态），禁止删除（路由层转 409）。"""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -321,6 +325,28 @@ class TaskRunner:
                 return False
             self._conn.execute("DELETE FROM tasks WHERE related_id=?", (batch_id,))
             self._conn.execute("DELETE FROM batches WHERE batch_id=?", (batch_id,))
+            self._conn.commit()
+        return True
+
+    def delete_task(self, task_id: str) -> bool:
+        """删除任务登记行（仅终态任务，锁内查状态后删）。
+
+        边界：只删 catalog.tasks 里的登记行，**不删**任务产出的快照/对比/文件
+        ——快照有自己的删除入口（cldm delete / DELETE /api/snapshots/{id}），
+        这里不越权级联。
+        批次子任务（related_id 指向 batch）允许删除：删掉后
+        GET /api/batches/{id} 的 summary/tasks 自然按剩余子任务行重算，
+        这是可接受行为，不加限制。
+        KeyError=任务不存在；TaskDeleteBlocked=pending/running 不可删。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row["status"] not in _TERMINAL_STATUSES:
+                raise TaskDeleteBlocked("任务正在运行或排队中，请先取消或等它结束")
+            self._conn.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
             self._conn.commit()
         return True
 

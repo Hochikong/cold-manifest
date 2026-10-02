@@ -158,6 +158,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_delete.add_argument("--force", action="store_true",
                           help="快照被 diff 引用时级联删除这些 diff（物化库 + catalog 行）")
 
+    p_task_delete = sub.add_parser("task-delete",
+                                   help="删除任务登记行（仅终态任务；不动其产出的快照/对比；"
+                                        "退出码 0 成功 / 2 未知或运行中）")
+    p_task_delete.add_argument("task_id", help="任务 ID（task_xxx，见任务列表）")
+    p_task_delete.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+
     p_verify = sub.add_parser("verify-copy",
                               help="校验快照盘上副本与源文件完整性（只读；退出码 0 一致 / 1 不一致 / 2 错误）")
     p_verify.add_argument("snapshot_id", help="快照 ID（形如 volume_id/时间戳，如 VOL_P0/20260101T000000Z；Windows 反斜杠分隔亦可）")
@@ -876,6 +882,39 @@ def _cmd_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---- task-delete --------------------------------------------------------------
+
+def _cmd_task_delete(args: argparse.Namespace) -> int:
+    """删除任务登记行（仅终态）：未知/运行中 → 退出码 2。只删 tasks 行，
+    不动任务产出的快照/对比/文件。"""
+    from .db import init_catalog, open_catalog
+    from .tasks import TaskDeleteBlocked, TaskRunner
+
+    data_root = Path(args.data_root)
+    if not data_root.is_dir():
+        print(f"错误：数据根不存在：{data_root}", file=sys.stderr)
+        return 2
+    runner = TaskRunner(data_root)
+    # 不启动工作线程：仅复用 delete_task 的状态判断与删除逻辑
+    runner._conn = open_catalog(data_root / "catalog.db")
+    init_catalog(runner._conn)  # 幂等，保证 tasks 表存在
+    try:
+        runner.delete_task(args.task_id)
+    except KeyError:
+        print(f"错误：任务不存在：{args.task_id}", file=sys.stderr)
+        return 2
+    except TaskDeleteBlocked as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+    finally:
+        runner._conn.close()
+        runner._conn = None
+
+    print(f"已删除任务：{args.task_id}")
+    print("  说明：仅删除任务登记行，其产出的快照/对比不受影响。")
+    return 0
+
+
 # ---- nickname ----------------------------------------------------------------
 
 _NICKNAME_MAX = 64
@@ -1204,6 +1243,8 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.command == "duplicates":
         return _cmd_duplicates(args)
 
+    if args.command == "task-delete":
+        return _cmd_task_delete(args)
     if args.command == "delete":
         return _cmd_delete(args)
 
