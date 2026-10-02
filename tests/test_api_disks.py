@@ -415,11 +415,15 @@ def test_disk_detail_ssd_contract(client_with_nvme: TestClient) -> None:
     assert abs(ssd["written_tb"] - 8.9) < 0.1
     assert ssd["temp_sensors"] == [82, 52]
     assert ssd["source"] == "nvme"
+    # 集成回归：前端健康卡读的是 latest_smart.ssd（与 /smart 历史项形状一致），
+    # 两层必须是同一份契约 —— 曾经只有顶层有、内层为 null（SSD 区块显示"未采集到"）。
+    assert body["latest_smart"]["ssd"] == ssd
     # HDD 盘 → 全 null / [] 兜底
     d1 = client_with_nvme.get("/api/disks/D1").json()
     assert d1["latest_smart"]["health"] == "passed"
     assert d1["ssd"]["life_left_pct"] is None
     assert d1["ssd"]["temp_sensors"] == []
+    assert d1["latest_smart"]["ssd"] == d1["ssd"]
 
 
 def test_smart_history_ssd_fields(client_with_nvme: TestClient) -> None:

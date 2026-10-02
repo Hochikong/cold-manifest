@@ -227,8 +227,13 @@ def disk_detail(disk_id: str, request: Request) -> dict:
     else:
         back = _meta_backfill(state, disk_id)
         latest = back[-1] if back else None
+    # SSD 契约同时挂在顶层与 latest_smart 内层：前端健康卡读的是 latest_smart.ssd
+    # （与 /smart 历史序列每项的形状保持一致），顶层那份保留给其它调用方。
+    ssd = _ssd_fields(latest) if latest is not None else None
+    if latest is not None:
+        latest["ssd"] = ssd
     detail["latest_smart"] = latest
-    detail["ssd"] = _ssd_fields(latest)
+    detail["ssd"] = ssd
     detail["smart_error"] = _latest_meta_smart_error(state, disk_id)
     return detail
 
