@@ -358,6 +358,29 @@ export interface LatestSmart {
   collected_at: string
 }
 
+/** SSD 专属指标（契约冻结，字段名勿改；后端未实现/旧快照 → ssd 为 null/缺省）。 */
+export interface SsdMetrics {
+  /** 剩余寿命 %（NVMe = 100 - percentage_used；SATA 来自 202/231/233 等） */
+  life_left_pct: number | null
+  /** NVMe 已用寿命 % */
+  percentage_used: number | null
+  available_spare_pct: number | null
+  /** 累计写入字节 */
+  written_bytes: number | null
+  read_bytes: number | null
+  /** 人类可读 TB（后端已换算，前端优先用它） */
+  written_tb: number | null
+  read_tb: number | null
+  media_errors: number | null
+  unsafe_shutdowns: number | null
+  power_cycles: number | null
+  /** 控制器忙时（分钟） */
+  controller_busy_minutes: number | null
+  /** NVMe 多温度探头 */
+  temp_sensors: number[]
+  source: 'nvme' | 'ata'
+}
+
 export interface Disk {
   disk_id: string
   physical_model: string | null
@@ -449,6 +472,7 @@ export interface SmartItem {
   device_type: string | null
   raw_json: string | null
   source: string
+  ssd?: SsdMetrics | null
 }
 
 export interface SmartHistoryResponse {
@@ -477,6 +501,7 @@ export interface LatestSmartFull extends LatestSmart {
   raw_json: string | null
   snapshot_id?: string
   source?: string
+  ssd?: SsdMetrics | null
 }
 
 /** POST /disks/{id}/smart/read 单次尝试记录。 */
@@ -500,6 +525,7 @@ export interface ParsedSmart {
   model: string | null
   serial: string | null
   firmware: string | null
+  ssd?: SsdMetrics | null
 }
 
 /** 现场读取 SMART 返回（不写库）。ok=false 时 message/attempts/raw_excerpt 给出人话原因。 */

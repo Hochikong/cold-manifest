@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Alert, App, Button, Card, Collapse, Descriptions, Empty, Row, Col, Skeleton, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { Alert, App, Button, Card, Collapse, Descriptions, Empty, Progress, Row, Col, Skeleton, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { CheckCircleOutlined, DeleteOutlined, ExclamationCircleOutlined, MedicineBoxOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useDisk, useDiskSmartRead, useSetDiskNickname } from '../api/hooks'
 import { useDeleteRegistry } from '../hooks/useDeleteRegistry'
@@ -9,13 +9,52 @@ import NicknameEditor from './NicknameEditor'
 import SmartTrendsChart from './SmartTrendsChart'
 import VolumeTrendsChart from './VolumeTrendsChart'
 import VolumeDetailDrawer from './VolumeDetailDrawer'
-import { apiErrorDetail, parseSmartIdentity, type DiskDetail, type DiskVolume, type DiskSnapshot, type ParsedSmart, type SmartReadResult } from '../api/client'
+import { apiErrorDetail, parseSmartIdentity, type DiskDetail, type DiskVolume, type DiskSnapshot, type ParsedSmart, type SmartReadResult, type SsdMetrics } from '../api/client'
 import { formatDateTime, formatFileSize, formatNumber } from '../utils/format'
 
 const { Text } = Typography
 
 interface DiskDetailPanelProps {
   disk_id: string
+}
+
+/**
+ * 展开面板宽度与表格列宽解耦：
+ * 面板内容宽度 = 表格滚动容器（.ant-table-content）可视区宽度（ResizeObserver 实测），
+ * 上限 1200、左对齐。这样用户拖宽表格列后，面板卡片不会被拉长/挤压；
+ * 表格横向滚动时 sticky left:0 保持面板可见。ResizeObserver 不可用时退化为 100%。
+ */
+function PanelWidthGate({ children }: { children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [width, setWidth] = useState<number | null>(null)
+
+  useEffect(() => {
+    const el = ref.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const scroller = (el.closest('.ant-table-content') as HTMLElement | null)
+      ?? (el.closest('.ant-table') as HTMLElement | null)
+    if (!scroller) return
+    const measure = () => setWidth(scroller.clientWidth)
+    const ro = new ResizeObserver(measure)
+    ro.observe(scroller)
+    measure()
+    return () => ro.disconnect()
+  }, [])
+
+  return (
+    <div
+      ref={ref}
+      style={{
+        width: width ?? '100%',
+        maxWidth: 1200,
+        minWidth: 0,
+        position: 'sticky',
+        left: 0,
+      }}
+    >
+      {children}
+    </div>
+  )
 }
 
 export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
@@ -54,9 +93,13 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
   const liveParsed = readResult?.ok ? readResult.parsed : null
   const liveLabel = readResult?.ok ? '现场读取 · smartctl' : null
 
+  // SSD 指标：优先现场读取，其次最近一次采集；都没有 → null（区块显示占位文案）
+  const ssd = liveParsed?.ssd ?? disk.latest_smart?.ssd ?? null
+
   return (
-    // contain: inline-size 把面板的内在宽度与内容解耦：趋势图 canvas 的显式像素宽
-    // 不再参与外层表格 max-content 计算（否则图表↔表格互相撑大，整页出横向滚动）。
+    <PanelWidthGate>
+    {/* contain: inline-size 把面板的内在宽度与内容解耦：趋势图 canvas 的显式像素宽
+        不再参与外层表格 max-content 计算（否则图表↔表格互相撑大，整页出横向滚动）。 */}
     <Space orientation="vertical" style={{ width: '100%', minWidth: 0, contain: 'inline-size' }} size="middle">
       {modalNode}
       <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -70,11 +113,12 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
       </div>
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
-          <IdentityCard disk={disk} liveParsed={liveParsed} liveLabel={liveLabel} />
+          <IdentityCard disk={disk} liveParsed={liveParsed} liveLabel={liveLabel} mediaBadge={inferMediaBadge(disk, ssd)} />
         </Col>
         <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
           <HealthCard
             disk={disk}
+            ssd={ssd}
             readResult={readResult}
             readError={readError}
             reading={smartRead.isPending}
@@ -98,7 +142,29 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
         <VolumeTrendsChart key={vol.volume_id} volume_id={vol.volume_id} />
       ))}
     </Space>
+    </PanelWidthGate>
   )
+}
+
+/** 介质类型徽标：ssd.source 可靠；无 ssd 时按接口/smart 线索推断；完全无线索则不显示。 */
+function inferMediaBadge(
+  disk: DiskDetail,
+  ssd: SsdMetrics | null,
+): { label: string; color: string } | null {
+  if (ssd) {
+    return ssd.source === 'nvme'
+      ? { label: '固态 · NVMe', color: 'purple' }
+      : { label: '固态 · SATA', color: 'cyan' }
+  }
+  const ifce = (disk.interface_type || '').toUpperCase()
+  const dev = (disk.latest_smart?.device_type || '').toLowerCase()
+  if (ifce.includes('NVME') || dev.includes('nvme')) {
+    return { label: '固态 · NVMe', color: 'purple' }
+  }
+  if (disk.latest_smart || ifce.includes('SATA') || ifce.includes('USB')) {
+    return { label: '机械', color: 'default' }
+  }
+  return null
 }
 
 /** 来源小标签：smartctl（真盘）/ 系统探测（lsblk / CIM）/ USB 桥（真盘信息被隐藏）。 */
@@ -111,7 +177,7 @@ function SourceTag({ text }: { text: string }) {
   )
 }
 
-function IdentityCard({ disk, liveParsed, liveLabel }: { disk: DiskDetail; liveParsed: ParsedSmart | null; liveLabel: string | null }) {
+function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge }: { disk: DiskDetail; liveParsed: ParsedSmart | null; liveLabel: string | null; mediaBadge: { label: string; color: string } | null }) {
   const { message } = App.useApp()
   const setNickname = useSetDiskNickname()
 
@@ -161,6 +227,9 @@ function IdentityCard({ disk, liveParsed, liveLabel }: { disk: DiskDetail; liveP
       >
         <Descriptions.Item label="昵称">
           <NicknameEditor value={disk.nickname} onSave={saveNickname} />
+        </Descriptions.Item>
+        <Descriptions.Item label="介质类型">
+          {mediaBadge ? <Tag color={mediaBadge.color}>{mediaBadge.label}</Tag> : <Text type="secondary">未识别</Text>}
         </Descriptions.Item>
         <Descriptions.Item label="磁盘 ID"><Text code>{disk.disk_id}</Text></Descriptions.Item>
         <Descriptions.Item label="真盘型号">
@@ -221,12 +290,14 @@ function RawOutputBlock({ text, title }: { text: string; title: string }) {
 
 function HealthCard({
   disk,
+  ssd,
   readResult,
   readError,
   reading,
   onReadNow,
 }: {
   disk: DiskDetail
+  ssd: SsdMetrics | null
   readResult: SmartReadResult | null
   readError: string | null
   reading: boolean
@@ -295,12 +366,12 @@ function HealthCard({
       }
     >
       <Space orientation="vertical" style={{ width: '100%' }} size="small">
+        <SsdSection ssd={ssd} />
         {readError && (
           <Alert
             type="warning"
             showIcon
-            title="无法现场读取 SMART"
-            description={
+            title="无法现场读取 SMART"            description={
               <Space orientation="vertical" size={4} style={{ width: '100%' }}>
                 <Text>{readError}</Text>
                 <Text type="secondary">请确认这块盘当前已接到本机并可枚举（磁盘页 → 采集对话框里能看到），再重试。</Text>
@@ -458,8 +529,7 @@ function VolumesCard({ volumes }: { volumes: DiskVolume[] }) {
   )
 }
 
-function SnapshotsCard({ snapshots, onSelect }: { snapshots: DiskSnapshot[]; onSelect: (id: string) => void }) {
-  return (
+function SnapshotsCard({ snapshots, onSelect }: { snapshots: DiskSnapshot[]; onSelect: (id: string) => void }) {  return (
     <Card title="快照时间线" size="small" style={{ width: '100%', minWidth: 0, overflow: 'hidden' }}>
       {snapshots.length === 0 ? (
         <Empty description="该盘还没有快照" />
@@ -500,5 +570,108 @@ function SnapshotsCard({ snapshots, onSelect }: { snapshots: DiskSnapshot[]; onS
         />
       )}
     </Card>
+  )
+}
+
+/** 控制器忙时（分钟 → 人类可读）。 */
+function formatBusyMinutes(min: number | null | undefined): string {
+  if (min == null || Number.isNaN(min)) return '—'
+  if (min < 60) return `${formatNumber(min)} 分钟`
+  const h = min / 60
+  if (h < 48) return `${h.toFixed(1)} 小时`
+  return `${formatNumber(Math.round(h))} 小时`
+}
+
+/** 写入/读取量：优先后端换算好的 TB，退回字节格式化；都缺 → — */
+function formatTb(tb: number | null | undefined, bytes: number | null | undefined): string {
+  if (tb != null && !Number.isNaN(tb)) return `${formatNumber(Math.round(tb * 100) / 100)} TB`
+  if (bytes != null && !Number.isNaN(bytes)) return formatFileSize(bytes)
+  return '—'
+}
+
+/**
+ * 健康卡内的 SSD 专属指标区块。后端未实现 / 旧快照 / HDD → ssd 为 null，
+ * 显示占位文案而不是报错或空白；单项缺失显示 —，绝不出现 "null"。
+ */
+function SsdSection({ ssd }: { ssd: SsdMetrics | null | undefined }) {
+  if (!ssd) {
+    return (
+      <div
+        style={{
+          padding: '10px 12px',
+          border: '1px dashed #d9d9d9',
+          borderRadius: 6,
+          background: '#fafafa',
+        }}
+      >
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          未采集到 SSD 专属指标（寿命 / 读写量等）。机械盘或旧快照没有这部分数据；SSD 盘重新采集一次 SMART 后会显示在这里。
+        </Text>
+      </div>
+    )
+  }
+
+  // 寿命剩余：life_left_pct 优先，缺则 100 - percentage_used，再缺 → 未提供
+  const lifeLeft = ssd.life_left_pct ?? (ssd.percentage_used != null ? 100 - ssd.percentage_used : null)
+  const lifeStatus = lifeLeft == null ? 'normal' : lifeLeft < 10 ? 'exception' : lifeLeft < 30 ? 'active' : 'success'
+
+  const temps = (ssd.temp_sensors ?? []).filter((t) => t != null)
+
+  return (
+    <div
+      style={{
+        padding: '10px 12px',
+        border: '1px solid #f0f0f0',
+        borderRadius: 6,
+      }}
+    >
+      <Space size={8} wrap style={{ marginBottom: lifeLeft != null ? 4 : 0 }}>
+        <Text strong style={{ fontSize: 13 }}>SSD 专属指标</Text>
+        <Tag color={ssd.source === 'nvme' ? 'purple' : 'cyan'} style={{ fontSize: 11, lineHeight: '16px' }}>
+          {ssd.source === 'nvme' ? 'NVMe' : 'SATA'}
+        </Tag>
+      </Space>
+      {lifeLeft != null ? (
+        <>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <Text type="secondary" style={{ fontSize: 12, flexShrink: 0 }}>寿命剩余</Text>
+            <Progress
+              percent={Math.max(0, Math.min(100, lifeLeft))}
+              size="small"
+              status={lifeStatus}
+              format={(p) => `${Math.round(p ?? 0)}%`}
+              style={{ flex: 1, minWidth: 0, marginBottom: 0 }}
+            />
+          </div>
+        </>
+      ) : (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <Text type="secondary" style={{ fontSize: 12, flexShrink: 0 }}>寿命剩余</Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>未提供</Text>
+        </div>
+      )}
+      <Descriptions size="small" column={2} bordered style={{ marginTop: 8 }}>
+        <Descriptions.Item label="已写入">{formatTb(ssd.written_tb, ssd.written_bytes)}</Descriptions.Item>
+        <Descriptions.Item label="已读取">{formatTb(ssd.read_tb, ssd.read_bytes)}</Descriptions.Item>
+        <Descriptions.Item label="可用备用块">
+          {ssd.available_spare_pct != null ? `${formatNumber(ssd.available_spare_pct)} %` : '—'}
+        </Descriptions.Item>
+        <Descriptions.Item label="介质错误">
+          {ssd.media_errors != null ? formatNumber(ssd.media_errors) : '—'}
+        </Descriptions.Item>
+        <Descriptions.Item label="异常断电">
+          {ssd.unsafe_shutdowns != null ? formatNumber(ssd.unsafe_shutdowns) : '—'}
+        </Descriptions.Item>
+        <Descriptions.Item label="通电次数">
+          {ssd.power_cycles != null ? formatNumber(ssd.power_cycles) : '—'}
+        </Descriptions.Item>
+        <Descriptions.Item label="控制器忙时">{formatBusyMinutes(ssd.controller_busy_minutes)}</Descriptions.Item>
+        <Descriptions.Item label="温度探头">
+          {temps.length > 0
+            ? temps.map((t) => `${t}℃`).join(' / ')
+            : '—'}
+        </Descriptions.Item>
+      </Descriptions>
+    </div>
   )
 }
