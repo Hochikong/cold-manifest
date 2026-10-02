@@ -46,6 +46,7 @@ class DiskInfo:
     smart_error_raw: str | None = None  # 失败现场 stderr 片段（≤2KB，诊断用）
     smart_attempts: "list | None" = None  # smartctl 类型兜底链逐次尝试记录
     smart_exit_status: "int | None" = None  # 生效那次的 smartctl exit_status
+    smart_scan_info: "dict | None" = None  # 设备映射结论（扫描表/候选链/生效设备）
 
 
 @dataclass

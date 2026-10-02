@@ -208,7 +208,9 @@ def test_read_smart_verbose_no_smart(monkeypatch) -> None:
     import subprocess
 
     def fake2(cmd):
-        p = subprocess.CompletedProcess(args=[], returncode=2, stdout="",
+        # rc=4（bit2：部分子命令失败）+ 无 JSON → 不算读到数据；
+        # stderr 指向设备类型识别失败（bit0/bit1 未置位才走到文案归类）
+        p = subprocess.CompletedProcess(args=[], returncode=4, stdout="",
                                         stderr="Unable to detect device type")
         return p, None
 
@@ -235,11 +237,84 @@ def test_read_smart_verbose_timeout(monkeypatch) -> None:
 
 
 def test_read_smart_verbose_other(monkeypatch) -> None:
-    fake, _ = _fake_cmd_ex([_proc("", rc=2), _proc("", rc=2)])
+    fake, _ = _fake_cmd_ex([_proc("", rc=4), _proc("", rc=4)])
     monkeypatch.setattr(smart, "_run_cmd_ex", fake)
     res = smart.read_smart_verbose("/dev/sdb")
     assert res["ok"] is False and res["reason"] == "other"
     assert res["message"]
+
+
+def test_read_smart_verbose_device_open_bit1(monkeypatch) -> None:
+    """exit_status bit1(2) → device_open，文案给可执行建议。"""
+    import json as _json
+    import subprocess
+
+    def fake2(cmd):
+        # USB 桥实测形态：rc=2，stdout 仍是 JSON，原因在 messages[].string
+        out = _json.dumps({"smartctl": {"exit_status": 2}, "messages": [
+            {"string": "Smartctl open device: Invalid argument"}]})
+        p = subprocess.CompletedProcess(args=[], returncode=2,
+                                        stdout=out, stderr="")
+        return p, None
+
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake2)
+    res = smart.read_smart_verbose("\\\\.\\PhysicalDrive2")
+    assert res["ok"] is False and res["reason"] == "device_open"
+    assert "/dev/sdN" in res["message"]
+    assert "CLDM_SMARTCTL_DEVICE" in res["message"]
+    # messages[].string 已提取进 attempts（-j 出错时 stderr 为空）
+    assert "Invalid argument" in res["attempts"][0]["stdout_messages"]
+    assert "Invalid argument" in res["raw_excerpt"]
+
+
+def test_read_smart_verbose_cmdline_error_bit0(monkeypatch) -> None:
+    import subprocess
+
+    def fake2(cmd):
+        p = subprocess.CompletedProcess(args=[], returncode=1, stdout="",
+                                        stderr="Unknown argument: -x")
+        return p, None
+
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake2)
+    res = smart.read_smart_verbose("/dev/sdb")
+    assert res["ok"] is False and res["reason"] == "cmdline_error"
+    assert "bit0" in res["message"]
+
+
+def test_read_smart_verbose_device_candidates_chain(monkeypatch) -> None:
+    """候选链逐台设备尝试；attempts 记录设备串；scan_info 带映射结论。"""
+    fake, calls = _fake_cmd_ex([_proc("", rc=4)])
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake)
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [])
+    res = smart.read_smart_verbose(devices=[
+        {"device": "/dev/sdc", "type": "sat", "source": "scan"},
+        {"device": "\\\\.\\PhysicalDrive2", "type": "", "source": "fallback-pd"},
+    ])
+    assert res["ok"] is False
+    assert res["device_candidates"] == ["/dev/sdc", "\\\\.\\PhysicalDrive2"]
+    devices_tried = {a["device"] for a in res["attempts"]}
+    assert devices_tried == {"/dev/sdc", "\\\\.\\PhysicalDrive2"}
+    assert all(a["argv"].split()[-1] == a["device"] for a in res["attempts"])
+    si = res["scan_info"]
+    assert si["devices"] == []
+    assert si["device_used"] is None
+    assert si["mapped_from_scan"] is True  # 候选来源标记为 scan
+    assert [c["device"] for c in si["candidates"]] == \
+        ["/dev/sdc", "\\\\.\\PhysicalDrive2"]
+    # 类型兜底链按设备各走一遍
+    assert len(res["attempts"]) == 2 * len(smart._device_types("sat"))
+
+
+def test_read_smart_verbose_success_has_scan_info(monkeypatch) -> None:
+    fake, _ = _fake_cmd_ex([_proc(SAMPLE, rc=0)])
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake)
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [
+        {"device": "/dev/sdb", "type": "sat"}])
+    res = smart.read_smart_verbose("/dev/sdb", suggested_type="sat")
+    assert res["ok"] is True
+    assert res["device"] == "/dev/sdb"
+    assert res["scan_info"]["device_used"] == "/dev/sdb"
+    assert res["scan_info"]["devices"] == [{"device": "/dev/sdb", "type": "sat"}]
 
 
 # ---------------------------------------------------------------- exit_status 位掩码 / 设备名 / 类型兜底链
@@ -256,6 +331,46 @@ def test_parse_scan_output() -> None:
     entries = smart.parse_scan_output(SCAN_TEXT)
     assert [e["device"] for e in entries] == ["/dev/sda", "/dev/sdb", "/dev/sdc"]
     assert [e["type"] for e in entries] == ["ata", "scsi", "sat"]
+
+
+# 实测 smartctl 7.5 `--scan -j`（Windows 宿主，两块 NVMe）——JSON 形态
+SCAN_JSON = json.dumps({
+    "json_format_version": [1, 0],
+    "smartctl": {"version": [7, 5], "exit_status": 0},
+    "devices": [
+        {"name": "/dev/sda", "info_name": "/dev/sda",
+         "type": "nvme", "protocol": "NVMe"},
+        {"name": "/dev/sdb", "info_name": "/dev/sdb",
+         "type": "nvme", "protocol": "NVMe"},
+    ],
+})
+
+
+def test_parse_scan_output_json() -> None:
+    """`--scan -j` 的 JSON 形态必须能解析（曾因只认文本导致映射成空）。"""
+    entries = smart.parse_scan_output(SCAN_JSON)
+    assert [e["device"] for e in entries] == ["/dev/sda", "/dev/sdb"]
+    assert [e["type"] for e in entries] == ["nvme", "nvme"]
+
+
+def test_parse_scan_output_json_info_name_fallback() -> None:
+    raw = json.dumps({"devices": [
+        {"info_name": "/dev/sdz", "type": "sat"},          # 缺 name → info_name
+        {"name": "/dev/sdy"},                              # 缺 type → ""
+    ]})
+    entries = smart.parse_scan_output(raw)
+    assert entries == [{"device": "/dev/sdz", "type": "sat"},
+                       {"device": "/dev/sdy", "type": ""}]
+
+
+def test_scan_devices_prefers_json(monkeypatch) -> None:
+    """scan_devices 走 -j JSON 分支（parse_scan_output 认 JSON）。"""
+    monkeypatch.setattr(smart, "_SCAN_CACHE", None)
+    fake, calls = _fake_cmd([_proc(SCAN_JSON, rc=0)])
+    monkeypatch.setattr(smart, "_run_cmd", fake)
+    entries = smart.scan_devices()
+    assert [e["device"] for e in entries] == ["/dev/sda", "/dev/sdb"]
+    assert len(calls) == 1  # JSON 成功即不再回退文本
 
 
 def test_parse_scan_output_empty_noise() -> None:
@@ -332,8 +447,8 @@ def test_smart_device_scan_mapping(monkeypatch) -> None:
     ])
     assert smart.smart_device(2) == ("/dev/sdc", "sat")
     assert smart.smart_device(0) == ("/dev/sda", "ata")
-    # 超出 scan 范围 → PhysicalDrive 回退
-    assert smart.smart_device(9) == ("\\\\.\\PhysicalDrive9", "")
+    # 超出 scan 范围 → 候选链回退（首选 /dev/sdN 形态）
+    assert smart.smart_device(9) == ("/dev/sdj", "")
 
 
 def test_smart_device_env_override(monkeypatch) -> None:
@@ -341,10 +456,30 @@ def test_smart_device_env_override(monkeypatch) -> None:
     assert smart.smart_device(2) == ("/dev/sdz", "")
 
 
-def test_smart_device_fallback_physicaldrive(monkeypatch) -> None:
+def test_smart_device_candidates_both_forms(monkeypatch) -> None:
+    """扫描映射不可用时，候选链同时含 /dev/sdN 与 \\\\.\\PhysicalDriveN
+    （单选回退曾导致 USB 盘永远落在打不开的 PhysicalDrive 上）。"""
     monkeypatch.setattr(smart, "_SCAN_CACHE", [])
     monkeypatch.delenv("CLDM_SMARTCTL_DEVICE", raising=False)
-    assert smart.smart_device(2) == ("\\\\.\\PhysicalDrive2", "")
+    cands = smart.smart_device_candidates(2)
+    assert [c["device"] for c in cands] == \
+        ["/dev/sdc", "\\\\.\\PhysicalDrive2"]
+    assert [c["source"] for c in cands] == ["fallback-sd", "fallback-pd"]
+    # 首选仍向后兼容（smart_device 取第一候选）
+    assert smart.smart_device(2) == ("/dev/sdc", "")
+
+
+def test_smart_device_candidates_scan_first(monkeypatch) -> None:
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [
+        {"device": "/dev/sda", "type": "ata"},
+        {"device": "/dev/sdb", "type": "nvme"},
+        {"device": "/dev/sdc", "type": "sat"},
+    ])
+    cands = smart.smart_device_candidates(2)
+    assert cands[0] == {"device": "/dev/sdc", "type": "sat", "source": "scan"}
+    # /dev/sdc 已在首选里，不重复
+    assert [c["device"] for c in cands] == \
+        ["/dev/sdc", "\\\\.\\PhysicalDrive2"]
 
 
 def test_device_type_chain_order() -> None:

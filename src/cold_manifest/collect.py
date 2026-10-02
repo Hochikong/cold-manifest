@@ -234,6 +234,10 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
     smart_attempts = getattr(disk, "smart_attempts", None)
     if smart_attempts:
         meta["smart_attempts_json"] = json.dumps(smart_attempts, ensure_ascii=False)
+    # 设备映射结论（诊断用：扫描表/候选链/生效设备串）
+    smart_scan_info = getattr(disk, "smart_scan_info", None)
+    if smart_scan_info:
+        meta["smart_scan_info_json"] = json.dumps(smart_scan_info, ensure_ascii=False)
     if serial_fallback:
         # 序列号回退时的原始探测值（诊断用：说明为何 volume_id 用了卷序列号）
         meta["probe_serial_raw"] = probe_serial_raw

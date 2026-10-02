@@ -180,9 +180,9 @@ def test_device_for_path_win(monkeypatch, tmp_path):
     # 屏蔽真实 smartctl --scan：无扫描结果 → PhysicalDrive 回退
     monkeypatch.setattr(smart, "_SCAN_CACHE", [])
 
-    # 提供 disk_index → PhysicalDrive
-    assert smart.device_for_path("E:\\data", disk_index=3) == "\\\\.\\PhysicalDrive3"
-    assert smart.device_for_path("E:\\data", disk_index=0) == "\\\\.\\PhysicalDrive0"
+    # 提供 disk_index → 候选链首选（/dev/sdN 形态；PhysicalDrive 为次选）
+    assert smart.device_for_path("E:\\data", disk_index=3) == "/dev/sdd"
+    assert smart.device_for_path("E:\\data", disk_index=0) == "/dev/sda"
 
     # 无 index → 退回盘符。mock Path.resolve 返回固定盘符路径
     import cold_manifest.smart as s

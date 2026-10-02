@@ -272,14 +272,17 @@ def probe_path_win(
     # smartctl --scan 的 /dev/sdN + 扫描建议类型；CLDM_SMARTCTL_DEVICE 可直接覆盖
     if smartctl:
         try:
-            from ..smart import parse_smart, read_smart_verbose, smart_device
+            from ..smart import (parse_smart, read_smart_verbose,
+                                 smart_device_candidates)
 
             data = json.loads(text)
             idx = (data.get("disk") or {}).get("index")
-            device, suggested = smart_device(
+            # 候选链：--scan 映射 → /dev/sdN → \\.\PhysicalDriveN，依序尝试
+            cands = smart_device_candidates(
                 idx if isinstance(idx, int) else None, letter)
-            res = read_smart_verbose(device, suggested_type=suggested)
+            res = read_smart_verbose(devices=cands)
             info.smart_attempts = res.get("attempts") or None
+            info.smart_scan_info = res.get("scan_info")
             if res["ok"]:
                 info.smart_raw = res["raw"]
                 info.smart_device_type = res["device_type"]
