@@ -225,6 +225,10 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
         ssd = smart_struct.get("ssd") or {}
         if ssd:
             meta["smart_ssd_json"] = json.dumps(ssd, ensure_ascii=False)
+        # ATA 属性整表一份 JSON（关键指标走 smart_* 扁平键，不塞 20 个 meta 键）
+        ata_attrs = smart_struct.get("ata_attributes")
+        if isinstance(ata_attrs, list) and ata_attrs:
+            meta["smart_ata_json"] = json.dumps(ata_attrs, ensure_ascii=False)
     else:
         # 拿不到 SMART 时留下可诊断原因（成功路径不受影响）
         smart_error = getattr(disk, "smart_error", None)

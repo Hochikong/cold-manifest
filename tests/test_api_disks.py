@@ -478,3 +478,98 @@ def test_smart_read_response_ssd(client_with_nvme: TestClient, monkeypatch) -> N
                             "raw_excerpt": "", "attempts": []})
     body = client_with_nvme.post("/api/disks/D2/smart/read").json()
     assert body["ok"] is False and body["ssd"] is None
+
+
+# ---------------------------------------------------------------- ATA 属性表契约
+
+
+@pytest.fixture()
+def ata_client(tmp_path: Path) -> TestClient:
+    """D1 的最新 SMART 为完整 ATA 盘（关键指标/属性表齐全）。"""
+    from test_smart import ATA_FULL
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_snapshot_db(data_root / "vol" / "20260301T000000Z" / "snapshot.db", None)
+
+    cat = sqlite3.connect(catalog_path(data_root))
+    init_catalog(cat)
+    ensure_disk(cat, "D1", physical_model="TOSHIBA MQ04UBB400", capacity_bytes=4000)
+    ensure_volume(cat, "vol", "D1", filesystem="ext4")
+    register_snapshot(cat, SID_NEW, "vol", status="sealed", host_path="/x",
+                      collected_at="2026-03-01T00:00:00Z")
+    smart.record_smart(cat, "D1", SID_NEW, smart.parse_smart(ATA_FULL),
+                       collected_at="2026-03-01T00:00:00Z", raw_json=ATA_FULL)
+    cat.commit()
+    cat.close()
+    with TestClient(create_app(data_root=str(data_root))) as c:
+        yield c
+
+
+_ATA_FLAT_KEYS = ("power_cycle_count", "load_cycle_count", "udma_crc_errors",
+                  "raw_read_error_rate", "seek_error_rate", "spin_retry_count",
+                  "power_off_retract_count", "airflow_temperature_c",
+                  "head_flying_hours", "interface_speed_current",
+                  "interface_speed_max", "sata_version", "ata_version",
+                  "trim", "zoned", "model_family")
+
+
+def test_disk_detail_ata_contract(ata_client: TestClient) -> None:
+    """详情端点：顶层与 latest_smart 内层两层一致。"""
+    d = ata_client.get("/api/disks/D1").json()
+    ls = d["latest_smart"]
+    assert len(ls["ata_attributes"]) == 15
+    assert ls["power_cycle_count"] == 4627
+    assert ls["udma_crc_errors"] == 0
+    assert ls["sata_version"] == "SATA 3.3"
+    assert ls["trim"] is False
+    for k in _ATA_FLAT_KEYS:
+        assert d[k] == ls[k], k
+    assert len(d["ata_attributes"]) == 15
+
+
+def test_disk_detail_ata_null_fallback(client: TestClient) -> None:
+    """非 ATA 盘（NVMe/旧数据）：ata_attributes == []、扁平键 null/false 兜底。"""
+    d = client.get("/api/disks/D1").json()
+    ls = d["latest_smart"]
+    # SAMPLE 的 ATA 表只有 5 项（无关键指标属性）→ 扁平键全 null 兜底
+    assert isinstance(ls["ata_attributes"], list)
+    assert ls["trim"] is False
+    for k in _ATA_FLAT_KEYS:
+        if k not in ("trim", "model_family"):  # SAMPLE 带 model_family
+            assert ls[k] is None, k
+
+
+def test_smart_history_ata_contract(ata_client: TestClient) -> None:
+    body = ata_client.get("/api/disks/D1/smart").json()
+    items = body["items"]
+    assert len(items) == 1  # ata_client 只注册了一个快照（无 meta 回填项）
+    last = items[0]
+    assert len(last["ata_attributes"]) == 15
+    assert last["power_cycle_count"] == 4627
+    assert last["head_flying_hours"] == 1157774408
+
+
+def test_smart_read_ata_contract(ata_client: TestClient, monkeypatch) -> None:
+    from test_smart import ATA_FULL
+
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True,
+        "items": [{"device": "/dev/sdb", "model": "M", "serial": "D1",
+                   "size_bytes": 100, "volumes": []}],
+        "count": 1,
+    })
+    monkeypatch.setattr(
+        smart, "read_smart_verbose",
+        lambda dev=None, *, devices=None, **kw: {
+            "ok": True, "raw": ATA_FULL, "device": "/dev/sdb",
+            "device_candidates": ["/dev/sdb"], "device_type": "sat",
+            "exit_status": 0, "reason": None, "message": None,
+            "raw_excerpt": ATA_FULL[:512], "attempts": [],
+            "scan_info": {}})
+    body = ata_client.post("/api/disks/D1/smart/read").json()
+    assert body["ok"] is True
+    parsed = body["parsed"]
+    assert len(parsed["ata_attributes"]) == 15
+    assert parsed["power_cycle_count"] == 4627
+    assert parsed["sata_version"] == "SATA 3.3"

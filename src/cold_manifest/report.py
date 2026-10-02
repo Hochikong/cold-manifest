@@ -458,6 +458,36 @@ def generate_snapshot_report(conn: sqlite3.Connection,
     elif meta.get("smart_status"):
         smart_line = f"SMART：{meta['smart_status']}"
 
+    # SMART 关键指标 + ATA 属性表（catalog 历史行优先，meta 兜底；无数据不渲染）
+    _SMART_METRICS = (
+        ("power_cycle_count", "通电次数", ""),
+        ("start_stop_ct", "启停次数", ""),
+        ("reallocated_ct", "重映射扇区", ""),
+        ("pending_ct", "待定扇区", ""),
+        ("udma_crc_errors", "CRC 错误", ""),
+        ("raw_read_error_rate", "读错误率(raw)", ""),
+        ("temperature_c", "温度", "°C"),
+        ("rotation_rate", "转速", "rpm"),
+    )
+    smart_metrics = []
+    for key, lbl, unit in _SMART_METRICS:
+        v = sm.get(key) if sm else None
+        if v is None:
+            v = meta.get(f"smart_{key}")
+        if v is not None and v != "":
+            smart_metrics.append((lbl, f"{v}{unit}"))
+    ata_attrs = None
+    raw_ata = sm.get("ata_json") if sm else None
+    if not raw_ata:
+        raw_ata = meta.get("smart_ata_json")
+    if raw_ata:
+        try:
+            ata_attrs = json.loads(raw_ata)
+        except (ValueError, TypeError):
+            ata_attrs = None
+    if not isinstance(ata_attrs, list):
+        ata_attrs = []
+
     h: "list[str]" = ["<!DOCTYPE html>", '<html lang="zh-CN">', "<head>",
                       '<meta charset="utf-8">',
                       f"<title>快照报告 { _esc(snapshot_id) }</title>",
@@ -499,6 +529,30 @@ def generate_snapshot_report(conn: sqlite3.Connection,
         h.append(f"<div class='card'><div class='num'>{ov['skipped_total']:,}</div>"
                  f"<div class='lbl'>跳过项</div></div>")
         h.append("</div>")
+
+        # SMART 关键指标 + ATA 属性表（无数据不渲染；自包含无 JS）
+        if smart_metrics:
+            h.append("<h2>SMART 关键指标</h2>")
+            h += _table(["指标", "数值"],
+                        [[lbl, val] for lbl, val in smart_metrics])
+        if ata_attrs:
+            h.append("<h2>SMART 属性表</h2>")
+            shown = ata_attrs[:20]
+
+            def _cell(v: Any) -> str:
+                return "—" if v is None else _esc(v if not isinstance(v, int)
+                                                  else f"{v:,}")
+            rows = [[_cell(a.get("id")), _esc(a.get("name") or "—"),
+                     _cell(a.get("value")), _cell(a.get("worst")),
+                     _cell(a.get("thresh")), _cell(a.get("raw_value")),
+                     _esc(a.get("when_failed") or "—")]
+                    for a in shown if isinstance(a, dict)]
+            h += _table(["ID", "属性", "当前", "最差", "阈值",
+                         "原始值", "状态"], rows)
+            rest = len(ata_attrs) - len(rows)
+            if rest > 0:
+                h.append(f"<p class='muted'>其余 {rest} 项见页面"
+                         f"（GET /api/disks/{{disk_id}}/smart）</p>")
 
     # 扩展名 Top（按字节 / 按数量）
     if _want("extensions"):

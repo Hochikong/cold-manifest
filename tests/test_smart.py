@@ -1206,3 +1206,199 @@ def test_snapshot_report_shows_ssd(tmp_path: Path) -> None:
     assert "剩余寿命 100%" in html
     assert "累计写入" in html and "TB" in html
     conn.close()
+
+
+# ---------------------------------------------------------------- ATA 属性表/关键指标
+
+# 真实 ATA JSON 子集夹具（字段完整、值真实；TOSHIBA MQ04UBB400 USB 桥 -d sat 形态）
+ATA_FULL = json.dumps({
+    "device": {"name": "/dev/sdc", "type": "sat", "protocol": "ATA"},
+    "model_family": "Toshiba MQ04UBB series",
+    "model_name": "TOSHIBA MQ04UBB400",
+    "serial_number": "  Y7BPT04XT  ",
+    "firmware_version": "JU000U",
+    "user_capacity": {"blocks": 7814037168, "bytes": 4000787030016},
+    "rotation_rate": 5400,
+    "form_factor": {"ata_value": 3, "name": "2.5 inches"},
+    "sata_version": {"string": "SATA 3.3", "value": 510},
+    "ata_version": {"string": "ACS-3 (minor revision not indicated)", "value": 1027},
+    "interface_speed": {"max": {"string": "6.0 Gb/s", "unit": "Gb/s"},
+                        "current": {"string": "6.0 Gb/s", "unit": "Gb/s"}},
+    "trim": {"supported": False},
+    "zoned_device": {"name": "not_zoned", "value": 0},
+    "smart_status": {"passed": True},
+    "temperature": {"current": 29},
+    "power_on_time": {"hours": 1189},
+    "ata_smart_attributes": {"table": [
+        {"id": 1, "name": "Raw_Read_Error_Rate", "value": 100, "worst": 100,
+         "thresh": 50, "raw": {"value": 0, "string": "0"},
+         "when_failed": ""},
+        {"id": 3, "name": "Spin_Up_Time", "value": 133, "worst": 126,
+         "thresh": 23, "raw": {"value": 5625, "string": "5625"},
+         "when_failed": ""},
+        {"id": 4, "name": "Start_Stop_Count", "value": 96, "worst": 96,
+         "thresh": 0, "raw": {"value": 4673, "string": "4673"},
+         "when_failed": ""},
+        {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100,
+         "thresh": 50, "raw": {"value": 0, "string": "0"}, "when_failed": ""},
+        {"id": 7, "name": "Seek_Error_Rate", "value": 100, "worst": 100,
+         "thresh": 50, "raw": {"value": 0, "string": "0"}, "when_failed": ""},
+        {"id": 9, "name": "Power_On_Hours", "value": 85, "worst": 85,
+         "thresh": 0, "raw": {"value": 1189, "string": "1189"},
+         "when_failed": ""},
+        {"id": 10, "name": "Spin_Retry_Count", "value": 100, "worst": 100,
+         "thresh": 30, "raw": {"value": 0, "string": "0"}, "when_failed": ""},
+        {"id": 12, "name": "Power_Cycle_Count", "value": 96, "worst": 96,
+         "thresh": 0, "raw": {"value": 4627, "string": "4627"},
+         "when_failed": ""},
+        {"id": 190, "name": "Airflow_Temperature_Cel", "value": 66, "worst": 51,
+         "thresh": 0, "raw": {"value": 34, "string": "34"}, "when_failed": ""},
+        {"id": 192, "name": "Power-Off_Retract_Count", "value": 100, "worst": 100,
+         "thresh": 0, "raw": {"value": 88, "string": "88"}, "when_failed": ""},
+        {"id": 193, "name": "Load_Cycle_Count", "value": 96, "worst": 96,
+         "thresh": 0, "raw": {"value": 4673, "string": "4673"},
+         "when_failed": ""},
+        {"id": 194, "name": "Temperature_Celsius", "value": 34, "worst": 49,
+         "thresh": 0, "raw": {"value": 29, "string": "29"}, "when_failed": ""},
+        {"id": 197, "name": "Current_Pending_Sector", "value": 100, "worst": 100,
+         "thresh": 0, "raw": {"value": 0, "string": "0"}, "when_failed": ""},
+        {"id": 199, "name": "UDMA_CRC_Error_Count", "value": 200, "worst": 200,
+         "thresh": 0, "raw": {"value": 0, "string": "0"}, "when_failed": ""},
+        # 48-bit 多字属性：raw.string 是 smartctl 拼好的完整十进制串
+        {"id": 240, "name": "Head_Flying_Hours", "value": 100, "worst": 100,
+         "thresh": 0, "raw": {"value": 1157774408, "string": "1157774408"},
+         "when_failed": ""},
+    ]},
+})
+
+
+def test_parse_smart_ata_attributes() -> None:
+    p = smart.parse_smart(ATA_FULL)
+    attrs = p["ata_attributes"]
+    assert len(attrs) == 15
+    first = attrs[0]
+    assert first["id"] == 1
+    assert first["name"] == "Raw_Read_Error_Rate"
+    assert first["value"] == 100 and first["worst"] == 100 and first["thresh"] == 50
+    assert first["raw_value"] == 0 and first["raw_string"] == "0"
+    assert first["when_failed"] == ""
+
+
+def test_parse_smart_hdd_metrics_and_identity() -> None:
+    p = smart.parse_smart(ATA_FULL)
+    assert p["power_cycle_count"] == 4627
+    assert p["load_cycle_count"] == 4673
+    assert p["udma_crc_errors"] == 0
+    assert p["raw_read_error_rate"] == 0
+    assert p["seek_error_rate"] == 0
+    assert p["spin_retry_count"] == 0
+    assert p["power_off_retract_count"] == 88
+    assert p["airflow_temperature_c"] == 34
+    assert p["head_flying_hours"] == 1157774408  # 48-bit 多字取 raw.string
+    # 身份/链路细节
+    assert p["interface_speed_current"] == "6.0 Gb/s"
+    assert p["interface_speed_max"] == "6.0 Gb/s"
+    assert p["sata_version"] == "SATA 3.3"
+    assert p["ata_version"].startswith("ACS-3")
+    assert p["trim"] is False
+    assert p["zoned"] == "not_zoned"
+    assert p["model_family"] == "Toshiba MQ04UBB series"
+    assert p["capacity_bytes"] == 4000787030016
+    assert p["rotation_rate"] == 5400
+    assert p["form_factor"] == "2.5 inches"
+    # temperature.current 优先于 attr 194
+    assert p["temperature_c"] == 29
+
+
+def test_parse_smart_temperature_fallback_attr194() -> None:
+    raw = json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 194, "raw": {"value": 33}}]}})
+    assert smart.parse_smart(raw)["temperature_c"] == 33
+
+
+def test_parse_smart_nvme_ata_attributes_empty() -> None:
+    p = smart.parse_smart(NVME_SAMPLE)
+    assert p["ata_attributes"] == []
+    for k in smart.ATA_CONTRACT_KEYS:
+        if k == "trim":
+            assert p[k] is False
+        else:
+            assert p[k] is None
+
+
+def test_parse_smart_ata_bad_raw_never_raises() -> None:
+    p = smart.parse_smart(json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 5, "raw": {"value": "x", "string": "n/a"}},
+        {"id": 12},  # 无 raw
+        "junk",
+    ]}}))
+    attrs = p["ata_attributes"]
+    assert attrs[0]["raw_value"] is None
+    assert attrs[0]["raw_string"] == "n/a"
+    assert attrs[1]["raw_value"] is None
+    assert len(attrs) == 2
+    assert p["power_cycle_count"] is None
+
+
+def test_ata_record_and_list_roundtrip(tmp_path: Path) -> None:
+    cat = connect_catalog(tmp_path / "catalog.db")
+    p = smart.parse_smart(ATA_FULL)
+    smart.record_smart(cat, "D1", "vol/s", p)
+    rows = smart.list_smart(cat, "D1")
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["power_cycle_count"] == 4627
+    assert r["udma_crc_errors"] == 0
+    assert r["sata_version"] == "SATA 3.3"
+    assert r["trim"] == 0  # bool → int
+    assert r["model_family"] == "Toshiba MQ04UBB series"
+    attrs = json.loads(r["ata_json"])
+    assert len(attrs) == 15 and attrs[0]["id"] == 1
+    # 契约视图：历史行 → ata_contract
+    c = smart.ata_contract(r)
+    assert c["power_cycle_count"] == 4627
+    assert len(c["ata_attributes"]) == 15
+    assert c["trim"] is False
+    cat.close()
+
+
+def test_disk_smart_migration_idempotent(tmp_path: Path) -> None:
+    from cold_manifest.db import init_catalog
+
+    cat = sqlite3.connect(tmp_path / "catalog.db")
+    init_catalog(cat)
+    init_catalog(cat)  # 二次幂等
+    cols = {r[1] for r in cat.execute("PRAGMA table_info(disk_smart)")}
+    for name, _decl in smart.ATA_DB_COLUMNS:
+        assert name in cols
+    cat.close()
+
+
+def test_snapshot_report_ata_metrics(tmp_path: Path) -> None:
+    """快照 HTML 报告：SMART 关键指标表 + ATA 属性表（前 20 行 + 截断提示）。"""
+    import io
+
+    from cold_manifest.db import init_snapshot
+    from cold_manifest.report import generate_snapshot_report
+
+    db = tmp_path / "snapshot.db"
+    conn = sqlite3.connect(db)
+    init_snapshot(conn)
+    conn.execute("INSERT INTO meta(key, value) VALUES('status','sealed')")
+    conn.commit()
+    p = smart.parse_smart(ATA_FULL)
+    # 属性 >20 行以验证截断提示：整表复制两份（id 重复仅测试用）
+    sm = dict(p)
+    sm["ata_json"] = json.dumps(
+        p["ata_attributes"] + p["ata_attributes"], ensure_ascii=False)
+    buf = io.StringIO()
+    generate_snapshot_report(conn, buf, snapshot_id="vol/x", smart_row=sm)
+    html = buf.getvalue()
+    assert "SMART 关键指标" in html
+    assert "通电次数" in html and "4627" in html
+    assert "CRC 错误" in html
+    assert "转速" in html and "5400rpm" in html
+    assert "SMART 属性表" in html
+    assert "Raw_Read_Error_Rate" in html
+    assert "其余 10 项见页面" in html
+    conn.close()

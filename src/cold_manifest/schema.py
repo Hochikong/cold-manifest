@@ -172,6 +172,25 @@ CREATE TABLE IF NOT EXISTS disk_smart (
   power_cycles INTEGER,
   controller_busy_minutes INTEGER,
   ssd_json TEXT,                         -- SSD 子字典 JSON 兜底
+  -- ATA 属性表 + 关键 HDD 指标（契约键见 smart.ATA_CONTRACT_KEYS；旧库经
+  -- db._migrate_catalog 幂等补列，HDD 行才有值）
+  ata_json TEXT,                         -- ata_smart_attributes 整表 JSON
+  power_cycle_count INTEGER,             -- attr 12
+  load_cycle_count INTEGER,              -- attr 193
+  udma_crc_errors INTEGER,               -- attr 199
+  raw_read_error_rate INTEGER,           -- attr 1
+  seek_error_rate INTEGER,               -- attr 7
+  spin_retry_count INTEGER,              -- attr 10
+  power_off_retract_count INTEGER,       -- attr 192
+  airflow_temperature_c INTEGER,         -- attr 190
+  head_flying_hours INTEGER,             -- attr 240
+  interface_speed_current TEXT,
+  interface_speed_max TEXT,
+  sata_version TEXT,
+  ata_version TEXT,
+  trim INTEGER,                          -- bool → 0/1
+  zoned TEXT,
+  model_family TEXT,
   PRIMARY KEY (disk_id, snapshot_id)
 );
 """

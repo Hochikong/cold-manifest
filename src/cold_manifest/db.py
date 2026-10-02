@@ -113,6 +113,11 @@ def _migrate_catalog(conn: sqlite3.Connection) -> None:
         ):
             if name not in sm_cols:
                 conn.execute(f"ALTER TABLE disk_smart ADD COLUMN {name} {decl}")
+        # ATA 属性表 + 关键 HDD 指标列（声明统一在 smart.ATA_DB_COLUMNS）
+        from .smart import ATA_DB_COLUMNS
+        for name, decl in ATA_DB_COLUMNS:
+            if name not in sm_cols:
+                conn.execute(f"ALTER TABLE disk_smart ADD COLUMN {name} {decl}")
     conn.commit()
 
 

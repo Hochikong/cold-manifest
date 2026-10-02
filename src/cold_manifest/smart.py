@@ -62,6 +62,66 @@ SSD_CONTRACT_KEYS = (
     "source",                # 'nvme' | 'ata'
 )
 
+# 关键 HDD 指标 + 身份细节的 API 契约键（冻结；缺项 null/false）
+ATA_CONTRACT_KEYS = (
+    # 关键 HDD 指标（ATA 属性 ID 见 _ATA_METRIC_ATTRS）
+    "power_cycle_count",         # attr 12
+    "load_cycle_count",          # attr 193
+    "udma_crc_errors",           # attr 199（接口 CRC 错误）
+    "raw_read_error_rate",       # attr 1
+    "seek_error_rate",           # attr 7
+    "spin_retry_count",          # attr 10
+    "power_off_retract_count",   # attr 192
+    "airflow_temperature_c",     # attr 190
+    "head_flying_hours",         # attr 240
+    # 身份/链路细节
+    "interface_speed_current",   # interface_speed.current.string
+    "interface_speed_max",
+    "sata_version",              # sata_version.string
+    "ata_version",
+    "trim",                      # trim.supported（bool）
+    "zoned",                     # zoned_device（name/dict → str）
+    "model_family",
+    "rotation_rate",             # 转速 rpm（SSD 为 0）
+    "form_factor",               # form_factor.name（如 2.5 inches）
+)
+
+# 关键指标 → ATA 属性 ID（raw 优先 raw.string，可解析整数）
+_ATA_METRIC_ATTRS = {
+    "power_cycle_count": 12,
+    "load_cycle_count": 193,
+    "udma_crc_errors": 199,
+    "raw_read_error_rate": 1,
+    "seek_error_rate": 7,
+    "spin_retry_count": 10,
+    "power_off_retract_count": 192,
+    "airflow_temperature_c": 190,
+    "head_flying_hours": 240,
+}
+
+# disk_smart 新增列（ata_json + 上述扁平键；幂等迁移见 db._migrate_catalog）
+ATA_DB_COLUMNS = (
+    ("ata_json", "TEXT"),
+    ("power_cycle_count", "INTEGER"),
+    ("load_cycle_count", "INTEGER"),
+    ("udma_crc_errors", "INTEGER"),
+    ("raw_read_error_rate", "INTEGER"),
+    ("seek_error_rate", "INTEGER"),
+    ("spin_retry_count", "INTEGER"),
+    ("power_off_retract_count", "INTEGER"),
+    ("airflow_temperature_c", "INTEGER"),
+    ("head_flying_hours", "INTEGER"),
+    ("interface_speed_current", "TEXT"),
+    ("interface_speed_max", "TEXT"),
+    ("sata_version", "TEXT"),
+    ("ata_version", "TEXT"),
+    ("trim", "INTEGER"),
+    ("zoned", "TEXT"),
+    ("model_family", "TEXT"),
+    ("rotation_rate", "INTEGER"),
+    ("form_factor", "TEXT"),
+)
+
 # NVMe data unit = 1000 × 512 字节（smartmontools 对 data_units_* 的定义）
 _NVME_UNIT_BYTES = 1000 * 512
 
@@ -238,6 +298,67 @@ def ssd_contract(ssd: "dict | None") -> dict:
     return out
 
 
+def ata_contract(item: "dict | None") -> dict:
+    """SMART 数据 → ATA 契约字段（冻结键集，缺项 null/[]/false）。
+
+    item 可以是 parse_smart 输出（字段已齐）或 disk_smart 历史行
+    （ata_attributes 存在 ata_json 列、扁平键为列值）。绝不抛异常。
+    """
+    item = item or {}
+    out: dict = {k: None for k in ATA_CONTRACT_KEYS}
+    for k in ATA_CONTRACT_KEYS:
+        v = item.get(k)
+        out[k] = bool(v) if k == "trim" and v is not None else v
+    attrs = item.get("ata_attributes")
+    if attrs is None:
+        raw = item.get("ata_json")
+        if raw:
+            try:
+                attrs = json.loads(raw)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                attrs = None
+    out["ata_attributes"] = attrs if isinstance(attrs, list) else []
+    return out
+
+
+def _parse_ata_attributes(sj: dict) -> list:
+    """ata_smart_attributes.table → 规整列表（每项 id/name/value/worst/thresh/
+    raw_value/raw_string/when_failed）；段缺失（NVMe）→ []。绝不抛异常。
+
+    raw_value：优先 raw.string 里可解析的整数（48-bit 多字时 smartctl 已拼好
+    十进制串），回退 raw.value；都解析不了 → None（raw_string 保留原文）。
+    """
+    try:
+        table = sj.get("ata_smart_attributes")
+        if not isinstance(table, dict):
+            return []
+        out: list = []
+        for e in table.get("table") or []:
+            if not isinstance(e, dict):
+                continue
+            raw = e.get("raw") if isinstance(e.get("raw"), dict) else {}
+            raw_string = raw.get("string")
+            raw_value = _int_or_none(raw_string) if isinstance(raw_string, str) \
+                else None
+            if raw_value is None:
+                raw_value = _int_or_none(raw.get("value"))
+            out.append({
+                "id": _int_or_none(e.get("id")),
+                "name": e.get("name") or None,
+                "value": _int_or_none(e.get("value")),
+                "worst": _int_or_none(e.get("worst")),
+                "thresh": _int_or_none(e.get("thresh")),
+                "raw_value": raw_value,
+                "raw_string": str(raw_string) if raw_string is not None else None,
+                # smartctl 用 "" 表示"从未失败"，保留原文；仅缺失才置 None
+                "when_failed": e.get("when_failed")
+                if isinstance(e.get("when_failed"), str) else None,
+            })
+        return out
+    except Exception:  # noqa: BLE001 — 诊断路径绝不抛
+        return []
+
+
 def parse_smart(raw: "str | None", exit_status: "int | None" = None) -> dict:
     """smartctl JSON 文本 → 结构化字段。坏 JSON/缺失字段不抛异常。
 
@@ -253,6 +374,9 @@ def parse_smart(raw: "str | None", exit_status: "int | None" = None) -> dict:
     out: dict = {k: None for k in SMART_KEYS}
     out["health"] = "unavailable"
     out["ssd"] = {}
+    out["ata_attributes"] = []
+    for k in ATA_CONTRACT_KEYS:
+        out[k] = False if k == "trim" else None
     if not raw or not isinstance(raw, str):
         return out
     try:
@@ -278,7 +402,7 @@ def parse_smart(raw: "str | None", exit_status: "int | None" = None) -> dict:
     try:
         out["temperature_c"] = int((sj.get("temperature") or {}).get("current"))
     except (TypeError, ValueError):
-        out["temperature_c"] = None
+        out["temperature_c"] = _ata_attr_raw_int(sj, 194)
 
     poh = (sj.get("power_on_time") or {}).get("hours") \
         if isinstance(sj.get("power_on_time"), dict) else None
@@ -292,6 +416,29 @@ def parse_smart(raw: "str | None", exit_status: "int | None" = None) -> dict:
     out["pending_ct"] = _lo16(_attr_raw(table, 197))
     out["start_stop_ct"] = _attr_raw(table, 4)
     out["spin_up_ms"] = _lo16(_attr_raw(table, 3))
+
+    # 关键 HDD 指标（raw 优先 raw.string——48-bit 多字时 value 只是低字）
+    for key, attr_id in _ATA_METRIC_ATTRS.items():
+        out[key] = _ata_attr_raw_int(sj, attr_id)
+
+    # 身份/链路细节
+    ispeed = sj.get("interface_speed") if isinstance(
+        sj.get("interface_speed"), dict) else {}
+    out["interface_speed_current"] = (ispeed.get("current") or {}).get("string") \
+        if isinstance(ispeed.get("current"), dict) else None
+    out["interface_speed_max"] = (ispeed.get("max") or {}).get("string") \
+        if isinstance(ispeed.get("max"), dict) else None
+    out["sata_version"] = (sj.get("sata_version") or {}).get("string") \
+        if isinstance(sj.get("sata_version"), dict) else sj.get("sata_version")
+    out["ata_version"] = (sj.get("ata_version") or {}).get("string") \
+        if isinstance(sj.get("ata_version"), dict) else sj.get("ata_version")
+    trim = sj.get("trim")
+    out["trim"] = bool(trim.get("supported")) if isinstance(trim, dict) else False
+    zoned = sj.get("zoned_device")
+    out["zoned"] = (zoned.get("name") or zoned.get("id")) \
+        if isinstance(zoned, dict) else (zoned or None)
+    out["model_family"] = sj.get("model_family") or None
+    out["ata_attributes"] = _parse_ata_attributes(sj)
 
     dev = sj.get("device") if isinstance(sj.get("device"), dict) else {}
     out["device_type"] = dev.get("type") or None
@@ -924,25 +1071,43 @@ def record_smart(conn: sqlite3.Connection, disk_id: str, snapshot_id: str,
     """
     when = collected_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     ssd = parsed.get("ssd") or {}
+    ata_attrs = parsed.get("ata_attributes")
+    values = [disk_id, snapshot_id, when, parsed.get("health") or "unavailable",
+              parsed.get("temperature_c"), parsed.get("power_on_hours"),
+              parsed.get("reallocated_ct"), parsed.get("pending_ct"),
+              parsed.get("start_stop_ct"), parsed.get("spin_up_ms"),
+              parsed.get("device_type"), raw_json,
+              ssd.get("life_left_pct"), ssd.get("percentage_used"),
+              ssd.get("available_spare_pct"), ssd.get("written_bytes"),
+              ssd.get("read_bytes"), ssd.get("media_errors"),
+              ssd.get("unsafe_shutdowns"), ssd.get("power_cycles"),
+              ssd.get("controller_busy_minutes"),
+              json.dumps(ssd, ensure_ascii=False) if ssd else None,
+              json.dumps(ata_attrs, ensure_ascii=False)
+              if isinstance(ata_attrs, list) and ata_attrs else None]
+    trim = parsed.get("trim")
+    values += [parsed.get(k) for k in (
+        "power_cycle_count", "load_cycle_count", "udma_crc_errors",
+        "raw_read_error_rate", "seek_error_rate", "spin_retry_count",
+        "power_off_retract_count", "airflow_temperature_c", "head_flying_hours",
+        "interface_speed_current", "interface_speed_max", "sata_version",
+        "ata_version")]
+    values.append(None if trim is None else int(trim))  # bool → 0/1
+    values += [parsed.get(k) for k in ("zoned", "model_family", "rotation_rate", "form_factor")]
     conn.execute(
         "INSERT OR REPLACE INTO disk_smart(disk_id, snapshot_id, collected_at, health,"
         " temperature_c, power_on_hours, reallocated_ct, pending_ct, start_stop_ct,"
         " spin_up_ms, device_type, raw_json,"
         " life_left_pct, percentage_used, available_spare_pct, written_bytes,"
         " read_bytes, media_errors, unsafe_shutdowns, power_cycles,"
-        " controller_busy_minutes, ssd_json)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (disk_id, snapshot_id, when, parsed.get("health") or "unavailable",
-         parsed.get("temperature_c"), parsed.get("power_on_hours"),
-         parsed.get("reallocated_ct"), parsed.get("pending_ct"),
-         parsed.get("start_stop_ct"), parsed.get("spin_up_ms"),
-         parsed.get("device_type"), raw_json,
-         ssd.get("life_left_pct"), ssd.get("percentage_used"),
-         ssd.get("available_spare_pct"), ssd.get("written_bytes"),
-         ssd.get("read_bytes"), ssd.get("media_errors"),
-         ssd.get("unsafe_shutdowns"), ssd.get("power_cycles"),
-         ssd.get("controller_busy_minutes"),
-         json.dumps(ssd, ensure_ascii=False) if ssd else None),
+        " controller_busy_minutes, ssd_json,"
+        " ata_json, power_cycle_count, load_cycle_count, udma_crc_errors,"
+        " raw_read_error_rate, seek_error_rate, spin_retry_count,"
+        " power_off_retract_count, airflow_temperature_c, head_flying_hours,"
+        " interface_speed_current, interface_speed_max, sata_version, ata_version,"
+        " trim, zoned, model_family, rotation_rate, form_factor)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        values,
     )
 
 

@@ -50,6 +50,12 @@ def _ssd_fields(item: Any) -> dict:
     return smart.ssd_contract(ssd)
 
 
+def _ata_fields(item: Any) -> dict:
+    """SMART 行（catalog 行 / parse_smart 输出 / meta 回填项）→ ATA 契约字段
+    （ata_attributes + 关键 HDD 指标 + 身份细节，缺项 null/[]/false）。"""
+    return smart.ata_contract(item if isinstance(item, dict) else None)
+
+
 def _meta_backfill(state: Any, disk_id: str) -> "list[dict]":
     """读时回填（不写库）：历史表无行但快照库 meta 有 smart_raw_json 的快照，
     现场解析并标 source='meta'。库缺失/解析失败静默跳过。"""
@@ -227,13 +233,19 @@ def disk_detail(disk_id: str, request: Request) -> dict:
     else:
         back = _meta_backfill(state, disk_id)
         latest = back[-1] if back else None
-    # SSD 契约同时挂在顶层与 latest_smart 内层：前端健康卡读的是 latest_smart.ssd
-    # （与 /smart 历史序列每项的形状保持一致），顶层那份保留给其它调用方。
+    # SSD/ATA 契约同时挂在顶层与 latest_smart 内层：前端健康卡读的是
+    # latest_smart.*（与 /smart 历史序列每项的形状保持一致），顶层那份保留
+    # 给其它调用方——两层必须一致（ssd 只挂顶层导致前端读不到的前车之鉴）。
     ssd = _ssd_fields(latest) if latest is not None else None
+    ata = _ata_fields(latest) if latest is not None else {
+        "ata_attributes": [], **{k: (False if k == "trim" else None)
+                                 for k in smart.ATA_CONTRACT_KEYS}}
     if latest is not None:
         latest["ssd"] = ssd
+        latest.update(ata)
     detail["latest_smart"] = latest
     detail["ssd"] = ssd
+    detail.update(ata)
     detail["smart_error"] = _latest_meta_smart_error(state, disk_id)
     return detail
 
@@ -250,9 +262,11 @@ def disk_smart_history(disk_id: str, request: Request) -> dict:
     for r in list_smart_rows(state, disk_id):
         r["source"] = "catalog"
         r["ssd"] = _ssd_fields(r)
+        r.update(_ata_fields(r))
         items.append(r)
     for item in _meta_backfill(state, disk_id):
         item["ssd"] = _ssd_fields(item)
+        item.update(_ata_fields(item))
         items.append(item)
     items.sort(key=lambda x: x.get("collected_at") or "")
     return {"disk_id": disk_id, "items": items, "count": len(items),
