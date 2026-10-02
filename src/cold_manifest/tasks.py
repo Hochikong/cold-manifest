@@ -19,6 +19,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -172,6 +173,25 @@ class TaskRunner:
 
     # ------------------------------------------------------------ 提交 / 查询
 
+    @contextmanager
+    def _read_conn(self):
+        """API 线程专用短连接读。
+
+        工作线程持有 self._conn（check_same_thread=False），sqlite3.Connection
+        本身并非线程安全——API 线程与之并发 execute 会偶发
+        sqlite3.InterfaceError: bad parameter or other API misuse。
+        读路径改为每次调用开独立短连接（WAL 下读不阻塞写、写不阻塞读，
+        catalog 读都很小，连接开销可忽略），与写线程完全解耦；写路径维持
+        记忆 #36 的 _lock 语义不变。runner stop() 后仍可读（catalog.db 在盘）。
+        """
+        conn = sqlite3.connect(str(self.data_root / "catalog.db"), uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            yield conn
+        finally:
+            conn.close()
+
     def submit(self, kind: str, payload: dict, related_id: "str | None" = None) -> str:
         """登记任务（catalog.tasks 插行）并入队，返回 task_id。
 
@@ -230,8 +250,9 @@ class TaskRunner:
         return False
 
     def get_task(self, task_id: str) -> "dict | None":
-        """任务行 → 契约 Task dict；不存在返回 None。可用任意线程调用。"""
-        row = self._conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        """任务行 → 契约 Task dict；不存在返回 None。可用任意线程调用（短连接读）。"""
+        with self._read_conn() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         return _task_row_to_dict(row) if row else None
 
     def list_tasks(self, limit: int, cursor_created_at: "str | None" = None,
@@ -250,11 +271,13 @@ class TaskRunner:
         if cursor_created_at is not None and cursor_id:
             where.append("(created_at < ? OR (created_at = ? AND task_id < ?))")
             params += [cursor_created_at, cursor_created_at, cursor_id]
-        rows = self._conn.execute(
-            f"SELECT * FROM tasks WHERE {' AND '.join(where)}"
-            " ORDER BY created_at DESC, task_id DESC LIMIT ?",
-            [*params, limit + 1],
-        ).fetchall()
+        rows = []
+        with self._read_conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE {' AND '.join(where)}"
+                " ORDER BY created_at DESC, task_id DESC LIMIT ?",
+                [*params, limit + 1],
+            ).fetchall()
         has_more = len(rows) > limit
         rows = rows[:limit]
         next_cursor = None
@@ -276,7 +299,9 @@ class TaskRunner:
         if kind is not None:
             sql += " AND kind=?"
             params.append(kind)
-        for r in self._conn.execute(sql, params).fetchall():
+        with self._read_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        for r in rows:
             try:
                 if json.loads(r["payload_json"]).get(field) == key:
                     return True
@@ -301,11 +326,12 @@ class TaskRunner:
             self._conn.commit()
 
     def batch_child_statuses(self, batch_id: str) -> "list[str]":
-        """批次全部子任务状态（按 created_at, task_id 稳定序）。"""
-        rows = self._conn.execute(
-            "SELECT status FROM tasks WHERE related_id=? ORDER BY created_at, task_id",
-            (batch_id,),
-        ).fetchall()
+        """批次全部子任务状态（按 created_at, task_id 稳定序；短连接读）。"""
+        with self._read_conn() as conn:
+            rows = conn.execute(
+                "SELECT status FROM tasks WHERE related_id=? ORDER BY created_at, task_id",
+                (batch_id,),
+            ).fetchall()
         return [r["status"] for r in rows]
 
     def delete_batch_and_tasks(self, batch_id: str) -> bool:
@@ -364,8 +390,9 @@ class TaskRunner:
 
     def get_batch(self, batch_id: str) -> "dict | None":
         """批次 + 子任务摘要；不存在返回 None。终态回写 batches.status。"""
-        row = self._conn.execute(
-            "SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
+        with self._read_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM batches WHERE batch_id=?", (batch_id,)).fetchone()
         if row is None:
             return None
         try:
@@ -384,12 +411,15 @@ class TaskRunner:
         summary = {s: statuses.count(s) for s in
                    ("pending", "running", "done", "error", "cancelled") if s in statuses}
         if status in ("done", "partial") and row["status"] not in ("done", "partial"):
-            with self._lock:
-                self._conn.execute(
-                    "UPDATE batches SET status=?, finished_at=? WHERE batch_id=?",
-                    (status, _now(), batch_id),
-                )
-                self._conn.commit()
+            if self._conn is None:  # runner 已 stop：无写连接，跳过回写（读仍正常）
+                _log.debug("批次终态回写跳过（runner 已停止）：%s", batch_id)
+            else:
+                with self._lock:
+                    self._conn.execute(
+                        "UPDATE batches SET status=?, finished_at=? WHERE batch_id=?",
+                        (status, _now(), batch_id),
+                    )
+                    self._conn.commit()
         return {
             "batch_id": batch_id,
             "disk_id": row["disk_id"],
@@ -411,14 +441,17 @@ class TaskRunner:
         工作线程随后落终态 cancelled）。
         KeyError=任务不存在；ValueError=已终态（不可取消）。
         """
-        row = self._conn.execute(
-            "SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        with self._read_conn() as conn:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if row is None:
             raise KeyError(task_id)
         status = row["status"]
         if status in _TERMINAL_STATUSES:
             raise ValueError(f"任务已终态，不可取消：{status}")
         if status == "pending":
+            if self._conn is None:  # runner 已 stop：无写连接
+                raise RuntimeError("任务执行器已停止，无法取消")
             with self._lock:
                 self._conn.execute(
                     "UPDATE tasks SET status='cancelled', finished_at=?, error='任务取消（未执行）'"
