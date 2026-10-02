@@ -49,6 +49,8 @@ import {
   readDiskSmartNow,
   collectPreflight,
   deleteSnapshot,
+  deleteDisk,
+  deleteVolume,
   type ListEntriesParams,
   type SearchParams,
   type GlobalSearchParams,
@@ -255,6 +257,34 @@ export function useDeleteSnapshot() {
       qc.invalidateQueries({ queryKey: ['volume-trends'] })
       qc.invalidateQueries({ queryKey: ['disk'] })
       qc.invalidateQueries({ queryKey: ['volume-detail'] })
+    },
+  })
+}
+
+/** 删除磁盘登记记录（不做级联）；成功后磁盘/卷/快照相关缓存一致刷新。 */
+export function useDeleteDisk() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (disk_id: string) => deleteDisk(disk_id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['disks'] })
+      qc.invalidateQueries({ queryKey: ['disk'] })
+      qc.invalidateQueries({ queryKey: ['volumes'] })
+      qc.invalidateQueries({ queryKey: ['volume-detail'] })
+    },
+  })
+}
+
+/** 删除卷登记记录（不做级联）；成功后卷/磁盘相关缓存一致刷新。 */
+export function useDeleteVolume() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (volume_id: string) => deleteVolume(volume_id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['volumes'] })
+      qc.invalidateQueries({ queryKey: ['volume-detail'] })
+      qc.invalidateQueries({ queryKey: ['disks'] })
+      qc.invalidateQueries({ queryKey: ['disk'] })
     },
   })
 }

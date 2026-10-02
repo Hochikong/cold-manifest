@@ -1,11 +1,12 @@
-import { App, Card, Typography, Empty, Spin, Tag } from 'antd'
-import { CheckCircleOutlined, ExclamationCircleOutlined } from '@ant-design/icons'
+import { App, Button, Card, Typography, Empty, Spin, Tag } from 'antd'
+import { CheckCircleOutlined, DeleteOutlined, ExclamationCircleOutlined } from '@ant-design/icons'
 import { useDisks, useSetDiskNickname } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
 import NicknameEditor from '../components/NicknameEditor'
 import DiskDetailPanel from '../components/DiskDetailPanel'
 import ResizableTable from '../components/ResizableTable'
+import { useDeleteRegistry } from '../hooks/useDeleteRegistry'
 import { formatFileSize, formatNumber, truncateMiddle } from '../utils/format'
 import { apiErrorDetail, type Disk } from '../api/client'
 
@@ -15,6 +16,7 @@ export default function DisksPage() {
   const { message } = App.useApp()
   const { data, isLoading, error } = useDisks()
   const setNickname = useSetDiskNickname()
+  const { confirmDelete, modalNode } = useDeleteRegistry()
 
   const saveNickname = async (disk_id: string, nickname: string) => {
     try {
@@ -93,14 +95,36 @@ export default function DisksPage() {
     },
     { title: '卷数', dataIndex: 'volume_count', key: 'volume_count', width: 70, align: 'right' as const, render: (v: number) => formatNumber(v) },
     { title: '快照数', dataIndex: 'snapshot_count', key: 'snapshot_count', width: 80, align: 'right' as const, render: (v: number) => formatNumber(v) },
+    {
+      title: '操作',
+      key: 'action',
+      width: 70,
+      render: (_: unknown, record: Disk) => (
+        <Button
+          type="link"
+          danger
+          size="small"
+          icon={<DeleteOutlined />}
+          style={{ padding: 0 }}
+          onClick={(e) => {
+            e.stopPropagation()
+            confirmDelete({ kind: 'disk', id: record.disk_id, label: record.nickname || record.disk_id })
+          }}
+        >
+          删除
+        </Button>
+      ),
+    },
   ]
 
   return (
-    <div>
+    <div style={{ minWidth: 0 }}>
       <Title level={4} style={{ marginTop: 0 }}>磁盘与卷</Title>
+      {modalNode}
       {error && <ErrorAlert error={error} />}
       {isLoading && <Spin style={{ display: 'block', margin: '32px auto' }} />}
-      <Card>
+      {/* minWidth/overflow 保证 max-content 宽的表格只在卡片容器内横向滚动，不撑宽整页 */}
+      <Card style={{ minWidth: 0, overflow: 'hidden' }}>
         {data?.items.length ? (
           <ResizableTable
             tableId="disks"

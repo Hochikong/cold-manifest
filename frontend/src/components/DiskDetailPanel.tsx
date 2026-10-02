@@ -1,8 +1,9 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Alert, App, Button, Card, Collapse, Descriptions, Empty, Row, Col, Skeleton, Space, Table, Tag, Tooltip, Typography } from 'antd'
-import { CheckCircleOutlined, ExclamationCircleOutlined, MedicineBoxOutlined, ThunderboltOutlined } from '@ant-design/icons'
+import { CheckCircleOutlined, DeleteOutlined, ExclamationCircleOutlined, MedicineBoxOutlined, ThunderboltOutlined } from '@ant-design/icons'
 import { useDisk, useDiskSmartRead, useSetDiskNickname } from '../api/hooks'
+import { useDeleteRegistry } from '../hooks/useDeleteRegistry'
 import ErrorAlert from './ErrorAlert'
 import NicknameEditor from './NicknameEditor'
 import SmartTrendsChart from './SmartTrendsChart'
@@ -21,6 +22,7 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
   const navigate = useNavigate()
   const { data: disk, isLoading, error } = useDisk(disk_id)
   const smartRead = useDiskSmartRead()
+  const { confirmDelete, modalNode } = useDeleteRegistry()
   const [readResult, setReadResult] = useState<SmartReadResult | null>(null)
   const [readError, setReadError] = useState<string | null>(null)
 
@@ -53,12 +55,24 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
   const liveLabel = readResult?.ok ? '现场读取 · smartctl' : null
 
   return (
-    <Space orientation="vertical" style={{ width: '100%' }} size="middle">
+    // contain: inline-size 把面板的内在宽度与内容解耦：趋势图 canvas 的显式像素宽
+    // 不再参与外层表格 max-content 计算（否则图表↔表格互相撑大，整页出横向滚动）。
+    <Space orientation="vertical" style={{ width: '100%', minWidth: 0, contain: 'inline-size' }} size="middle">
+      {modalNode}
+      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+        <Button
+          danger
+          icon={<DeleteOutlined />}
+          onClick={() => confirmDelete({ kind: 'disk', id: disk.disk_id, label: disk.nickname || disk.disk_id })}
+        >
+          删除该磁盘
+        </Button>
+      </div>
       <Row gutter={[16, 16]}>
-        <Col xs={24} lg={12}>
+        <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
           <IdentityCard disk={disk} liveParsed={liveParsed} liveLabel={liveLabel} />
         </Col>
-        <Col xs={24} lg={12}>
+        <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
           <HealthCard
             disk={disk}
             readResult={readResult}
@@ -72,10 +86,10 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
       <SmartTrendsChart disk_id={disk_id} />
 
       <Row gutter={[16, 16]}>
-        <Col xs={24} lg={12}>
+        <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
           <VolumesCard volumes={disk.volumes} />
         </Col>
-        <Col xs={24} lg={12}>
+        <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
           <SnapshotsCard snapshots={disk.snapshots} onSelect={(id) => navigate(`/snapshots?snapshot=${encodeURIComponent(id)}&tab=overview`)} />
         </Col>
       </Row>
@@ -128,7 +142,8 @@ function IdentityCard({ disk, liveParsed, liveLabel }: { disk: DiskDetail; liveP
   const capacitySource = smartIdentity?.capacity_bytes != null ? smartSource : capacity != null ? '系统探测' : null
 
   return (
-    <Card title="身份与容量" size="small">
+    // minWidth 0 + overflow hidden：长串值（磁盘 ID / 序列号）在卡内断行，不撑破栅格列
+    <Card title="身份与容量" size="small" style={{ width: '100%', minWidth: 0, overflow: 'hidden' }}>
       {identityHidden && (
         <Alert
           style={{ marginBottom: 12 }}
@@ -138,7 +153,12 @@ function IdentityCard({ disk, liveParsed, liveLabel }: { disk: DiskDetail; liveP
           description="USB 桥接盘常把 ATA IDENT 隔断。把盘接好（必要时换直连 SATA）后点右侧「现在读取 SMART」可尝试读取真盘身份。"
         />
       )}
-      <Descriptions size="small" column={1} bordered>
+      <Descriptions
+        size="small"
+        column={1}
+        bordered
+        styles={{ label: { width: 120 }, content: { wordBreak: 'break-all' } }}
+      >
         <Descriptions.Item label="昵称">
           <NicknameEditor value={disk.nickname} onSave={saveNickname} />
         </Descriptions.Item>
@@ -265,6 +285,7 @@ function HealthCard({
         </Space>
       }
       size="small"
+      style={{ width: '100%', minWidth: 0, overflow: 'hidden' }}
       extra={
         <Tooltip title="对当前插着的盘现场读一次 SMART（不写入快照 / 历史）">
           <Button size="small" icon={<ThunderboltOutlined />} loading={reading} onClick={onReadNow}>
@@ -395,6 +416,7 @@ function VolumesCard({ volumes }: { volumes: DiskVolume[] }) {
     <Card
       title="卷列表"
       size="small"
+      style={{ width: '100%', minWidth: 0, overflow: 'hidden' }}
       extra={volumes.length > 0 ? <Typography.Text type="secondary" style={{ fontSize: 12 }}>点击行查看卷详情</Typography.Text> : undefined}
     >
       {volumes.length === 0 ? (
@@ -438,7 +460,7 @@ function VolumesCard({ volumes }: { volumes: DiskVolume[] }) {
 
 function SnapshotsCard({ snapshots, onSelect }: { snapshots: DiskSnapshot[]; onSelect: (id: string) => void }) {
   return (
-    <Card title="快照时间线" size="small">
+    <Card title="快照时间线" size="small" style={{ width: '100%', minWidth: 0, overflow: 'hidden' }}>
       {snapshots.length === 0 ? (
         <Empty description="该盘还没有快照" />
       ) : (

@@ -2,7 +2,9 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { App, Button, Descriptions, Drawer, Empty, Space, Spin, Tabs, Tag, Typography } from 'antd'
 import type { TableProps } from 'antd'
+import { DeleteOutlined } from '@ant-design/icons'
 import { useSetVolumeNickname, useVolumeDetail } from '../api/hooks'
+import { useDeleteRegistry } from '../hooks/useDeleteRegistry'
 import { apiErrorDetail, type VolumeDetailSnapshot } from '../api/client'
 import ErrorAlert from './ErrorAlert'
 import NicknameEditor from './NicknameEditor'
@@ -29,6 +31,7 @@ export default function VolumeDetailDrawer({ volumeId, onClose }: VolumeDetailDr
   const [tab, setTab] = useState('identity')
   const { data: vol, isLoading, error } = useVolumeDetail(volumeId ?? undefined)
   const setNickname = useSetVolumeNickname()
+  const { confirmDelete, modalNode } = useDeleteRegistry()
 
   const saveNickname = async (nickname: string) => {
     if (!vol) return
@@ -82,7 +85,31 @@ export default function VolumeDetailDrawer({ volumeId, onClose }: VolumeDetailDr
   ]
 
   return (
-    <Drawer title={volumeId ? `卷详情：${vol?.nickname || volumeId}` : '卷详情'} size={680} open={!!volumeId} onClose={close}>
+    <Drawer
+      title={volumeId ? `卷详情：${vol?.nickname || volumeId}` : '卷详情'}
+      size={680}
+      open={!!volumeId}
+      onClose={close}
+      footer={
+        vol && (
+          <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <Button
+              danger
+              icon={<DeleteOutlined />}
+              onClick={() =>
+                confirmDelete(
+                  { kind: 'volume', id: vol.volume_id, label: vol.nickname || vol.volume_id },
+                  close,
+                )
+              }
+            >
+              删除该卷
+            </Button>
+          </div>
+        )
+      }
+    >
+      {modalNode}
       {error && <ErrorAlert error={error} />}
       {isLoading && <Spin style={{ display: 'block', margin: '32px auto' }} />}
       {vol && (
@@ -94,7 +121,12 @@ export default function VolumeDetailDrawer({ volumeId, onClose }: VolumeDetailDr
               key: 'identity',
               label: '身份',
               children: (
-                <Descriptions size="small" column={1} bordered>
+                <Descriptions
+                  size="small"
+                  column={1}
+                  bordered
+                  styles={{ label: { width: 110 }, content: { wordBreak: 'break-all' } }}
+                >
                   <Descriptions.Item label="昵称">
                     <NicknameEditor value={vol.nickname} onSave={saveNickname} />
                   </Descriptions.Item>

@@ -589,6 +589,31 @@ export async function deleteSnapshot(
   return data
 }
 
+/** 删除磁盘 / 卷的登记记录（不做级联：其下仍有快照时后端返回 409）。 */
+export interface DeleteRegistryResponse {
+  disk_id?: string
+  volume_id?: string
+  deleted_volumes?: number
+  deleted_snapshots: number
+}
+
+/** 409 响应体形如 {"detail": {message, snapshots, diffs}}；detail 为嵌套对象。 */
+export interface DeleteRegistryBlocked {
+  message: string
+  snapshots: string[]
+  diffs: string[]
+}
+
+export async function deleteDisk(disk_id: string): Promise<DeleteRegistryResponse> {
+  const { data } = await client.delete(`/disks/${encodeURIComponent(disk_id)}`)
+  return data
+}
+
+export async function deleteVolume(volume_id: string): Promise<DeleteRegistryResponse> {
+  const { data } = await client.delete(`/volumes/${encodeURIComponent(volume_id)}`)
+  return data
+}
+
 export interface VolumeTrendItem {
   snapshot_id: string
   collect_time: string
