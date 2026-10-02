@@ -68,3 +68,15 @@ export function truncateMiddle(value: string | null | undefined, max = 24): stri
   const tail = Math.floor((max - 1) / 2)
   return `${s.slice(0, head)}…${s.slice(s.length - tail)}`
 }
+
+/**
+ * 中间省略：保留开头 head 字符与结尾 tail 字符。
+ * 磁盘/快照 ID 的尾部携带分区与时间信息（如 `_P2/20261002T074406Z`），优先保留尾部，
+ * 所以 head/tail 分别指定而不是像 truncateMiddle 那样对半分。
+ */
+export function middleEllipsis(value: string | null | undefined, head = 10, tail = 16): string {
+  if (value == null) return '-'
+  const s = String(value)
+  if (s.length <= head + tail + 1) return s
+  return `${s.slice(0, head)}…${s.slice(s.length - tail)}`
+}

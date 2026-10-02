@@ -10,7 +10,7 @@ import SmartTrendsChart from './SmartTrendsChart'
 import VolumeTrendsChart from './VolumeTrendsChart'
 import VolumeDetailDrawer from './VolumeDetailDrawer'
 import { apiErrorDetail, parseSmartIdentity, type AtaAttribute, type AtaExtras, type DiskDetail, type DiskVolume, type DiskSnapshot, type ParsedSmart, type SmartReadResult, type SsdMetrics } from '../api/client'
-import { formatDateTime, formatFileSize, formatNumber } from '../utils/format'
+import { formatDateTime, formatFileSize, formatNumber, middleEllipsis } from '../utils/format'
 
 const { Text } = Typography
 
@@ -136,12 +136,13 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
       <SmartTrendsChart disk_id={disk_id} />
 
       {/* 卷列表 / 快照时间线：<1200（xl）堆叠成整行，避免两张表并排挤成窄列；
-          宽屏并排时表格内部保留各自的横向滚动（scroll.x），不撑破面板。 */}
-      <Row gutter={[16, 16]}>
-        <Col xs={24} xl={12} style={{ minWidth: 0, display: 'flex' }}>
+          align="top" + 列不用 flex 拉伸：两卡各按内容高度，内容少的一侧不留大片空白；
+          宽屏并排时表格自适应卡宽（无 scroll.x），不撑破面板。 */}
+      <Row gutter={[16, 16]} align="top">
+        <Col xs={24} xl={12} style={{ minWidth: 0 }}>
           <VolumesCard volumes={disk.volumes} />
         </Col>
-        <Col xs={24} xl={12} style={{ minWidth: 0, display: 'flex' }}>
+        <Col xs={24} xl={12} style={{ minWidth: 0 }}>
           <SnapshotsCard snapshots={disk.snapshots} onSelect={(id) => navigate(`/snapshots?snapshot=${encodeURIComponent(id)}&tab=overview`)} />
         </Col>
       </Row>
@@ -757,17 +758,16 @@ function VolumesCard({ volumes }: { volumes: DiskVolume[] }) {
             size="small"
             tableLayout="fixed"
             pagination={false}
-            scroll={{ x: 480 }}
             columns={[
               {
                 title: '卷 ID',
                 dataIndex: 'volume_id',
-                width: 150,
                 ellipsis: true,
                 render: (v: string) => (
                   <Tooltip title={v} placement="topLeft" mouseEnterDelay={0.3}>
                     <Button type="link" style={{ padding: 0, maxWidth: '100%' }} onClick={() => setSelectedVolumeId(v)}>
-                      <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{v}</span>
+                      {/* 中间省略：尾部保留分区/时间特征，Tooltip 给完整 ID */}
+                      <span style={{ whiteSpace: 'nowrap' }}>{middleEllipsis(v, 10, 14)}</span>
                     </Button>
                   </Tooltip>
                 ),
@@ -800,16 +800,16 @@ function SnapshotsCard({ snapshots, onSelect }: { snapshots: DiskSnapshot[]; onS
           size="small"
           tableLayout="fixed"
           pagination={{ pageSize: 5, hideOnSinglePage: true }}
-          scroll={{ x: 560 }}
           columns={[
             {
               title: '快照 ID',
               dataIndex: 'snapshot_id',
               ellipsis: true,
-              width: 170,
+              // 不设固定宽度：自适应占满剩余空间（fixed 布局下其余列吃固定宽度，这里不会被挤掉首字符）
               render: (v: string) => (
                 <Tooltip title={v} placement="topLeft" mouseEnterDelay={0.3}>
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{v}</span>
+                  {/* 中间省略：尾部 `_P2/时间戳` 区分分区与采集时间，优先保留 */}
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{middleEllipsis(v, 10, 20)}</span>
                 </Tooltip>
               ),
             },
@@ -821,7 +821,7 @@ function SnapshotsCard({ snapshots, onSelect }: { snapshots: DiskSnapshot[]; onS
               key: 'action',
               width: 80, // 固定宽度不压缩：「查看」链接需要完整展示
               render: (_: unknown, record: DiskSnapshot) => (
-                <Button type="link" style={{ padding: 0 }} onClick={() => onSelect(record.snapshot_id)}>
+                <Button type="link" style={{ padding: 0, whiteSpace: 'nowrap' }} onClick={() => onSelect(record.snapshot_id)}>
                   查看
                 </Button>
               ),
