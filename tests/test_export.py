@@ -1,6 +1,7 @@
 """export 命令测试：csv 全字段导出 + v1_csv 三件套 + 回灌往返自检。"""
 
 import csv
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -11,7 +12,9 @@ from cold_manifest.cli import main as cli_main
 from cold_manifest.import_legacy import import_snapshot
 
 REPO = Path(__file__).resolve().parent.parent
-LEGACY_SRC = REPO / "Legacy" / "backupStatus260505"
+# v1 源码与样本已在 2026-10-02 从仓库清理（用户决定全面改用 v2）。
+# 如需重跑 v1 对照测试，把 CLDM_LEGACY_SAMPLES 指向任意含 backuptools/ 的 v1 目录即可。
+LEGACY_SRC = REPO / os.environ.get("CLDM_LEGACY_SAMPLES", "Legacy/backupStatus260505")
 
 
 def _make_legacy_dir(root: Path) -> Path:

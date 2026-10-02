@@ -199,8 +199,11 @@ def test_reject_invalid_volume_id(tmp_path: Path) -> None:
             import_snapshot(snap, tmp_path / "d", volume_id=bad)
 
 
-SMALL = Path("Legacy/backupStatus260505/TOSHIBA_HDWD120_X0DG6A2GS_P0")
-BIG = Path("Legacy/backupStatus260505/TOSHIBA_HDWD120_X0FGBM2AS_P0")
+# v1 样本已在 2026-10-02 从仓库清理（用户决定全面改用 v2）；如需重跑真实样本回归，
+# 把 CLDM_LEGACY_SAMPLES 指向包含这两个样本目录的 v1 输出目录。
+LEGACY_ROOT = Path(os.environ.get("CLDM_LEGACY_SAMPLES", "Legacy/backupStatus260505"))
+SMALL = LEGACY_ROOT / "TOSHIBA_HDWD120_X0DG6A2GS_P0"
+BIG = LEGACY_ROOT / "TOSHIBA_HDWD120_X0FGBM2AS_P0"
 
 
 @pytest.mark.skipif(not SMALL.is_dir(), reason="样本 A 目录不存在")

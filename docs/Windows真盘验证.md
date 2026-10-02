@@ -1,5 +1,8 @@
 # Windows 真盘验证报告
 
+> **历史说明（2026-10-02）**：文中用到的 v1 源码与样本（`Legacy/backupStatus260505/…`）已按用户决定从仓库清理（全面改用 v2）。
+> 下面的命令与输出保留作当时验证过程的记录；如需重跑 v1 对照，请自行准备 v1 目录。
+
 本文记录 cold-manifest v2（cldm）在 Windows 真盘上对照 legacy v1（backuptools）的两轮验证：
 
 - **第一部分：F:（KIOXIA USB 盘）** — 流程验证（小盘，验证采集/副本/探测全链路）
