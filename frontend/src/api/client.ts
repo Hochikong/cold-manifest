@@ -349,6 +349,44 @@ export async function listVolumes(): Promise<VolumesResponse> {
   return data
 }
 
+/** ATA/SATA SMART 属性表单行（契约冻结；NVMe 盘 ata_attributes 为 []）。 */
+export interface AtaAttribute {
+  id: number
+  name: string
+  value: number
+  worst: number
+  thresh: number
+  raw_value: string
+  raw_string: string | null
+  when_failed: string | null
+}
+
+/**
+ * ATA 机械盘扩展指标 / 身份与链路信息（契约冻结）。
+ * 后端缺项 → null；前端缺项显示 —，绝不渲染 "null"。
+ */
+export interface AtaExtras {
+  ata_attributes?: AtaAttribute[] | null
+  power_cycle_count?: number | null
+  load_cycle_count?: number | null
+  udma_crc_errors?: number | null
+  raw_read_error_rate?: number | null
+  seek_error_rate?: number | null
+  spin_retry_count?: number | null
+  power_off_retract_count?: number | null
+  airflow_temperature_c?: number | null
+  head_flying_hours?: number | null
+  interface_speed_current?: string | null
+  interface_speed_max?: string | null
+  sata_version?: string | null
+  ata_version?: string | null
+  trim?: boolean | null
+  zoned?: string | null
+  model_family?: string | null
+  rotation_rate?: number | null
+  form_factor?: string | null
+}
+
 export interface LatestSmart {
   health: string
   temperature_c: number | null
@@ -458,7 +496,7 @@ export async function patchVolumeNickname(volume_id: string, nickname: string): 
   return data
 }
 
-export interface SmartItem {
+export interface SmartItem extends AtaExtras {
   disk_id: string
   snapshot_id: string
   collected_at: string
@@ -494,7 +532,7 @@ export interface SmartErrorInfo {
 }
 
 /** 盘详情返回的 latest_smart：disk_smart 全行 + source（catalog=历史表，meta=老快照 meta 现场解析）。 */
-export interface LatestSmartFull extends LatestSmart {
+export interface LatestSmartFull extends LatestSmart, AtaExtras {
   start_stop_ct: number | null
   spin_up_ms: number | null
   device_type: string | null
@@ -529,7 +567,7 @@ export interface SmartScanInfo {
 }
 
 /** parse_smart 输出（含真盘身份字段 model/serial/firmware）。 */
-export interface ParsedSmart {
+export interface ParsedSmart extends AtaExtras {
   health: string
   temperature_c: number | null
   power_on_hours: number | null

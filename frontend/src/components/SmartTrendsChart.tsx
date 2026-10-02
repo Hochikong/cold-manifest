@@ -11,7 +11,7 @@ const { Text } = Typography
 
 const EMPTY_ARRAY: never[] = []
 
-type MetricKey = 'temperature_c' | 'power_on_hours' | 'life_left_pct' | 'written_tb'
+type MetricKey = 'temperature_c' | 'power_on_hours' | 'life_left_pct' | 'written_tb' | 'reallocated_ct' | 'udma_crc_errors'
 
 /** 单个历史点的指标取值：字段缺失 → null（该点跳过）。 */
 type ValueFn = (item: SmartItem) => number | null
@@ -80,6 +80,22 @@ const METRICS: Record<MetricKey, MetricConfig> = {
     color: '#722ed1',
     areaColor: 'rgba(114, 46, 209, 0.25)',
   },
+  reallocated_ct: {
+    label: '重分配扇区',
+    unit: '',
+    format: formatNumber,
+    value: (i) => i.reallocated_ct,
+    color: '#f5222d',
+    areaColor: 'rgba(245, 34, 45, 0.25)',
+  },
+  udma_crc_errors: {
+    label: 'UDMA CRC',
+    unit: '',
+    format: formatNumber,
+    value: (i) => i.udma_crc_errors ?? null,
+    color: '#faad14',
+    areaColor: 'rgba(250, 173, 20, 0.25)',
+  },
 }
 
 interface SmartTrendsChartProps {
@@ -91,6 +107,10 @@ export default function SmartTrendsChart({ disk_id }: SmartTrendsChartProps) {
   const { data, isLoading, error } = useDiskSmartHistory(disk_id)
 
   const items = data?.items ?? EMPTY_ARRAY
+
+  // ATA 机械盘专属指标：历史里出现至少一个有效值才给选项（NVMe 盘两项恒空 → 不显示）
+  const hasReallocHistory = items.some((i) => i.reallocated_ct != null)
+  const hasCrcHistory = items.some((i) => i.udma_crc_errors != null)
 
   const chartOption = useMemo<EChartsOption | null>(() => {
     const cfg = METRICS[metric]
@@ -185,6 +205,8 @@ export default function SmartTrendsChart({ disk_id }: SmartTrendsChartProps) {
             { label: '通电小时', value: 'power_on_hours' },
             { label: '寿命剩余 %', value: 'life_left_pct' },
             { label: '累计写入量', value: 'written_tb' },
+            ...(hasReallocHistory ? [{ label: '重分配扇区', value: 'reallocated_ct' } as const] : []),
+            ...(hasCrcHistory ? [{ label: 'UDMA CRC', value: 'udma_crc_errors' } as const] : []),
           ]}
         />
       }

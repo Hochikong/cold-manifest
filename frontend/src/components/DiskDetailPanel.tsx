@@ -9,7 +9,7 @@ import NicknameEditor from './NicknameEditor'
 import SmartTrendsChart from './SmartTrendsChart'
 import VolumeTrendsChart from './VolumeTrendsChart'
 import VolumeDetailDrawer from './VolumeDetailDrawer'
-import { apiErrorDetail, parseSmartIdentity, type DiskDetail, type DiskVolume, type DiskSnapshot, type ParsedSmart, type SmartReadResult, type SsdMetrics } from '../api/client'
+import { apiErrorDetail, parseSmartIdentity, type AtaAttribute, type AtaExtras, type DiskDetail, type DiskVolume, type DiskSnapshot, type ParsedSmart, type SmartReadResult, type SsdMetrics } from '../api/client'
 import { formatDateTime, formatFileSize, formatNumber } from '../utils/format'
 
 const { Text } = Typography
@@ -93,8 +93,11 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
   const liveParsed = readResult?.ok ? readResult.parsed : null
   const liveLabel = readResult?.ok ? '现场读取 · smartctl' : null
 
-  // SSD 指标：优先现场读取，其次最近一次采集；都没有 → null（区块显示占位文案）
-  const ssd = liveParsed?.ssd ?? disk.latest_smart?.ssd ?? null
+  // SSD 指标：优先现场读取，其次最近一次采集；机械盘（rotation_rate>0）即使后端给了空 ssd 对象也不当 SSD 展示；
+  // 都没有 → null（区块显示占位文案）
+  const ata: AtaExtras | null = liveParsed ?? disk.latest_smart
+  const isHddByRotation = ata?.rotation_rate != null && ata.rotation_rate > 0
+  const ssd = isHddByRotation ? null : (liveParsed?.ssd ?? disk.latest_smart?.ssd ?? null)
 
   return (
     <PanelWidthGate>
@@ -113,7 +116,7 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
       </div>
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
-          <IdentityCard disk={disk} liveParsed={liveParsed} liveLabel={liveLabel} mediaBadge={inferMediaBadge(disk, ssd)} />
+          <IdentityCard disk={disk} liveParsed={liveParsed} liveLabel={liveLabel} mediaBadge={inferMediaBadge(disk, ssd)} ata={ata} />
         </Col>
         <Col xs={24} lg={12} style={{ minWidth: 0, display: 'flex' }}>
           <HealthCard
@@ -126,6 +129,9 @@ export default function DiskDetailPanel({ disk_id }: DiskDetailPanelProps) {
           />
         </Col>
       </Row>
+
+      {/* ATA SMART 属性表：NVMe 盘 / 旧数据为空 → 不渲染 */}
+      <AtaAttributesCard attrs={ata?.ata_attributes ?? null} />
 
       <SmartTrendsChart disk_id={disk_id} />
 
@@ -153,6 +159,11 @@ function inferMediaBadge(
   disk: DiskDetail,
   ssd: SsdMetrics | null,
 ): { label: string; color: string } | null {
+  // 机械盘（转速 >0）优先：后端给过空 ssd 对象时曾把 5400rpm 机械盘误标成「固态 · SATA」
+  const rot = disk.latest_smart?.rotation_rate
+  if (rot != null && rot > 0) {
+    return { label: '机械', color: 'default' }
+  }
   if (ssd) {
     return ssd.source === 'nvme'
       ? { label: '固态 · NVMe', color: 'purple' }
@@ -179,7 +190,7 @@ function SourceTag({ text }: { text: string }) {
   )
 }
 
-function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge }: { disk: DiskDetail; liveParsed: ParsedSmart | null; liveLabel: string | null; mediaBadge: { label: string; color: string } | null }) {
+function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge, ata }: { disk: DiskDetail; liveParsed: ParsedSmart | null; liveLabel: string | null; mediaBadge: { label: string; color: string } | null; ata: AtaExtras | null }) {
   const { message } = App.useApp()
   const setNickname = useSetDiskNickname()
 
@@ -259,7 +270,207 @@ function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge }: { disk: DiskD
         <Descriptions.Item label="首次发现">{formatDateTime(disk.first_seen)}</Descriptions.Item>
         <Descriptions.Item label="最近发现">{formatDateTime(disk.last_seen)}</Descriptions.Item>
       </Descriptions>
+      <AtaTechInfo ata={ata} />
     </Card>
+  )
+}
+
+/** 转速展示：0 = 固态（SSD），null/缺省 = —，其余 = N rpm。 */
+function formatRotation(rate: number | null | undefined): string {
+  if (rate == null) return '—'
+  if (rate === 0) return '固态（SSD）'
+  return `${formatNumber(rate)} rpm`
+}
+
+/** 接口速率：current；max 存在且不同 → "current / max"。 */
+function formatIfSpeed(cur: string | null | undefined, max: string | null | undefined): string {
+  if (cur == null && max == null) return '—'
+  if (cur != null && max != null && max !== cur) return `${cur} / ${max}`
+  return cur ?? max ?? '—'
+}
+
+/**
+ * 身份卡内的「技术信息」小分组：转速 / 尺寸 / 接口速率 / SATA·ATA 版本 / TRIM / zoned / 型号族。
+ * 全部字段缺失（NVMe 无此段或旧数据）→ 整块不渲染。
+ */
+function AtaTechInfo({ ata }: { ata: AtaExtras | null }) {
+  if (!ata) return null
+  const hasAny = [
+    ata.rotation_rate, ata.form_factor, ata.interface_speed_current, ata.interface_speed_max,
+    ata.sata_version, ata.ata_version, ata.trim, ata.zoned, ata.model_family,
+  ].some((v) => v != null)
+  if (!hasAny) return null
+  return (
+    <>
+      <div style={{ margin: '12px 0 4px' }}>
+        <Text strong style={{ fontSize: 13 }}>技术信息</Text>
+      </div>
+      <Descriptions size="small" column={2} bordered styles={{ label: { width: 120 }, content: { wordBreak: 'break-all' } }}>
+        <Descriptions.Item label="转速">{formatRotation(ata.rotation_rate ?? null)}</Descriptions.Item>
+        <Descriptions.Item label="尺寸规格">{ata.form_factor || '—'}</Descriptions.Item>
+        <Descriptions.Item label="接口速率" span={2}>
+          {formatIfSpeed(ata.interface_speed_current, ata.interface_speed_max)}
+        </Descriptions.Item>
+        <Descriptions.Item label="SATA 版本">{ata.sata_version || '—'}</Descriptions.Item>
+        <Descriptions.Item label="ATA 版本">{ata.ata_version || '—'}</Descriptions.Item>
+        <Descriptions.Item label="TRIM">
+          {ata.trim == null ? '—' : ata.trim ? '支持' : '不支持'}
+        </Descriptions.Item>
+        <Descriptions.Item label="Zoned">{ata.zoned || '—'}</Descriptions.Item>
+        <Descriptions.Item label="型号族" span={2}>{ata.model_family || '—'}</Descriptions.Item>
+      </Descriptions>
+    </>
+  )
+}
+
+/** 关键指标单一格取值：null/undefined/NaN → —（绝不渲染 "null"）。 */
+function metricText(v: number | null | undefined, suffix = ''): string {
+  if (v == null || Number.isNaN(v)) return '—'
+  return `${formatNumber(v)}${suffix}`
+}
+
+/**
+ * 健康卡内的 ATA 关键指标瓦片组（13 项）。缺项显示 —；
+ * liveParsed 与 disk.latest_smart（扩展字段可选）都符合此结构。
+ */
+function AtaKeyMetrics({ d }: { d: {
+  temperature_c: number | null
+  power_on_hours: number | null
+  reallocated_ct: number | null
+  pending_ct: number | null
+  start_stop_ct?: number | null
+} & AtaExtras | null }) {
+  if (!d) return null
+  const tiles: { label: string; value: string }[] = [
+    { label: '温度', value: d.temperature_c != null ? `${d.temperature_c} ℃` : '—' },
+    { label: '通电小时', value: metricText(d.power_on_hours, ' h') },
+    { label: '通电次数', value: metricText(d.power_cycle_count) },
+    { label: '启停次数', value: metricText(d.start_stop_ct) },
+    { label: '重分配扇区', value: metricText(d.reallocated_ct) },
+    { label: '待映射扇区', value: metricText(d.pending_ct) },
+    { label: 'UDMA CRC', value: metricText(d.udma_crc_errors) },
+    { label: '读错误率', value: metricText(d.raw_read_error_rate) },
+    { label: '寻道错误率', value: metricText(d.seek_error_rate) },
+    { label: '退避重试', value: metricText(d.spin_retry_count) },
+    { label: '断电回收', value: metricText(d.power_off_retract_count) },
+    { label: '负载循环', value: metricText(d.load_cycle_count) },
+    { label: '飞行小时', value: metricText(d.head_flying_hours, ' h') },
+  ]
+  return (
+    <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: '10px 12px' }}>
+      <Text strong style={{ fontSize: 13 }}>关键指标</Text>
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fill, minmax(104px, 1fr))',
+          gap: 8,
+          marginTop: 8,
+        }}
+      >
+        {tiles.map((t) => (
+          <div key={t.label} style={{ background: '#fafafa', borderRadius: 6, padding: '6px 8px', minWidth: 0 }}>
+            <div style={{ fontSize: 11, color: '#8c8c8c', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.label}</div>
+            <div style={{ fontSize: 14, fontWeight: 600, overflowWrap: 'anywhere' }}>{t.value}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+/** ATA SMART 属性表（可折叠，默认折叠；空 → 不渲染）。异常行保守高亮 + Tooltip 说明原因。 */
+function AtaAttributesCard({ attrs }: { attrs: AtaAttribute[] | null | undefined }) {
+  if (!attrs || attrs.length === 0) return null
+
+  // 异常判定（保守）：曾报告失败，或阈值 >0 且当前值 ≤ 阈值
+  const abnormalReason = (a: AtaAttribute): string | null => {
+    if (a.when_failed != null && a.when_failed !== '') {
+      return `该属性曾报告失败（when_failed = ${a.when_failed}）`
+    }
+    if (a.thresh > 0 && a.value <= a.thresh) {
+      return `当前值 ${a.value} 已 ≤ 阈值 ${a.thresh}`
+    }
+    return null
+  }
+
+  const columns = [
+    { title: 'ID', dataIndex: 'id', width: 50 },
+    {
+      title: '名称',
+      dataIndex: 'name',
+      width: 190,
+      ellipsis: true,
+      render: (v: string, record: AtaAttribute) => {
+        const reason = abnormalReason(record)
+        return (
+          <Space size={4}>
+            {reason && (
+              <Tooltip title={`已标红：${reason}`}>
+                <ExclamationCircleOutlined style={{ color: '#cf1322', fontSize: 12 }} />
+              </Tooltip>
+            )}
+            <Tooltip title={v} placement="topLeft" mouseEnterDelay={0.3}>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{v}</span>
+            </Tooltip>
+          </Space>
+        )
+      },
+    },
+    {
+      title: '当前',
+      dataIndex: 'value',
+      width: 70,
+      align: 'right' as const,
+      render: (v: number, record: AtaAttribute) => (
+        <span style={abnormalReason(record) ? { color: '#cf1322', fontWeight: 600 } : undefined}>{formatNumber(v)}</span>
+      ),
+    },
+    { title: '最差', dataIndex: 'worst', width: 70, align: 'right' as const, render: (v: number) => formatNumber(v) },
+    { title: '阈值', dataIndex: 'thresh', width: 70, align: 'right' as const, render: (v: number) => formatNumber(v) },
+    {
+      title: '原始值',
+      key: 'raw',
+      ellipsis: true,
+      render: (_: unknown, record: AtaAttribute) => {
+        const t = record.raw_string ?? record.raw_value ?? ''
+        return (
+          <Tooltip title={t} placement="topLeft" mouseEnterDelay={0.3}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{t}</span>
+          </Tooltip>
+        )
+      },
+    },
+  ]
+
+  return (
+    <Collapse
+      size="small"
+      items={[
+        {
+          key: 'ata-attributes',
+          label: (
+            <Space size={8} wrap>
+              <Text strong style={{ fontSize: 13 }}>SMART 属性表</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>共 {attrs.length} 项</Text>
+            </Space>
+          ),
+          children: (
+            <Table
+              rowKey="id"
+              size="small"
+              tableLayout="fixed"
+              pagination={false}
+              scroll={{ y: 320 }}
+              columns={columns}
+              dataSource={attrs}
+              onRow={(record) => ({
+                style: abnormalReason(record) ? { background: '#fff1f0' } : undefined,
+              })}
+            />
+          ),
+        },
+      ]}
+    />
   )
 }
 
@@ -313,23 +524,13 @@ function HealthCard({
     return <Tag color="warning">未采集到</Tag>
   }
 
+  // 健康卡主体只剩状态与设备类型；13 项关键指标统一走 AtaKeyMetrics 瓦片组
   const fieldsOf = (s: {
     health: string
-    temperature_c: number | null
-    power_on_hours: number | null
-    reallocated_ct: number | null
-    pending_ct: number | null
-    start_stop_ct?: number | null
-    spin_up_ms?: number | null
     device_type?: string | null
   }) => (
     <Descriptions size="small" column={2} bordered>
       <Descriptions.Item label="健康状态">{healthTag(s.health)}</Descriptions.Item>
-      <Descriptions.Item label="温度">{s.temperature_c != null ? `${s.temperature_c} ℃` : '-'}</Descriptions.Item>
-      <Descriptions.Item label="通电小时">{s.power_on_hours != null ? formatNumber(s.power_on_hours) : '-'}</Descriptions.Item>
-      <Descriptions.Item label="启停次数">{s.start_stop_ct != null ? formatNumber(s.start_stop_ct) : '-'}</Descriptions.Item>
-      <Descriptions.Item label="重分配扇区">{s.reallocated_ct != null ? formatNumber(s.reallocated_ct) : '-'}</Descriptions.Item>
-      <Descriptions.Item label="待映射扇区">{s.pending_ct != null ? formatNumber(s.pending_ct) : '-'}</Descriptions.Item>
       {s.device_type != null && (
         <Descriptions.Item label="设备类型">{s.device_type || '-'}</Descriptions.Item>
       )}
@@ -407,6 +608,7 @@ function HealthCard({
               description={`设备 ${readResult.device}${readResult.device_type ? ` · 类型 ${readResult.device_type}` : ''}`}
             />
             {fieldsOf(readResult.parsed)}
+            <AtaKeyMetrics d={readResult.parsed} />
             <RawOutputBlock text={readResult.raw_excerpt} title="原始输出" />
           </>
         )}
@@ -485,6 +687,7 @@ function HealthCard({
               </Space>
             </div>
             {fieldsOf(smart)}
+            <AtaKeyMetrics d={smart} />
             <Text type="secondary" style={{ fontSize: 12 }}>
               最近采集：{formatDateTime(smart.collected_at)}
               {smart.snapshot_id ? ` · ${smart.snapshot_id}` : ''}
