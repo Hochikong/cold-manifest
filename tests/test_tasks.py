@@ -63,7 +63,9 @@ def test_cancel_race_pending_never_runs(data_root: Path) -> None:
         # ② 端到端抢跑：先用 blocker 占住 worker（保证后续提交始终停在 pending），
         #    再批量提交+立刻取消——终态必须全部 cancelled，fn 从未执行
         _blocker_id = runner.submit("race_blocker", {})
-        deadline = time.monotonic() + 5.0
+        # 上限放到 30s：全量套件负载下 worker 可能要好几秒才认领 blocker，
+        # 旧值 5s 会在负载高时提前放行、破坏"后续提交始终停在 pending"的前提（假失败）。
+        deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             bt = runner.get_task(_blocker_id)
             if bt and bt["status"] == "running":
@@ -73,7 +75,8 @@ def test_cancel_race_pending_never_runs(data_root: Path) -> None:
             task_id = runner.submit("race_probe", {"i": i})
             assert runner.cancel(task_id) == "cancelled"
         release.set()
-        deadline = time.monotonic() + 10.0
+        # 同上：负载下终态收敛可能明显变慢
+        deadline = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             rows = conn.execute(
                 "SELECT status FROM tasks WHERE kind IN ('race_probe','race_blocker')").fetchall()
