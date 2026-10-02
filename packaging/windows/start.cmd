@@ -1,7 +1,10 @@
 @echo off
 rem cold-manifest web server launcher. Default data root: <package root>\data
-rem NOTE: keep this file ASCII-only (cmd.exe parses batch files in the OEM codepage)
-rem Force UTF-8 console codepage + Python IO encoding (P1-1: avoid GBK encode crashes)
+rem NOTE: keep this file ASCII-only (cmd.exe parses batch files in the OEM codepage,
+rem       so non-ASCII bytes here can produce "The syntax of the command is incorrect").
+rem       Chinese messages are therefore passed to PowerShell as base64 UTF-16
+rem       (-EncodedCommand); they render correctly while this file stays pure ASCII.
+rem Force UTF-8 console codepage + Python IO encoding (avoid GBK encode crashes)
 chcp 65001 >nul
 set "PYTHONIOENCODING=utf-8"
 setlocal
@@ -12,17 +15,17 @@ if not exist ".venv-win\Scripts\cldm.exe" (
     exit /b 1
 )
 
-rem ---- Admin check: SMART on USB-bridge / PhysicalDrive disks needs elevation ----
+rem ---- Admin check: SMART on USB-bridge / physical disks needs elevation ----
 net session >nul 2>&1
 if errorlevel 1 (
-    rem Chinese warning text goes through PowerShell so it renders regardless
-    rem of the batch file's own codepage (this .cmd stays pure ASCII).
-    powershell -NoProfile -Command "Write-Host ''; Write-Host '=================================================' -ForegroundColor Yellow; Write-Host '[WARNING] 当前不是管理员身份运行。' -ForegroundColor Yellow; Write-Host '非管理员时 SMART 采集会失败（USB 桥接盘/PhysicalDrive 需要管理员权限，' -ForegroundColor Yellow; Write-Host 'NVMe 盘不受影响）。报错形如 Open failed, Error=5。' -ForegroundColor Yellow; Write-Host '=================================================' -ForegroundColor Yellow"
+    powershell -NoProfile -EncodedCommand VwByAGkAdABlAC0ASABvAHMAdAAgACcAJwA7ACAAVwByAGkAdABlAC0ASABvAHMAdAAgACcAPQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQAnACAALQBGAG8AcgBlAGcAcgBvAHUAbgBkAEMAbwBsAG8AcgAgAFkAZQBsAGwAbwB3ADsAIABXAHIAaQB0AGUALQBIAG8AcwB0ACAAJwBbAGaLSlRdACAAU19NUg1OL2blTqF7BnRYVKuO/U7Qj0yIAjAnACAALQBGAG8AcgBlAGcAcgBvAHUAbgBkAEMAbwBsAG8AcgAgAFkAZQBsAGwAbwB3ADsAIABXAHIAaQB0AGUALQBIAG8AcwB0ACAAJwAgACAAVQBTAEIAIABlaKVj2HYgAC8AIABpcgZ0wXjYdoR2IABTAE0AQQBSAFQAIADHkcaWGk8xWSWNCP9OAFYATQBlACAA2HYNTtdTcV/NVAn/DP8nACAALQBGAG8AcgBlAGcAcgBvAHUAbgBkAEMAbwBsAG8AcgAgAFkAZQBsAGwAbwB3ADsAIABXAHIAaQB0AGUALQBIAG8AcwB0ACAAJwAgACAApWIZlWJfglkgAE8AcABlAG4AIABmAGEAaQBsAGUAZAAsACAARQByAHIAbwByAD0ANQACMCcAIAAtAEYAbwByAGUAZwByAG8AdQBuAGQAQwBvAGwAbwByACAAWQBlAGwAbABvAHcAOwAgAFcAcgBpAHQAZQAtAEgAbwBzAHQAIAAnAD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0APQA9AD0AJwAgAC0ARgBvAHIAZQBnAHIAbwB1AG4AZABDAG8AbABvAHIAIABZAGUAbABsAG8AdwA=
     choice /C YN /N /M "Restart as administrator now? (Y/N): "
     if errorlevel 2 goto :run
     rem Re-launch elevated, preserving the working directory (quotes survive
-    rem spaces / non-ASCII in the install path).
-    powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -WorkingDirectory '%~dp0..\..'"; exit /b
+    rem spaces / non-ASCII in the install path). NOTE: keep `exit /b` on its own
+    rem line - PowerShell's -Command swallows everything after it on the same line.
+    powershell -NoProfile -Command "Start-Process -Verb RunAs -FilePath '%~f0' -WorkingDirectory '%~dp0..\..'"
+    exit /b
 )
 
 :run

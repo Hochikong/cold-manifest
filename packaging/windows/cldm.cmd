@@ -11,12 +11,12 @@ if not exist "%HERE%\.venv-win\Scripts\cldm.exe" (
     exit /b 1
 )
 
-rem ---- Non-admin notice: SMART on USB-bridge / PhysicalDrive disks will fail ----
+rem ---- Non-admin notice: SMART on USB-bridge / physical disks will fail ----
 net session >nul 2>&1
 if errorlevel 1 (
-    rem Chinese warning text goes through PowerShell so it renders regardless
-    rem of the batch file's own codepage (this .cmd stays pure ASCII).
-    powershell -NoProfile -Command "Write-Host '[WARNING] 未以管理员身份运行：SMART 采集 USB 桥接盘/PhysicalDrive 会失败（NVMe 盘不受影响）。建议以管理员身份运行本命令。' -ForegroundColor Yellow"
+    rem Chinese warning goes through PowerShell as base64 UTF-16 (-EncodedCommand)
+    rem so it renders correctly while this .cmd stays pure ASCII.
+    powershell -NoProfile -EncodedCommand VwByAGkAdABlAC0ASABvAHMAdAAgACcAKmflTqF7BnRYVKuO/U7Qj0yIGv9TAE0AQQBSAFQAIADHkcaWIABVAFMAQgAgAGVopWPYdi8AaXIGdMF42HYaTzFZJY0I/04AVgBNAGUAIAANTtdTcV/NVAn/DP/6Xq6L5U6hewZ0WFSrjv1O0I9MiCxnfVTkTgIwJwAgAC0ARgBvAHIAZQBnAHIAbwB1AG4AZABDAG8AbABvAHIAIABZAGUAbABsAG8AdwA=
 )
 
 rem Default data root: <package root>\data (same as start.cmd); an explicit
