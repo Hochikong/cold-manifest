@@ -253,20 +253,31 @@ def parse_scan_output(text: str) -> "list[dict]":
 
 
 def scan_devices() -> "list[dict]":
-    """smartctl --scan 结果（进程内缓存）：优先 -j JSON，回退文本解析。"""
+    """smartctl --scan 结果（进程内缓存）：优先 -j JSON，回退文本解析。
+
+    **不缓存失败**：空结果（smartctl 缺失/刚启动盘未就绪/权限等瞬时失败）
+    绝不进缓存——否则一次瞬时失败会把整个服务进程的映射永久污染成空，
+    后续全部退化成 \\\\.\\PhysicalDriveN 兜底（"第一次好、后面坏"）。
+    空结果原地重试一次后仍空则直接返回，等下次调用再试。
+    """
     global _SCAN_CACHE
     if _SCAN_CACHE is not None:
         return _SCAN_CACHE
     exe = smartctl_exec()
     entries: list[dict] = []
-    proc = _run_cmd([exe, "--scan", "-j"])
-    if proc is not None:
-        entries = parse_scan_output(proc.stdout)
-    if not entries:
-        proc = _run_cmd([exe, "--scan"])
+    for _attempt in range(2):  # 空结果重试一次（设备枚举可能有启动时延）
+        entries = []
+        proc = _run_cmd([exe, "--scan", "-j"])
         if proc is not None:
             entries = parse_scan_output(proc.stdout)
-    _SCAN_CACHE = entries
+        if not entries:
+            proc = _run_cmd([exe, "--scan"])
+            if proc is not None:
+                entries = parse_scan_output(proc.stdout)
+        if entries:
+            break
+    if entries:
+        _SCAN_CACHE = entries
     return entries
 
 
@@ -316,11 +327,56 @@ def smart_device(disk_index: "int | None", letter: "str | None" = None
     return cands[0]["device"], cands[0]["type"]
 
 
+def device_candidates_for_path(path: "str | Path",
+                               disk_index: "int | None" = None) -> "list[dict]":
+    """path 所在物理盘的**完整候选链**（现场读取用）。
+
+    device_for_path 只回首个候选（旧签名保留，不破坏其它调用点）；
+    现场读取必须走本函数/候选链——单设备曾导致 USB 桥盘永远打不开。
+    有 disk_index（Windows 盘号）直接走 smart_device_candidates 全链
+    （scan 映射 + /dev/sdN + \\\\.\\PhysicalDriveN）；只有盘符时退化为
+    盘符形态；Linux 复用 /proc/mounts 定位出单候选。
+    定位失败返回 []（由调用方转 404/warning），绝不抛异常。
+    """
+    if isinstance(disk_index, int):
+        return smart_device_candidates(disk_index)
+    if sys.platform == "win32":
+        letter = str(Path(path).resolve())[:2].rstrip(":")
+        if len(letter) == 1 and letter.isalpha():
+            return smart_device_candidates(None, letter)
+        return []
+    try:
+        dev = device_for_path(path)
+    except Exception:  # noqa: BLE001 — 诊断路径绝不抛
+        return []
+    return [{"device": dev, "type": "", "source": "linux"}] if dev else []
+
+
+def device_capacity(device: str) -> "int | None":
+    """smartctl -i -j 读 user_capacity.bytes（扫描映射容量软校验用）。
+
+    smartctl --scan 行序与 PhysicalDrive 编号一致只是假设；用设备的实际
+    容量与盘的已知容量交叉核对可发现错位映射。读取失败 → None（不校验）。
+    """
+    proc = _run_cmd([smartctl_exec(), "-i", "-j", device])
+    if proc is None or not (proc.stdout or "").lstrip().startswith("{"):
+        return None
+    try:
+        sj = json.loads(proc.stdout)
+        return int((sj.get("user_capacity") or {}).get("bytes"))
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
 # ---------------------------------------------------------------- 类型兜底链
 
 # 每一步都是一次独立尝试（auto → sat → sat,12 → 扫描建议 → 桥专用）
 _BASE_TYPES = ("", "sat", "sat,12")
-_BRIDGE_TYPES = ("usbjmicron", "usbsunplus", "usbprolific", "jms56x")
+# smartctl 的 VALID ARGUMENTS（smartctl --device-type-help）核对结论：
+# usbjmicron / usbsunplus / usbprolific 可以裸用；jms56x 要求
+# `jms56x,N[,sLBA][,force][+TYPE]` 形式，裸写 `jms56x` 是非法参数
+# （报 "Unknown JMicron type 'jms56x'"、rc bit0），最小合法形式为 jms56x,0。
+_BRIDGE_TYPES = ("usbjmicron", "usbsunplus", "usbprolific", "jms56x,0")
 
 
 def _device_types(suggested: "str | None" = None) -> list[str]:
@@ -407,11 +463,12 @@ REASON_MESSAGES = {
     ),
     "device_open": (
         "设备打不开（exit_status bit1）：USB 桥接盘通常要用 /dev/sdN 而不是"
-        " \\\\.\\PhysicalDriveN；可设 CLDM_SMARTCTL_DEVICE 直接指定设备串后重试"
+        " \\\\.\\PhysicalDriveN；可设 CLDM_SMARTCTL_DEVICE 直接指定设备串"
+        "（改环境变量后需重启服务）再试"
     ),
     "cmdline_error": (
         "smartctl 命令行/参数识别失败（exit_status bit0）："
-        "检查 CLDM_SMARTCTL_ARGS 与设备串是否正确"
+        "检查 CLDM_SMARTCTL_ARGS 与设备串是否正确（改环境变量后需重启服务）"
     ),
     "device_type_unknown": (
         "无法识别设备类型（USB 桥常见；已尝试 auto/sat/桥专用参数均失败，"
@@ -430,15 +487,19 @@ def _classify_attempts(attempts: list[dict]) -> str:
             return "timeout"
         if a.get("error") == "not_found":
             return "not_found"
-    # exit_status 位掩码优先：bit1(2)=设备打不开、bit0(1)=命令行错误
-    #（低 2 位致命的尝试本就不会被当成功，rc 在此即真实失败位）
+    # exit_status 位掩码：bit1(2)=设备打不开、bit0(1)=命令行错误。
+    # 跨多次尝试时 bit1 更接近真实原因（一次参数错常伴随一连串打不开，
+    # 只看最后一次会把 bit0 当结论），故先全量找 bit1，找不到才用 bit0。
+    has_bit0 = False
     for a in attempts:
         es = a.get("exit_status")
         if isinstance(es, int):
             if es & 2:
                 return "device_open"
             if es & 1:
-                return "cmdline_error"
+                has_bit0 = True
+    if has_bit0:
+        return "cmdline_error"
     texts = " | ".join(
         f"{a.get('stderr_excerpt') or ''} {a.get('stdout_messages') or ''}"
         for a in attempts)

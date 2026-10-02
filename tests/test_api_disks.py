@@ -162,7 +162,9 @@ def test_smart_read_live_ok(client: TestClient, monkeypatch) -> None:
                    "size_bytes": 100, "volumes": []}],
         "count": 1,
     })
-    monkeypatch.setattr(smart, "read_smart_verbose", lambda dev: _ok_verbose())
+    monkeypatch.setattr(
+        smart, "read_smart_verbose",
+        lambda dev=None, *, devices=None, **kw: _ok_verbose())
     r = client.post("/api/disks/D1/smart/read")
     assert r.status_code == 200
     body = r.json()
@@ -180,7 +182,7 @@ def test_smart_read_live_failure_readable(client: TestClient, monkeypatch) -> No
         "count": 1,
     })
 
-    def fail(dev: str) -> dict:
+    def fail(dev=None, *, devices=None, **kw) -> dict:
         return {"ok": False, "raw": None, "device_type": "",
                 "reason": "permission_denied",
                 "message": smart.REASON_MESSAGES["permission_denied"],
@@ -207,6 +209,98 @@ def test_smart_read_live_disk_absent_404(client: TestClient, monkeypatch) -> Non
     assert "不在线" in r.json()["detail"]
 
 
+def test_smart_read_live_uses_candidate_chain(client: TestClient,
+                                              monkeypatch) -> None:
+    """现场读取走候选链：attached 项的设备传入 read_smart_verbose(devices=...)。"""
+    seen: dict = {}
+
+    def fake_cands(disk_index, letter=None):
+        seen["disk_index"] = disk_index
+        return [{"device": "/dev/sdb", "type": "nvme", "source": "scan"},
+                {"device": "\\\\.\\PhysicalDrive1", "type": "", "source": "fallback-pd"}]
+
+    monkeypatch.setattr(smart, "smart_device_candidates", fake_cands)
+
+    def fake_verbose(dev=None, *, devices=None, **kw):
+        seen["devices"] = devices
+        return {"ok": True, "raw": SAMPLE, "device": "/dev/sdb",
+                "device_type": "nvme", "exit_status": 0, "reason": None,
+                "message": None, "raw_excerpt": "", "attempts": [],
+                "device_candidates": [d["device"] for d in (devices or [])],
+                "scan_info": {"candidates": devices or []}}
+
+    monkeypatch.setattr(smart, "read_smart_verbose", fake_verbose)
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True,
+        "items": [{"device": "/dev/sdb", "model": "M", "serial": "D1",
+                   "size_bytes": 100, "volumes": []}],
+        "count": 1,
+    })
+    # 平台是 linux → _disk_index_of 认不出 PhysicalDrive → 走 attached 单候选
+    r = client.post("/api/disks/D1/smart/read")
+    assert r.status_code == 200
+    body = r.json()
+    assert seen["devices"][0]["device"] == "/dev/sdb"
+    assert body["device_candidates"] == ["/dev/sdb"]
+    assert seen.get("disk_index") is None  # linux 设备名不产盘号，不走 smart_device_candidates
+
+
+def test_smart_read_live_physicaldrive_index_chain(client: TestClient,
+                                                   monkeypatch) -> None:
+    """attached 项是 \\\\.\\PhysicalDriveN 时提取盘号 → smart_device_candidates(N)。"""
+    seen: dict = {}
+
+    def fake_cands(disk_index, letter=None):
+        seen["disk_index"] = disk_index
+        return [{"device": "/dev/sdb", "type": "", "source": "fallback-sd"},
+                {"device": f"\\\\.\\PhysicalDrive{disk_index}", "type": "",
+                 "source": "fallback-pd"}]
+
+    monkeypatch.setattr(smart, "smart_device_candidates", fake_cands)
+    monkeypatch.setattr(
+        smart, "read_smart_verbose",
+        lambda dev=None, *, devices=None, **kw: {
+            "ok": False, "raw": None, "device": "", "device_type": "",
+            "exit_status": None, "reason": "device_open",
+            "message": smart.REASON_MESSAGES["device_open"],
+            "raw_excerpt": "", "attempts": [],
+            "device_candidates": [d["device"] for d in (devices or [])],
+            "scan_info": {}})
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True,
+        "items": [{"device": "\\\\.\\PhysicalDrive1", "model": "M",
+                   "serial": "D1", "size_bytes": None, "volumes": []}],
+        "count": 1,
+    })
+    r = client.post("/api/disks/D1/smart/read")
+    assert r.status_code == 200
+    assert seen["disk_index"] == 1
+    body = r.json()
+    assert body["device_candidates"] == ["/dev/sdb", "\\\\.\\PhysicalDrive1"]
+    assert body["reason"] == "device_open"
+
+
+def test_capacity_screen_mismatch(client: TestClient, monkeypatch) -> None:
+    """容量软校验：scan 候选容量与已知容量差 >20% → 剔除并标 mismatch。"""
+    cands = [{"device": "/dev/sda", "type": "", "source": "scan"},
+             {"device": "/dev/sdb", "type": "", "source": "fallback-sd"}]
+    monkeypatch.setattr(smart, "device_capacity", lambda dev: 500_000_000_000)
+    out, status = routes_disks._capacity_screen(cands, 1_000_000_000_000)
+    assert [c["device"] for c in out] == ["/dev/sdb"]
+    assert status == "mismatch"
+    # 容量接近 → 保留
+    out, status = routes_disks._capacity_screen(cands, 520_000_000_000)
+    assert [c["device"] for c in out] == ["/dev/sda", "/dev/sdb"]
+    assert status is None
+    # 任一方无容量 → 不校验
+    out, status = routes_disks._capacity_screen(cands, None)
+    assert out == cands and status is None
+    out, status = routes_disks._capacity_screen(cands, 100)
+    monkeypatch.setattr(smart, "device_capacity", lambda dev: None)
+    out, status = routes_disks._capacity_screen(cands, 100)
+    assert out == cands and status is None
+
+
 # ---------------------------------------------------------------- preflight
 
 
@@ -215,8 +309,12 @@ def test_preflight_ok(client: TestClient, tmp_path: Path, monkeypatch) -> None:
     target.mkdir()
     monkeypatch.setattr(smart, "check_smartctl", lambda: "/usr/bin/smartctl")
     monkeypatch.setattr(smart, "device_for_path", lambda p: "/dev/sdz")
-    monkeypatch.setattr(smart, "read_smart",
-                        lambda dev: {"raw": SAMPLE, "device_type": "sat"})
+    monkeypatch.setattr(
+        smart, "read_smart_verbose",
+        lambda dev=None, *, devices=None, **kw: {
+            "ok": True, "raw": SAMPLE, "device": "/dev/sdz",
+            "device_type": "sat", "exit_status": 0, "reason": None,
+            "message": None, "raw_excerpt": "", "attempts": []})
     body = client.post("/api/collect/preflight", json={"path": str(target)}).json()
     assert body["writable"] is True
     assert body["smartctl_available"] is True
@@ -259,7 +357,12 @@ def test_preflight_sm_failures_degrade(client: TestClient, tmp_path: Path,
     assert any("物理盘" in w for w in body["warnings"])
 
     monkeypatch.setattr(smart, "device_for_path", lambda p: "/dev/sdz")
-    monkeypatch.setattr(smart, "read_smart", lambda dev: None)
+    monkeypatch.setattr(
+        smart, "read_smart_verbose",
+        lambda dev=None, *, devices=None, **kw: {
+            "ok": False, "raw": None, "device_type": "", "exit_status": None,
+            "reason": "device_open", "message": "打不开",
+            "raw_excerpt": "", "attempts": []})
     body = client.post("/api/collect/preflight", json={"path": str(target)}).json()
     assert body["is_smart_capable"] is False
     assert any("SMART" in w for w in body["warnings"])

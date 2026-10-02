@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -270,53 +271,115 @@ class SmartReadBody(BaseModel):
     path: "str | None" = None
 
 
-def _locate_attached_device(disk_id: str, path: "str | None") -> str:
-    """定位当前插着的盘设备：优先 body.path，否则按序列号在 attached 里找。
+def _disk_index_of(item: dict) -> "int | None":
+    """attached 枚举项的 PhysicalDrive 盘号（\\\\.\\PhysicalDriveN → N）。"""
+    m = re.search(r"PhysicalDrive(\d+)$", str(item.get("device") or ""))
+    return int(m.group(1)) if m else None
 
-    定位不到（盘不在线/路径无法定位）抛 HTTPException 404。
+
+def _locate_attached_candidates(disk_id: str, path: "str | None"
+                                ) -> "tuple[Any, list[dict]]":
+    """定位当前插着的盘的**候选链**：返回 (attached 容量或 None, 候选列表)。
+
+    现场读取必须走候选链（smart_device_candidates），单设备曾导致 USB 桥盘
+    永远打不开（PhysicalDrive 形态在桥上常 Invalid argument）。有 path：
+    Windows 优先在 attached 枚举里反查盘号走全链，反查不到退回
+    smart.device_candidates_for_path；Linux 直接 /proc/mounts 定位。
+    无 path：按序列号在 attached 里找。定位不到抛 HTTPException 404。
     """
-    if path:
-        try:
-            dev = smart.device_for_path(path)
-        except Exception as e:  # noqa: BLE001
+    attached: "dict | None" = None
+    need_attached = path is None or sys.platform == "win32"
+    if need_attached:
+        if sys.platform.startswith("linux"):
+            try:
+                attached = _attached_linux()
+            except Exception as e:  # noqa: BLE001
+                if path is None:
+                    raise HTTPException(status_code=404,
+                                        detail=f"本机盘枚举失败：{e}")
+        elif sys.platform == "win32":
+            try:
+                attached = _attached_win()
+            except Exception as e:  # noqa: BLE001
+                if path is None:
+                    raise HTTPException(status_code=404,
+                                        detail=f"本机盘枚举失败：{e}")
+        elif path is None:
             raise HTTPException(status_code=404,
-                                detail=f"无法定位 {path} 所在物理盘：{e}")
-        if not dev:
+                                detail=f"不支持的平台：{sys.platform}")
+
+    if path:
+        want = str(path).rstrip("\\/").lower()
+        item = None
+        if attached:
+            item = next(
+                (i for i in attached.get("items") or [] if any(
+                    str(v.get("path") or "").rstrip("\\/").lower() == want
+                    for v in i.get("volumes") or [])),
+                None,
+            )
+        if item is not None:
+            idx = _disk_index_of(item)
+            cands = (smart.smart_device_candidates(idx) if idx is not None
+                     else smart.device_candidates_for_path(path))
+            return item.get("size_bytes"), cands
+        cands = smart.device_candidates_for_path(path)
+        if not cands:
             raise HTTPException(status_code=404,
                                 detail=f"无法定位 {path} 所在物理盘")
-        return dev
-    if sys.platform.startswith("linux"):
-        try:
-            attached = _attached_linux()
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=404, detail=f"本机盘枚举失败：{e}")
-    elif sys.platform == "win32":
-        try:
-            attached = _attached_win()
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=404, detail=f"本机盘枚举失败：{e}")
-    else:
-        raise HTTPException(status_code=404,
-                            detail=f"不支持的平台：{sys.platform}")
+        return None, cands
+
     want = (disk_id or "").strip()
     item = next(
-        (i for i in attached.get("items") or []
+        (i for i in (attached or {}).get("items") or []
          if str(i.get("serial") or "").strip() == want),
         None,
     )
     if item is None:
         raise HTTPException(status_code=404,
                             detail=f"盘 {disk_id} 当前不在线（未在 /api/disks/attached 中）")
+    idx = _disk_index_of(item)
+    if idx is not None:
+        return item.get("size_bytes"), smart.smart_device_candidates(idx)
     dev = str(item.get("device") or "").strip()
     if not dev and item.get("volumes"):
-        try:
-            dev = smart.device_for_path(item["volumes"][0].get("path") or "")
-        except Exception:  # noqa: BLE001
-            dev = None
+        cands = smart.device_candidates_for_path(
+            item["volumes"][0].get("path") or "")
+        if cands:
+            return item.get("size_bytes"), cands
     if not dev:
         raise HTTPException(status_code=404,
                             detail=f"盘 {disk_id} 在线但无法定位物理设备")
-    return dev
+    return item.get("size_bytes"), [{"device": dev, "type": "",
+                                     "source": "attached"}]
+
+
+def _capacity_screen(cands: "list[dict]",
+                     expected_bytes: Any) -> "tuple[list[dict], str | None]":
+    """扫描映射的容量软校验：--scan 行序与盘号一致只是假设。
+
+    scan 来源候选的实际容量（smartctl -i）与 attached 枚举容量差 >20% 时
+    剔除该候选（降级到 /dev/sdN、PhysicalDrive fallback 形态），返回
+    (候选, "mismatch")；任一方无容量则不校验，原样返回。
+    """
+    if not expected_bytes:
+        return cands, None
+    try:
+        expected = int(expected_bytes)
+    except (TypeError, ValueError):
+        return cands, None
+    out: "list[dict]" = []
+    status: "str | None" = None
+    for c in cands:
+        if c.get("source") == "scan":
+            cap = smart.device_capacity(c["device"])
+            if cap and abs(cap - expected) > 0.2 * max(cap, expected):
+                status = "mismatch"
+                continue
+        out.append(c)
+    if not out:  # 全被剔除时保留原候选，宁可试错也不空手
+        return cands, status
+    return out, status
 
 
 @router.post("/disks/{disk_id}/smart/read")
@@ -327,11 +390,20 @@ def disk_smart_read(disk_id: str, request: Request,
     盘不在（404 之外）的读取失败一律 200 + ok=false + 人话原因，绝不 500。
     """
     get_state(request)  # 仅确认服务已挂 data_root
-    device = _locate_attached_device(disk_id, body.path if body else None)
-    res = smart.read_smart_verbose(device)
+    size_bytes, cands = _locate_attached_candidates(
+        disk_id, body.path if body else None)
+    size_bytes, cap_status = _capacity_screen(cands, size_bytes)
+    if not cands:
+        raise HTTPException(status_code=404, detail="无法定位该盘的物理设备候选")
+    res = smart.read_smart_verbose(devices=cands)
+    if cap_status:
+        res.setdefault("scan_info", {})["capacity_check"] = cap_status
+    device = res.get("device") or (cands[0]["device"] if cands else "")
     out: dict = {
         "disk_id": disk_id,
         "device": device,
+        "device_candidates": res.get("device_candidates"),
+        "scan_info": res.get("scan_info"),
         "ok": res["ok"],
         "device_type": res["device_type"],
         "reason": res["reason"],
@@ -384,20 +456,19 @@ def collect_preflight(body: PreflightBody) -> dict:
             "smartctl 不可用（安装 smartmontools，或设 CLDM_SMARTCTL 指定路径）")
         return res
 
-    try:
-        dev = smart.device_for_path(body.path)
-    except Exception as e:  # noqa: BLE001
-        res["warnings"].append(f"无法定位所在物理盘：{e}")
-        return res
-    if not dev:
+    cands = smart.device_candidates_for_path(body.path)
+    if not cands:
         res["warnings"].append("无法定位所在物理盘")
         return res
 
-    r = smart.read_smart(dev)
-    if r is None:
-        res["warnings"].append(f"无法读取 {dev} 的 SMART（盘不支持或需 root/管理员）")
+    r = smart.read_smart_verbose(devices=cands)
+    if not r.get("ok"):
+        msg = r.get("message") or ""
+        res["warnings"].append(
+            f"无法读取 SMART（{r.get('reason') or 'unknown'}）"
+            + (f"：{msg}" if msg else "（盘不支持或需 root/管理员）"))
         return res
-    parsed = smart.parse_smart(r["raw"])
+    parsed = smart.parse_smart(r["raw"], exit_status=r.get("exit_status"))
     res["device_type_hint"] = r["device_type"] or parsed.get("device_type") or ""
     res["is_smart_capable"] = parsed.get("health") in ("passed", "failed", "warning")
     if not res["is_smart_capable"]:

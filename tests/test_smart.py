@@ -487,12 +487,77 @@ def test_device_type_chain_order() -> None:
     chain = smart._device_types("sat")
     assert chain[0] == "" and chain[1] == "sat" and chain[2] == "sat,12"
     assert "sat" not in chain[3:]
-    for b in ("usbjmicron", "usbsunplus", "usbprolific", "jms56x"):
+    for b in ("usbjmicron", "usbsunplus", "usbprolific", "jms56x,0"):
         assert b in chain
     assert len(chain) == len(set(chain))
     # 未给扫描建议时 base + 桥
     assert smart._device_types() == ["", "sat", "sat,12",
-                                     "usbjmicron", "usbsunplus", "usbprolific", "jms56x"]
+                                     "usbjmicron", "usbsunplus",
+                                     "usbprolific", "jms56x,0"]
+
+
+def test_bridge_types_jms56x_legal_form() -> None:
+    """jms56x 必须写成 jms56x,0：smartctl VALID ARGUMENTS 要求
+    `jms56x,N[,sLBA][,force][+TYPE]`，裸写报 Unknown JMicron type（rc bit0）。"""
+    assert "jms56x,0" in smart._BRIDGE_TYPES
+    assert "jms56x" not in smart._BRIDGE_TYPES
+    chain = smart._device_types()
+    assert "jms56x,0" in chain
+    assert "jms56x" not in chain
+    # 其余三个桥类型按 VALID ARGUMENTS 可裸用
+    for b in ("usbjmicron", "usbsunplus", "usbprolific"):
+        assert b in smart._BRIDGE_TYPES
+
+
+def test_scan_devices_does_not_cache_failure(monkeypatch) -> None:
+    """空扫描结果（瞬时失败）不进缓存：第一次空 → 第二次有。"""
+    monkeypatch.setattr(smart, "_SCAN_CACHE", None)
+    state = {"n": 0}
+
+    def fake(cmd: list[str]):
+        state["n"] += 1
+        if state["n"] <= 4:  # 第一次 scan_devices：两轮重试共 4 次调用全空
+            return _proc("")
+        return _proc('/dev/sdb -d sat # [SAT], ATA device')
+
+    monkeypatch.setattr(smart, "_run_cmd", fake)
+    assert smart.scan_devices() == []
+    assert smart._SCAN_CACHE is None  # 失败不污染缓存
+    entries = smart.scan_devices()
+    assert [e["device"] for e in entries] == ["/dev/sdb"]
+    assert smart._SCAN_CACHE == entries  # 非空才缓存
+
+
+def test_classify_attempts_bit1_beats_bit0() -> None:
+    """跨尝试失败归类：bit1（设备打不开）优先于 bit0（参数错）。"""
+    attempts = [
+        {"exit_status": 1, "error": None, "stderr_excerpt": "", "stdout_messages": ""},
+        {"exit_status": 2, "error": None, "stderr_excerpt": "", "stdout_messages": ""},
+    ]
+    assert smart._classify_attempts(attempts) == "device_open"
+    # 纯参数错才报 cmdline_error
+    assert smart._classify_attempts(
+        [{"exit_status": 1, "error": None, "stderr_excerpt": "",
+          "stdout_messages": ""}]) == "cmdline_error"
+
+
+def test_device_candidates_for_path_linux(monkeypatch) -> None:
+    """Linux：device_candidates_for_path 复用 /proc/mounts 定位出单候选。"""
+    monkeypatch.setattr(smart, "device_for_path", lambda p, i=None: "/dev/sdb")
+    cands = smart.device_candidates_for_path("/mnt/x")
+    assert cands == [{"device": "/dev/sdb", "type": "", "source": "linux"}]
+    # 定位失败 → 空列表（绝不抛）
+    def boom(p, i=None):
+        raise RuntimeError("no mount")
+    monkeypatch.setattr(smart, "device_for_path", boom)
+    assert smart.device_candidates_for_path("/mnt/x") == []
+
+
+def test_device_candidates_for_path_with_disk_index(monkeypatch) -> None:
+    """给了盘号直接走 smart_device_candidates 全链（含 fallback 两形态）。"""
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [])
+    cands = smart.device_candidates_for_path("/mnt/x", disk_index=1)
+    assert [c["device"] for c in cands] == ["/dev/sdb", "\\\\.\\PhysicalDrive1"]
 
 
 def test_type_fallback_chain_commands(monkeypatch) -> None:
