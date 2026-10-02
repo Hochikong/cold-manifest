@@ -13,6 +13,8 @@ export interface CursorPagerProps {
   /** 位置提示，如「第 2 页 · 本页 50 条」；缺省不显示 */
   hint?: string
   pageSizeOptions?: number[]
+  /** 深链恢复等场景下禁用翻页按钮，禁止重复触发 */
+  disabled?: boolean
   /** 尺寸变化时是否重置回第一页由调用方决定，本组件只回调 */
 }
 
@@ -29,6 +31,7 @@ export default function CursorPager({
   onNext,
   hint,
   pageSizeOptions = [20, 50, 100, 200],
+  disabled = false,
 }: CursorPagerProps) {
   return (
     <Space wrap align="center" style={{ marginTop: 16, justifyContent: 'center', width: '100%' }}>
@@ -37,12 +40,13 @@ export default function CursorPager({
         style={{ width: 110 }}
         value={pageSize}
         onChange={onPageSizeChange}
+        disabled={disabled}
         options={pageSizeOptions.map((n) => ({ value: n, label: `${n} 条/页` }))}
       />
-      <Button size="small" icon={<LeftOutlined />} disabled={!canPrev} onClick={onPrev}>
+      <Button size="small" icon={<LeftOutlined />} disabled={disabled || !canPrev} onClick={onPrev}>
         上一页
       </Button>
-      <Button size="small" disabled={!canNext} onClick={onNext}>
+      <Button size="small" disabled={disabled || !canNext} onClick={onNext}>
         下一页 <RightOutlined />
       </Button>
       {hint && (

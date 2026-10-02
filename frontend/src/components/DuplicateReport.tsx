@@ -29,6 +29,7 @@ import CursorPager from './CursorPager'
 import ResizableTable from './ResizableTable'
 import EllipsisText from './EllipsisText'
 import { useRowContextMenu } from '../hooks/useRowContextMenu'
+import { useCursorPaging } from '../hooks/useCursorPaging'
 import { useShowApiError } from '../utils/apiError'
 import { formatFileSize, formatNumber } from '../utils/format'
 import { dirNameOf } from '../utils/path'
@@ -49,7 +50,7 @@ const MIN_SIZE_OPTIONS = [
   { label: '100 MiB', value: 100 * 1024 * 1024 },
 ]
 
-const DEFAULT_PAGE_SIZE = 50
+
 
 const MODE_OPTIONS: { value: DuplicateMode; label: string }[] = [
   { value: 'content', label: '按内容（严谨）' },
@@ -112,10 +113,21 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
 
   const [userMode, setUserMode] = useState<DuplicateMode | null>(null)
   const [minSize, setMinSize] = useState<number>(1024 * 1024)
-  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
-  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
-  const pageIndex = cursorStack.length - 1
+  // cursor 栈分页（共享 hook）：行数按 cldm_pagesize:duplicates 持久化、当前页写进 URL ?page=
+  const {
+    pageSize,
+    changePageSize,
+    cursorStack,
+    pageIndex,
+    goNext,
+    goPrev,
+    resetPage,
+    restoring,
+  } = useCursorPaging({
+    tableId: 'duplicates',
+    // 闭包里的 mode/minSize 在真正调用时（挂载后异步走页）已是最新值
+    fetchPage: (limit, cur) => getDuplicates(snapshotId, { mode, min_size: minSize, limit, cursor: cur }),
+  })
   const tableTopRef = useRef<HTMLDivElement | null>(null)
   const mountedRef = useRef(false)
 
@@ -157,7 +169,7 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
   const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
   if (filterKey !== syncedFilterKey) {
     setSyncedFilterKey(filterKey)
-    setCursorStack([null])
+    resetPage()
   }
 
   // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
@@ -168,15 +180,6 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
     }
     tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   }, [pageIndex, pageSize])
-
-  const goNext = () => {
-    if (page?.has_more && page.next_cursor) setCursorStack((s) => [...s, page.next_cursor!])
-  }
-  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
-  const changePageSize = (n: number) => {
-    setPageSize(n)
-    setCursorStack([null])
-  }
 
   // 后端仍判档位不可用（meta 陈旧等）：不整页报错，降级为引导面板。
   const policyBlocked = !!duplicatesQuery.error && isPolicyError(duplicatesQuery.error)
@@ -564,8 +567,9 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
                   canPrev={pageIndex > 0}
                   onPrev={goPrev}
                   canNext={page?.has_more ?? false}
-                  onNext={goNext}
-                  hint={`第 ${pageIndex + 1} 页 · 本页 ${items.length} 组`}
+                  onNext={() => goNext(page?.next_cursor)}
+                  disabled={restoring}
+                  hint={restoring ? '正在恢复页码…' : `第 ${pageIndex + 1} 页 · 本页 ${items.length} 组`}
                 />
               </>
             ) : (

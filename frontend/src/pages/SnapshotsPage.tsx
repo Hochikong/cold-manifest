@@ -73,9 +73,10 @@ import SkippedPanel from '../components/SkippedPanel'
 import OnDiskCopyBadge from '../components/OnDiskCopyBadge'
 import { VerifyCopyButton, VerifyCopyResultCard } from '../components/VerifyCopyCard'
 import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
+import { useCursorPaging } from '../hooks/useCursorPaging'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
 import { dirNameOf, joinChildPath } from '../utils/path'
-import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, getTree, apiErrorDetail, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport, type Snapshot } from '../api/client'
+import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, getTree, apiErrorDetail, listEntries, searchEntries, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport, type Snapshot } from '../api/client'
 import axios from 'axios'
 
 const { Title, Text } = Typography
@@ -84,7 +85,6 @@ const { Option } = Select
 type SortKey = 'name' | 'size' | 'mtime'
 type Order = 'asc' | 'desc'
 
-const DEFAULT_PAGE_SIZE = 50
 
 function getSnapshotDisplayName(snapshot_id: string) {
   const parts = snapshot_id.split('/')
@@ -843,10 +843,32 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
   const [extApplied, setExtApplied] = useState('')
   const [minSize, setMinSize] = useState<number | undefined>(undefined)
   const [maxSize, setMaxSize] = useState<number | undefined>(undefined)
-  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
-  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
-  const pageIndex = cursorStack.length - 1
+  // cursor 栈分页（共享 hook）：行数按 cldm_pagesize:browse-entries 持久化、当前页写进 URL ?page=
+  const {
+    pageSize,
+    changePageSize,
+    cursor,
+    pageIndex,
+    goNext,
+    goPrev,
+    resetPage,
+    restoring,
+  } = useCursorPaging({
+    tableId: 'browse-entries',
+    fetchPage: (limit, cur) =>
+      listEntries(snapshotId, {
+        parent_id: parentId,
+        limit,
+        cursor: cur,
+        sort,
+        order,
+        type: typeFilter as any,
+        ext: extApplied || undefined,
+        min_size: minSize,
+        max_size: maxSize,
+        q: qApplied || undefined,
+      }),
+  })
   const tableTopRef = useRef<HTMLDivElement | null>(null)
   const mountedRef = useRef(false)
   const [drawerEntry, setDrawerEntry] = useState<Entry | null>(null)
@@ -900,7 +922,7 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
   const { data: entriesRes, isLoading: entriesLoading, error: entriesError } = useEntries(snapshotId, {
     parent_id: parentId,
     limit: pageSize,
-    cursor: cursorStack[pageIndex] ?? undefined,
+    cursor,
     sort,
     order,
     type: typeFilter as any,
@@ -916,7 +938,7 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
   const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
   if (filterKey !== syncedFilterKey) {
     setSyncedFilterKey(filterKey)
-    setCursorStack([null])
+    resetPage()
   }
 
   // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
@@ -927,17 +949,6 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
     }
     tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   }, [pageIndex, pageSize])
-
-  const goNext = () => {
-    if (entriesRes?.has_more && entriesRes.next_cursor) {
-      setCursorStack((s) => [...s, entriesRes.next_cursor!])
-    }
-  }
-  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
-  const changePageSize = (n: number) => {
-    setPageSize(n)
-    setCursorStack([null])
-  }
 
   const hasFilters = !!(qApplied || extApplied || minSize != null || maxSize != null || typeFilter)
 
@@ -1202,8 +1213,9 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
               canPrev={pageIndex > 0}
               onPrev={goPrev}
               canNext={entriesRes?.has_more ?? false}
-              onNext={goNext}
-              hint={`第 ${pageIndex + 1} 页 · 本页 ${entries.length} 条`}
+              onNext={() => goNext(entriesRes?.next_cursor)}
+              disabled={restoring}
+              hint={restoring ? '正在恢复页码…' : `第 ${pageIndex + 1} 页 · 本页 ${entries.length} 条`}
             />
           </Card>
         </Col>
@@ -1276,10 +1288,30 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   const [ext, setExt] = useState('')
   const [minSize, setMinSize] = useState<number | undefined>(undefined)
   const [maxSize, setMaxSize] = useState<number | undefined>(undefined)
-  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
-  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
-  const pageIndex = cursorStack.length - 1
+  // cursor 栈分页（共享 hook）：行数按 cldm_pagesize:snapshot-search 持久化、当前页写进 URL ?page=
+  const {
+    pageSize,
+    changePageSize,
+    cursor,
+    pageIndex,
+    goNext,
+    goPrev,
+    resetPage,
+    restoring,
+  } = useCursorPaging({
+    tableId: 'snapshot-search',
+    fetchPage: (limit, cur) =>
+      searchEntries(snapshotId, {
+        q,
+        mode,
+        limit,
+        cursor: cur,
+        type: typeFilter as any,
+        ext: ext || undefined,
+        min_size: minSize,
+        max_size: maxSize,
+      }),
+  })
   const tableTopRef = useRef<HTMLDivElement | null>(null)
   const mountedRef = useRef(false)
   const [hasSearched, setHasSearched] = useState(false)
@@ -1359,7 +1391,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     q,
     mode,
     limit: pageSize,
-    cursor: cursorStack[pageIndex] ?? undefined,
+    cursor,
     type: typeFilter as any,
     ext: ext || undefined,
     min_size: minSize,
@@ -1371,7 +1403,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
   if (filterKey !== syncedFilterKey) {
     setSyncedFilterKey(filterKey)
-    setCursorStack([null])
+    resetPage()
   }
 
   // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
@@ -1382,8 +1414,6 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     }
     tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   }, [pageIndex, pageSize])
-
-  const results = searchRes?.items ?? []
 
   useEffect(() => {
     if (searchRes && typeof searchRes.fulltext_available === 'boolean') {
@@ -1396,16 +1426,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     refetch()
   }
 
-  const goNext = () => {
-    if (searchRes?.has_more && searchRes.next_cursor) {
-      setCursorStack((s) => [...s, searchRes.next_cursor!])
-    }
-  }
-  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
-  const changePageSize = (n: number) => {
-    setPageSize(n)
-    setCursorStack([null])
-  }
+  const results = searchRes?.items ?? []
 
   const columns = [
     { title: '名称', dataIndex: 'name', ellipsis: true, render: (v: string) => <EllipsisText value={v} /> },
@@ -1541,8 +1562,9 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
                 canPrev={pageIndex > 0}
                 onPrev={goPrev}
                 canNext={searchRes?.has_more ?? false}
-                onNext={goNext}
-                hint={`第 ${pageIndex + 1} 页 · 本页 ${results.length} 条`}
+                onNext={() => goNext(searchRes?.next_cursor)}
+                disabled={restoring}
+                hint={restoring ? '正在恢复页码…' : `第 ${pageIndex + 1} 页 · 本页 ${results.length} 条`}
               />
             </>
           ) : (

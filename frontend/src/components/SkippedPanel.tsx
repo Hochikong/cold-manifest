@@ -14,12 +14,12 @@ import ErrorAlert from './ErrorAlert'
 import CursorPager from './CursorPager'
 import ResizableTable from './ResizableTable'
 import { useSkipped, useSnapshot } from '../api/hooks'
+import { getSkipped } from '../api/client'
+import { useCursorPaging } from '../hooks/useCursorPaging'
 import { formatNumber } from '../utils/format'
 import type { SkippedItem } from '../api/client'
 
 const { Text } = Typography
-
-const DEFAULT_PAGE_SIZE = 50
 
 /** scanner 产出的全部跳过原因（src/cold_manifest/scanner.py 的 warning_type 常量）。 */
 const WARNING_TYPES = [
@@ -54,9 +54,20 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
   const [stage, setStage] = useState<string | undefined>(undefined)
   const [warningType, setWarningType] = useState<string | undefined>(undefined)
   // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
-  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
-  const pageIndex = cursorStack.length - 1
+  // cursor 栈分页（共享 hook）：行数按 cldm_pagesize:skipped 持久化、当前页写进 URL ?page=
+  const {
+    pageSize,
+    changePageSize,
+    cursor,
+    pageIndex,
+    goNext,
+    goPrev,
+    resetPage,
+    restoring,
+  } = useCursorPaging({
+    tableId: 'skipped',
+    fetchPage: (limit, cur) => getSkipped(snapshotId, { limit, stage, warning_type: warningType, cursor: cur }),
+  })
   const tableTopRef = useRef<HTMLDivElement | null>(null)
   const mountedRef = useRef(false)
 
@@ -65,7 +76,7 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
     limit: pageSize,
     stage,
     warning_type: warningType,
-    cursor: cursorStack[pageIndex] ?? undefined,
+    cursor,
   })
 
   // 筛选变化 → 重置回第一页（渲染期同步，避免 effect 级联）
@@ -73,7 +84,7 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
   const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
   if (filterKey !== syncedFilterKey) {
     setSyncedFilterKey(filterKey)
-    setCursorStack([null])
+    resetPage()
   }
 
   // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
@@ -86,15 +97,6 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
   }, [pageIndex, pageSize])
 
   const items: SkippedItem[] = useMemo(() => page?.items ?? [], [page])
-
-  const goNext = () => {
-    if (page?.has_more && page.next_cursor) setCursorStack((s) => [...s, page.next_cursor!])
-  }
-  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
-  const changePageSize = (n: number) => {
-    setPageSize(n)
-    setCursorStack([null])
-  }
 
   // 按原因汇总（基于已加载条目；全量总数见快照的 skipped_count）
   const byReason = useMemo(() => {
@@ -203,8 +205,9 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
           canPrev={pageIndex > 0}
           onPrev={goPrev}
           canNext={page?.has_more ?? false}
-          onNext={goNext}
-          hint={`第 ${pageIndex + 1} 页 · 本页 ${items.length} 条`}
+          onNext={() => goNext(page?.next_cursor)}
+          disabled={restoring}
+          hint={restoring ? '正在恢复页码…' : `第 ${pageIndex + 1} 页 · 本页 ${items.length} 条`}
         />
       </Card>
     </div>

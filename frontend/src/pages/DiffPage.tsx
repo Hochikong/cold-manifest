@@ -33,6 +33,8 @@ import {
 } from '@ant-design/icons'
 import ReactECharts from 'echarts-for-react'
 import { useSnapshots, useDiffs, useDiff, useDiffSummary, useDiffEntries, useCreateDiff, useDeleteDiff } from '../api/hooks'
+import { listDiffEntries, listDiffs } from '../api/client'
+import { useCursorPaging } from '../hooks/useCursorPaging'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
 import ResizableTable from '../components/ResizableTable'
@@ -123,19 +125,25 @@ function DiffSelector() {
   const navigate = useNavigate()
 
   // 历史对比列表：cursor 栈分页（上一页 = 栈内回退，下一页 = next_cursor 入栈）
-  const [historySize, setHistorySize] = useState(20)
-  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
-  const historyIndex = cursorStack.length - 1
+  // 行数按表持久化（cldm_pagesize:diff-history）、当前页写进 URL ?page=
+  const {
+    pageSize: historySize,
+    changePageSize: changeHistorySize,
+    cursorStack: historyCursorStack,
+    pageIndex: historyIndex,
+    goNext: goHistoryNext,
+    goPrev: goHistoryPrev,
+    restoring: historyRestoring,
+  } = useCursorPaging({
+    tableId: 'diff-history',
+    defaultPageSize: 20,
+    fetchPage: (limit, cursor) => listDiffs({ limit, cursor }),
+  })
   const { data: historyPage, isLoading: diffLoading, error: diffError } = useDiffs({
     limit: historySize,
-    cursor: cursorStack[historyIndex] ?? undefined,
+    cursor: historyCursorStack[historyIndex] ?? undefined,
   })
   const historyItems = historyPage?.items ?? []
-
-  const changeHistorySize = (n: number) => {
-    setHistorySize(n)
-    setCursorStack([null])
-  }
 
   const confirmDeleteDiff = (record: DiffRun) => {
     modal.confirm({
@@ -391,14 +399,11 @@ function DiffSelector() {
               pageSize={historySize}
               onPageSizeChange={changeHistorySize}
               canPrev={historyIndex > 0}
-              onPrev={() => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))}
+              onPrev={goHistoryPrev}
               canNext={historyPage?.has_more ?? false}
-              onNext={() => {
-                if (historyPage?.next_cursor) {
-                  setCursorStack((s) => [...s, historyPage.next_cursor!])
-                }
-              }}
-              hint={`第 ${historyIndex + 1} 页 · 本页 ${historyItems.length} 条`}
+              onNext={() => goHistoryNext(historyPage?.next_cursor)}
+              disabled={historyRestoring}
+              hint={historyRestoring ? '正在恢复页码…' : `第 ${historyIndex + 1} 页 · 本页 ${historyItems.length} 条`}
             />
           </>
         ) : (
@@ -620,18 +625,35 @@ function DiffEntriesTable({
   aLabel: string
   bLabel: string
 }) {
-  const [pageSize, setPageSize] = useState(50)
-  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
-  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  // cursor 栈分页（共享 hook）：行数按 cldm_pagesize:diff-entries 持久化、当前页写进 URL ?page=
+  const {
+    pageSize,
+    changePageSize,
+    cursor,
+    pageIndex,
+    goNext,
+    goPrev,
+    resetPage,
+    restoring,
+  } = useCursorPaging({
+    tableId: 'diff-entries',
+    defaultPageSize: 50,
+    fetchPage: (limit, cur) =>
+      listDiffEntries(diffId, {
+        category,
+        path_prefix: trimmedPrefix || undefined,
+        limit,
+        sort,
+        order,
+        cursor: cur,
+      }),
+  })
   const [sort, setSort] = useState<DiffSortKey>('path')
   const [order, setOrder] = useState<'asc' | 'desc'>('asc')
   const rowMenu = useRowContextMenu()
   const prefixTimer = useRef<number | null>(null)
   const tableTopRef = useRef<HTMLDivElement | null>(null)
   const mountedRef = useRef(false)
-
-  const pageIndex = cursorStack.length - 1
-  const cursor = cursorStack[pageIndex]
 
   // 输入框本地值；URL 外部变化（回退/前进/清空标签）时在渲染期同步回输入框。
   // 防抖写在 onChange 里，400ms 后写回 URL。
@@ -655,7 +677,7 @@ function DiffEntriesTable({
     limit: pageSize,
     sort,
     order,
-    cursor: cursor ?? undefined,
+    cursor,
   })
   const items = data?.items ?? []
 
@@ -664,7 +686,7 @@ function DiffEntriesTable({
   const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
   if (filterKey !== syncedFilterKey) {
     setSyncedFilterKey(filterKey)
-    setCursorStack([null])
+    resetPage()
   }
 
   // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
@@ -675,16 +697,6 @@ function DiffEntriesTable({
     }
     tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
   }, [pageIndex, pageSize])
-
-  const goNext = () => {
-    const nc = data?.next_cursor
-    if (data?.has_more && nc) setCursorStack((s) => [...s, nc])
-  }
-  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
-  const changePageSize = (n: number) => {
-    setPageSize(n)
-    setCursorStack([null])
-  }
 
   const onTableChange: TableProps<DiffEntry>['onChange'] = (_pagination, _filters, sorter) => {
     const s = Array.isArray(sorter) ? sorter[0] : sorter
@@ -825,8 +837,9 @@ function DiffEntriesTable({
         canPrev={pageIndex > 0}
         onPrev={goPrev}
         canNext={data?.has_more ?? false}
-        onNext={goNext}
-        hint={`第 ${pageIndex + 1} 页 · 本页 ${items.length} 条`}
+        onNext={() => goNext(data?.next_cursor)}
+        disabled={restoring}
+        hint={restoring ? '正在恢复页码…' : `第 ${pageIndex + 1} 页 · 本页 ${items.length} 条`}
       />
       {rowMenu.element}
     </div>

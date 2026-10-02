@@ -11,9 +11,9 @@ import { useShowApiError } from '../utils/apiError'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatDateTime } from '../utils/format'
 import ResizableTable from '../components/ResizableTable'
+import { useCursorPaging } from '../hooks/useCursorPaging'
 
 const { Text } = Typography
-const DEFAULT_PAGE_SIZE = 20
 
 /** 后端 GET /api/tasks?status= 只接受单个状态（且不含 cancelling）；多选由前端并行请求合并。 */
 const FILTERABLE_STATUSES: TaskStatus[] = ['pending', 'running', 'done', 'error', 'cancelled']
@@ -64,10 +64,21 @@ export default function TasksPage() {
   const multiMode = statusFilter.length >= 2
 
   // cursor 栈分页：单状态栈存 cursor（null=第一页），多状态栈存各状态的 cursor map
-  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
-  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  // 共享 hook：行数按 cldm_pagesize:tasks 持久化、当前页写进 URL ?page=（仅单状态模式）
+  const {
+    pageSize,
+    changePageSize: changePageSizeBase,
+    cursorStack,
+    pageIndex,
+    goNext: goNextSingle,
+    goPrev: goPrevSingle,
+    resetPage,
+    restoring,
+  } = useCursorPaging({
+    tableId: 'tasks',
+    fetchPage: (limit, cur) => listTasks({ limit, status: statusFilter[0], cursor: cur }),
+  })
   const [multiMaps, setMultiMaps] = useState<Record<string, string | undefined>[]>([{}])
-  const pageIndex = cursorStack.length - 1
   const multiIndex = multiMaps.length - 1
   const tableTopRef = useRef<HTMLDivElement | null>(null)
   const mountedRef = useRef(false)
@@ -94,7 +105,7 @@ export default function TasksPage() {
   const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
   if (filterKey !== syncedFilterKey) {
     setSyncedFilterKey(filterKey)
-    setCursorStack([null])
+    resetPage()
     setMultiMaps([{}])
     setMultiItems([])
     setMultiCursors({})
@@ -166,16 +177,15 @@ export default function TasksPage() {
       }
       if (any) setMultiMaps((maps) => [...maps, next])
     } else if (data?.has_more && data.next_cursor) {
-      setCursorStack((s) => [...s, data.next_cursor!])
+      goNextSingle(data.next_cursor)
     }
   }
   const goPrev = () => {
     if (multiMode) setMultiMaps((maps) => (maps.length > 1 ? maps.slice(0, -1) : maps))
-    else setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
+    else goPrevSingle()
   }
   const changePageSize = (n: number) => {
-    setPageSize(n)
-    setCursorStack([null])
+    changePageSizeBase(n)
     setMultiMaps([{}])
     setMultiItems([])
     setMultiCursors({})
@@ -390,7 +400,8 @@ export default function TasksPage() {
               onPrev={goPrev}
               canNext={canNext}
               onNext={goNext}
-              hint={`第 ${(multiMode ? multiIndex : pageIndex) + 1} 页 · 本页 ${visibleItems.length} 条`}
+              disabled={restoring}
+              hint={restoring ? '正在恢复页码…' : `第 ${(multiMode ? multiIndex : pageIndex) + 1} 页 · 本页 ${visibleItems.length} 条`}
             />
           )}
         </>
