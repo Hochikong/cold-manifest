@@ -248,3 +248,7 @@ frontend/dist/
 # Windows 运行包
 .venv-win/
 dist-packages/
+
+# 根目录临时截图/页面存档（工具与 agent 验收产物，勿提交）
+/*.png
+/*.mhtml
