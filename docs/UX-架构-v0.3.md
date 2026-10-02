@@ -880,6 +880,7 @@
 - 星标置顶 + 「只看置顶」开关 + 按卷筛选 —— `PATCH /api/snapshots/{id}`（pinned）+ 前端过滤
 - 备注编辑 —— `PATCH /api/snapshots/{id}`（notes）
 - 查看快照详情 —— 跳转 `?snapshot=<id>&tab=overview`
+- 已删除快照的空态兜底：直接访问 `?snapshot=<已删id>`（任务页、通知中心等入口的跳转都落到这里）显示可读空态「该快照已删除或不存在」+ 返回列表
 - 删除快照 —— `DELETE /api/snapshots/{id}`，支持 `on_disk=keep|delete`、`force=true`；409 阻塞时展示关联 diff/任务并需勾选确认
 
 **快照详情态（Tabs）**
@@ -951,6 +952,8 @@
 
 - 任务列表（id、类型、状态、批次、进度、创建/结束时间、操作、结果），支持**状态筛选**与**类型筛选** —— `GET /api/tasks`
 - 取消待处理/运行中任务 —— `POST /api/tasks/{id}/cancel`
+- 删除任务记录（仅终态行有删除按钮，二次确认；运行中/排队行禁用 + Tooltip）—— `DELETE /api/tasks/{id}`（只删登记行，不影响快照/对比数据）
+- 结果列「查看快照」跳转兜底：快照已被删除时显示「快照已删除」标签并禁用跳转
 - 任务列表（统一分页控件：行数切换 + 上/下一页）
 - 批次详情抽屉：状态、根路径、计划卷、子任务进度 —— `GET /api/batches/{id}` + `GET /api/tasks?batch_id=...`
 

@@ -34,6 +34,7 @@ verify-copy       校验盘上副本（--sample --full）
 build-fts         补建 FTS 全文索引
 build-stats       补建统计预计算
 delete            删除快照（--on-disk keep|delete --force）
+task-delete       删除任务记录（仅终态任务；只删登记行，不影响快照/对比数据）
 nickname          设置/清除磁盘或分区昵称（nickname disk|volume <id> [名字]）
 integrity-check   快照库完整性自查（只读 PRAGMA quick_check；退出码 0 正常 / 1 损坏）
 rebuild-catalog   重建 catalog（--dry-run 预演）
@@ -77,6 +78,8 @@ POST /api/diffs                            # 发起对比（口径开关；结�
 GET  /api/diffs?limit=&cursor=             # 对比历史（keyset 游标，limit 1..200 默认 50，含昵称标签 labels）
 GET  /api/snapshots/{sid}/duplicates       # 查重三档
 POST /api/snapshots/{sid}/hash             # 按需哈希任务
+POST /api/tasks/{id}/cancel                # 取消任务
+DELETE /api/tasks/{id}                     # 删除任务记录（仅终态任务，只删登记行不影响数据）
 PATCH /api/disks/{disk_id}                 # 磁盘昵称（{"nickname": "..."}，空串/null 清除）
 PATCH /api/volumes/{volume_id}             # 分区昵称（同上）
 POST /api/disks/{disk_id}/smart/read       # 现场读一次 SMART（诊断，不写历史）
