@@ -175,6 +175,20 @@ class SnapshotDeleteBlocked(Exception):
         self.tasks = tasks or []
 
 
+class ObjectDeleteBlocked(Exception):
+    """删除磁盘/卷被阻塞：其下仍存在快照（路由层转 409，不允许级联删快照）。
+
+    snapshots：阻塞来源的 snapshot_id 列表；
+    diffs：引用这些快照的 diff_id 列表（供指引，不阻塞判断本身）。
+    """
+
+    def __init__(self, message: str, *, snapshots: "list[str] | None" = None,
+                 diffs: "list[str] | None" = None) -> None:
+        super().__init__(message)
+        self.snapshots = snapshots or []
+        self.diffs = diffs or []
+
+
 def _dir_size(path: Path) -> int:
     """递归求目录字节占用（删除前统计 freed_bytes 用；异常按 0 计）。"""
     total = 0
@@ -314,6 +328,120 @@ def delete_snapshot(conn: sqlite3.Connection, data_root: "str | Path",
         "diffs_removed": diffs_removed,
         "warnings": warnings,
     }
+
+
+def _blocked_snapshots_and_diffs(conn: sqlite3.Connection,
+                                 volume_ids: "list[str]") -> "tuple[list[str], list[str]]":
+    """列出这些卷下的快照与引用它们的 diff（用于阻塞提示）。"""
+    if not volume_ids:
+        return [], []
+    marks = ",".join("?" * len(volume_ids))
+    snap_rows = conn.execute(
+        f"SELECT snapshot_id FROM snapshots WHERE volume_id IN ({marks})"
+        " ORDER BY snapshot_id", volume_ids).fetchall()
+    snap_ids = [r["snapshot_id"] for r in snap_rows]
+    diff_ids: "list[str]" = []
+    if snap_ids:
+        smarks = ",".join("?" * len(snap_ids))
+        diff_ids = [r["diff_id"] for r in conn.execute(
+            f"SELECT DISTINCT diff_id FROM diff_runs WHERE a IN ({smarks})"
+            f" OR b IN ({smarks}) ORDER BY diff_id", snap_ids + snap_ids)]
+    return snap_ids, diff_ids
+
+
+def _defensive_cleanup(conn: sqlite3.Connection, volume_ids: "list[str]",
+                       disk_id: "str | None" = None) -> None:
+    """防御式清理：on_disk_copies / disk_smart 中指向已不存在快照的残留行。
+
+    正常流程走到删除时快照已清空，这些表应已无对应行；此处兜底清孤儿，
+    不删任何仍被 snapshots 引用的行。
+    """
+    def _like(v: str) -> str:
+        # 转义 LIKE 通配符后接未转义的 '%' 作前缀通配
+        return (v.replace("\\", "\\\\").replace("%", "\\%")
+                 .replace("_", "\\_")) + "%"
+
+    if volume_ids:
+        likes = " OR ".join("snapshot_id LIKE ? ESCAPE '\\'" for _ in volume_ids)
+        params = [_like(v) for v in volume_ids]
+        # 卷前缀匹配 + 不再被 snapshots 引用 = 孤儿残留行
+        conn.execute(
+            f"DELETE FROM on_disk_copies WHERE ({likes}) AND NOT EXISTS ("
+            f"SELECT 1 FROM snapshots s WHERE s.snapshot_id=on_disk_copies.snapshot_id)",
+            params)
+        if disk_id is None:
+            conn.execute(
+                f"DELETE FROM disk_smart WHERE ({likes}) AND NOT EXISTS ("
+                f"SELECT 1 FROM snapshots s WHERE s.snapshot_id=disk_smart.snapshot_id)",
+                params)
+    if disk_id is not None:
+        conn.execute("DELETE FROM disk_smart WHERE disk_id=?", (disk_id,))
+
+
+def delete_volume(conn: sqlite3.Connection, data_root: "str | Path",
+                  volume_id: str) -> dict:
+    """删除卷（catalog 注册行）：其下存在快照 → 抛 ObjectDeleteBlocked。
+
+    - 不允许级联删快照（用户规则：先删快照与比对，再删卷）；
+    - volume_id 非法 → SnapshotDeleteError（路由转 400）；
+    - 卷不存在 → LookupError（路由转 404）；
+    - hash_cache 不动（缓存键与卷无关）。
+
+    返回 {volume_id, deleted_snapshots: 0}。
+    """
+    del data_root  # 预留：未来卷级残留目录清理；当前 catalog 行删除不需要
+    from .import_legacy import LegacyImportError
+    try:
+        validate_volume_id(volume_id)
+    except LegacyImportError as e:
+        raise SnapshotDeleteError(str(e)) from None
+
+    if conn.execute("SELECT 1 FROM volumes WHERE volume_id=?",
+                    (volume_id,)).fetchone() is None:
+        raise LookupError(f"卷不存在：{volume_id}")
+
+    snap_ids, diff_ids = _blocked_snapshots_and_diffs(conn, [volume_id])
+    if snap_ids:
+        msg = (f"卷 {volume_id} 下仍有 {len(snap_ids)} 个快照："
+               f"{', '.join(snap_ids)}；请先删除这些快照与相关对比，再删除卷")
+        raise ObjectDeleteBlocked(msg, snapshots=snap_ids, diffs=diff_ids)
+
+    _defensive_cleanup(conn, [volume_id])
+    conn.execute("DELETE FROM volumes WHERE volume_id=?", (volume_id,))
+    conn.commit()
+    return {"volume_id": volume_id, "deleted_snapshots": 0}
+
+
+def delete_disk(conn: sqlite3.Connection, data_root: "str | Path",
+                disk_id: str) -> dict:
+    """删除磁盘及其全部卷行：任一卷下存在快照 → 抛 ObjectDeleteBlocked。
+
+    - 不允许级联删快照（用户规则：先删快照与比对，再删盘）；
+    - 盘不存在 → LookupError（路由转 404）；
+    - hash_cache 不动（缓存键与盘/卷无关）。
+
+    返回 {disk_id, deleted_volumes, deleted_snapshots: 0}。
+    """
+    del data_root  # 预留：未来盘级残留目录清理；当前 catalog 行删除不需要
+    if conn.execute("SELECT 1 FROM disks WHERE disk_id=?",
+                    (disk_id,)).fetchone() is None:
+        raise LookupError(f"盘不存在：{disk_id}")
+
+    vol_ids = [r["volume_id"] for r in conn.execute(
+        "SELECT volume_id FROM volumes WHERE disk_id=? ORDER BY volume_id",
+        (disk_id,))]
+    snap_ids, diff_ids = _blocked_snapshots_and_diffs(conn, vol_ids)
+    if snap_ids:
+        msg = (f"盘 {disk_id}（含其卷）下仍有 {len(snap_ids)} 个快照："
+               f"{', '.join(snap_ids)}；请先删除这些快照与相关对比，再删除磁盘")
+        raise ObjectDeleteBlocked(msg, snapshots=snap_ids, diffs=diff_ids)
+
+    _defensive_cleanup(conn, vol_ids, disk_id=disk_id)
+    conn.execute("DELETE FROM volumes WHERE disk_id=?", (disk_id,))
+    conn.execute("DELETE FROM disks WHERE disk_id=?", (disk_id,))
+    conn.commit()
+    return {"disk_id": disk_id, "deleted_volumes": len(vol_ids),
+            "deleted_snapshots": 0}
 
 
 def _read_snapshot_meta_scan_root(data_root: Path, snapshot_id: str) -> "str | None":

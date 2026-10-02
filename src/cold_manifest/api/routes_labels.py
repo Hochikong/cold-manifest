@@ -65,3 +65,59 @@ def set_volume_nickname(volume_id: str, body: NicknameBody, request: Request) ->
         "UPDATE volumes SET nickname=? WHERE volume_id=?", (nickname, volume_id))
     state.catalog.commit()
     return {"volume_id": volume_id, "nickname": nickname}
+
+
+# ---------------------------------------------------------------- 删除（不允许级联删快照）
+
+
+@router.delete("/disks/{disk_id}")
+def delete_disk(disk_id: str, request: Request) -> dict:
+    """删除磁盘（连同其全部卷行）；其下存在快照 → 409，不允许级联删快照。
+
+    404=盘不存在；409={message, snapshots, diffs}，message 给可执行指引。
+    """
+    from ..catalog import ObjectDeleteBlocked, delete_disk as _delete_disk
+
+    state = get_state(request)
+    try:
+        result = _delete_disk(state.catalog, state.data_root, disk_id)
+    except LookupError as e:
+        state.catalog.rollback()
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except ObjectDeleteBlocked as e:
+        state.catalog.rollback()
+        raise HTTPException(status_code=409, detail={
+            "message": str(e), "snapshots": e.snapshots, "diffs": e.diffs,
+        }) from None
+    return result
+
+
+@router.delete("/volumes/{volume_id}")
+def delete_volume(volume_id: str, request: Request) -> dict:
+    """删除卷；其下存在快照 → 409，不允许级联删快照。
+
+    400=volume_id 非法；404=卷不存在；409={message, snapshots, diffs}。
+    """
+    from ..catalog import (ObjectDeleteBlocked, SnapshotDeleteError,
+                           delete_volume as _delete_volume)
+    from ..import_legacy import LegacyImportError
+
+    state = get_state(request)
+    try:
+        validate_volume_id(volume_id)
+    except LegacyImportError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    try:
+        result = _delete_volume(state.catalog, state.data_root, volume_id)
+    except LookupError as e:
+        state.catalog.rollback()
+        raise HTTPException(status_code=404, detail=str(e)) from None
+    except SnapshotDeleteError as e:
+        state.catalog.rollback()
+        raise HTTPException(status_code=400, detail=str(e)) from None
+    except ObjectDeleteBlocked as e:
+        state.catalog.rollback()
+        raise HTTPException(status_code=409, detail={
+            "message": str(e), "snapshots": e.snapshots, "diffs": e.diffs,
+        }) from None
+    return result
