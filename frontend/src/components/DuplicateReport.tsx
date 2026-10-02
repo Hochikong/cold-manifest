@@ -25,6 +25,7 @@ import {
 } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import ErrorAlert from './ErrorAlert'
+import CursorPager from './CursorPager'
 import ResizableTable from './ResizableTable'
 import EllipsisText from './EllipsisText'
 import { useRowContextMenu } from '../hooks/useRowContextMenu'
@@ -48,7 +49,7 @@ const MIN_SIZE_OPTIONS = [
   { label: '100 MiB', value: 100 * 1024 * 1024 },
 ]
 
-const PAGE_SIZE = 100
+const DEFAULT_PAGE_SIZE = 50
 
 const MODE_OPTIONS: { value: DuplicateMode; label: string }[] = [
   { value: 'content', label: '按内容（严谨）' },
@@ -111,13 +112,12 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
 
   const [userMode, setUserMode] = useState<DuplicateMode | null>(null)
   const [minSize, setMinSize] = useState<number>(1024 * 1024)
-  // 「加载更多」追加页：keyed 到当前请求签名，切档/改门槛自动失效
-  const [extra, setExtra] = useState<{ key: string; items: DuplicateItem[]; cursor: string | null }>({
-    key: '',
-    items: [],
-    cursor: null,
-  })
-  const [loadingMore, setLoadingMore] = useState(false)
+  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  const pageIndex = cursorStack.length - 1
+  const tableTopRef = useRef<HTMLDivElement | null>(null)
+  const mountedRef = useRef(false)
 
   // 可用档位以快照库 meta.hash_policy 为准（哈希任务完成后会更新）。
   const hashPolicy = snapshot?.meta?.hash_policy ?? snapshot?.hash_policy ?? 'none'
@@ -138,19 +138,45 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
   const ready = snapshot != null
 
   const duplicatesQuery = useQuery({
-    queryKey: ['duplicates', snapshotId, mode, minSize],
-    queryFn: () => getDuplicates(snapshotId, { mode, min_size: minSize, limit: PAGE_SIZE }),
+    queryKey: ['duplicates', snapshotId, mode, minSize, pageSize, cursorStack[pageIndex]],
+    queryFn: () =>
+      getDuplicates(snapshotId, {
+        mode,
+        min_size: minSize,
+        limit: pageSize,
+        cursor: cursorStack[pageIndex] ?? undefined,
+      }),
     enabled: ready && availability[mode],
     staleTime: 30_000,
   })
   const page = duplicatesQuery.data ?? null
-  const requestKey = `${snapshotId}|${mode}|${minSize}`
-  const extraMatches = extra.key === requestKey
-  const allItems = useMemo(
-    () => (extraMatches ? [...(page?.items ?? []), ...extra.items] : (page?.items ?? [])),
-    [extraMatches, page, extra]
-  )
-  const cursor = extraMatches ? extra.cursor : (page?.next_cursor ?? null)
+  const items = useMemo(() => page?.items ?? [], [page])
+
+  // 快照 / 档位 / 门槛变化 → 重置回第一页（渲染期同步，避免 effect 级联）
+  const filterKey = `${snapshotId}|${mode}|${minSize}`
+  const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
+  if (filterKey !== syncedFilterKey) {
+    setSyncedFilterKey(filterKey)
+    setCursorStack([null])
+  }
+
+  // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
+    }
+    tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [pageIndex, pageSize])
+
+  const goNext = () => {
+    if (page?.has_more && page.next_cursor) setCursorStack((s) => [...s, page.next_cursor!])
+  }
+  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
+  const changePageSize = (n: number) => {
+    setPageSize(n)
+    setCursorStack([null])
+  }
 
   // 后端仍判档位不可用（meta 陈旧等）：不整页报错，降级为引导面板。
   const policyBlocked = !!duplicatesQuery.error && isPolicyError(duplicatesQuery.error)
@@ -186,29 +212,6 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
       qc.invalidateQueries({ queryKey: ['duplicates', snapshotId] })
     }
   }, [activeHashTask, qc, snapshotId])
-
-  const loadMore = async () => {
-    if (!cursor || loadingMore || duplicatesQuery.isFetching) return
-    setLoadingMore(true)
-    try {
-      const res = await getDuplicates(snapshotId, {
-        mode,
-        min_size: minSize,
-        limit: PAGE_SIZE,
-        cursor,
-      })
-      setExtra({
-        key: requestKey,
-        items: [...(extraMatches ? extra.items : []), ...res.items],
-        cursor: res.next_cursor,
-      })
-    } catch (e) {
-      const detail = (e as { response?: { data?: { detail?: string } } }).response?.data?.detail
-      message.error(detail || '加载更多失败，请重试')
-    } finally {
-      setLoadingMore(false)
-    }
-  }
 
   const hashMutation = useMutation({
     mutationFn: () =>
@@ -261,8 +264,8 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
   const confidence = CONFIDENCE[mode]
   const isNameMode = mode === 'name'
   const fetchingDuplicates = duplicatesQuery.isFetching
-  const showSkeleton = fetchingDuplicates && allItems.length === 0 && !policyBlocked
-  const nameLoadedBytes = allItems.reduce((acc, it) => acc + (it.size_bytes || 0), 0)
+  const showSkeleton = fetchingDuplicates && items.length === 0 && !policyBlocked
+  const nameLoadedBytes = items.reduce((acc, it) => acc + (it.size_bytes || 0), 0)
 
   return (
     <div>
@@ -409,7 +412,7 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
               <Card size="small">
                 {isNameMode ? (
                   <Statistic
-                    title="同名文件总大小（已加载）"
+                    title="同名文件总大小（本页）"
                     value={formatFileSize(nameLoadedBytes)}
                   />
                 ) : (
@@ -434,15 +437,16 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
           <Card size="small">
             {showSkeleton ? (
               <Skeleton active paragraph={{ rows: 6 }} />
-            ) : allItems.length ? (
+            ) : items.length ? (
               <>
+                <div ref={tableTopRef} />
                 <ResizableTable<DuplicateItem>
                   tableId="duplicates"
                   rowKey={(r) => r.hash_hex ?? r.name ?? String(r.size_bytes)}
                   size="small"
                   tableLayout="fixed"
                   pagination={false}
-                  loading={fetchingDuplicates || loadingMore}
+                  loading={fetchingDuplicates}
                   scroll={{ x: 'max-content' }}
                   expandable={{
                     expandedRowRender: (record) => (
@@ -552,15 +556,17 @@ export default function DuplicateReport({ snapshotId }: { snapshotId: string }) 
                       },
                     },
                   ]}
-                  dataSource={allItems}
+                  dataSource={items}
                 />
-                {cursor && (
-                  <div style={{ textAlign: 'center', marginTop: 16 }}>
-                    <Button loading={loadingMore || fetchingDuplicates} onClick={loadMore}>
-                      加载更多
-                    </Button>
-                  </div>
-                )}
+                <CursorPager
+                  pageSize={pageSize}
+                  onPageSizeChange={changePageSize}
+                  canPrev={pageIndex > 0}
+                  onPrev={goPrev}
+                  canNext={page?.has_more ?? false}
+                  onNext={goNext}
+                  hint={`第 ${pageIndex + 1} 页 · 本页 ${items.length} 组`}
+                />
               </>
             ) : (
               <Empty

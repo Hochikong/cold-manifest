@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import {
   Alert,
@@ -10,20 +10,20 @@ import {
   Space,
   Spin,
   Typography,
-  Button,
 } from 'antd'
 import type { TableProps } from 'antd'
 import { FileOutlined, FolderOutlined, SearchOutlined } from '@ant-design/icons'
 import { useGlobalSearch, useSnapshots, useVolumes } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
+import CursorPager from '../components/CursorPager'
 import ResizableTable from '../components/ResizableTable'
 import { useRowContextMenu } from '../hooks/useRowContextMenu'
 import { formatDateTime, formatFileSize, formatNumber, nsToDate } from '../utils/format'
 import { dirNameOf, snapshotBrowseUrl } from '../utils/path'
-import { globalSearch, type GlobalSearchItem, type GlobalSearchParams } from '../api/client'
+import { type GlobalSearchItem, type GlobalSearchParams } from '../api/client'
 
 const { Title, Text } = Typography
-const PAGE_SIZE = 50
+const DEFAULT_PAGE_SIZE = 50
 const MIN_CHARS = 2
 
 type SearchMode = 'prefix' | 'fulltext'
@@ -66,42 +66,55 @@ export default function SearchPage() {
     setParam('q', q)
   }
 
+  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  const pageIndex = cursorStack.length - 1
+  const tableTopRef = useRef<HTMLDivElement | null>(null)
+  const mountedRef = useRef(false)
+
   const params: GlobalSearchParams = useMemo(
-    () => ({ q: qParam, mode, limit: PAGE_SIZE, volume_id: volumeId, snapshot_id: snapshotId, type }),
-    [qParam, mode, volumeId, snapshotId, type],
+    () => ({
+      q: qParam,
+      mode,
+      limit: pageSize,
+      volume_id: volumeId,
+      snapshot_id: snapshotId,
+      type,
+      cursor: cursorStack[pageIndex] ?? undefined,
+    }),
+    [qParam, mode, pageSize, volumeId, snapshotId, type, pageIndex, cursorStack],
   )
   const active = qParam.trim().length >= MIN_CHARS
   const { data, isFetching, error } = useGlobalSearch(params, active)
 
-  // 「加载更多」追加页：keyed 到请求签名，筛选变化自动失效（与 DuplicateReport 同一套路）
-  const requestKey = `${qParam}|${mode}|${volumeId ?? ''}|${snapshotId ?? ''}|${type ?? ''}`
-  const [extra, setExtra] = useState<{ key: string; items: GlobalSearchItem[]; cursor: string | null }>({
-    key: '',
-    items: [],
-    cursor: null,
-  })
-  const extraMatches = extra.key === requestKey
-  const [loadMorePending, setLoadMorePending] = useState(false)
-  const items = useMemo(
-    () => (extraMatches ? [...(data?.items ?? []), ...extra.items] : (data?.items ?? [])),
-    [extraMatches, data, extra],
-  )
-  const cursor = extraMatches ? extra.cursor : (data?.next_cursor ?? null)
+  // 筛选条件变化 → 重置回第一页（渲染期同步，避免 effect 级联）
+  const filterKey = `${qParam}|${mode}|${volumeId ?? ''}|${snapshotId ?? ''}|${type ?? ''}`
+  const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
+  if (filterKey !== syncedFilterKey) {
+    setSyncedFilterKey(filterKey)
+    setCursorStack([null])
+  }
+
+  const items = useMemo(() => data?.items ?? [], [data])
   const scanned = data?.scanned ?? null
 
-  const loadMore = async () => {
-    if (!cursor) return
-    setLoadMorePending(true)
-    try {
-      const res = await globalSearch({ ...params, cursor })
-      setExtra({
-        key: requestKey,
-        items: [...(extraMatches ? extra.items : []), ...res.items],
-        cursor: res.next_cursor,
-      })
-    } finally {
-      setLoadMorePending(false)
+  // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
     }
+    tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [pageIndex, pageSize])
+
+  const goNext = () => {
+    if (data?.has_more && data.next_cursor) setCursorStack((s) => [...s, data.next_cursor!])
+  }
+  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
+  const changePageSize = (n: number) => {
+    setPageSize(n)
+    setCursorStack([null])
   }
 
   const { data: volumes } = useVolumes()
@@ -243,9 +256,10 @@ export default function SearchPage() {
         <Spin style={{ display: 'block', margin: '48px auto' }} />
       ) : items.length ? (
         <Card
-          title={`搜索结果（已加载 ${formatNumber(items.length)} 条）`}
+          title="搜索结果"
           extra={scanned && <Text type="secondary">已搜 {formatNumber(scanned.snapshots)} 个快照</Text>}
         >
+          <div ref={tableTopRef} />
           <ResizableTable<GlobalSearchItem>
             tableId="search"
             rowKey={(r) => `${r.snapshot_id}:${r.entry_id}`}
@@ -262,20 +276,15 @@ export default function SearchPage() {
               style: { cursor: 'pointer' },
             })}
           />
-          {cursor && (
-            <div style={{ textAlign: 'center', marginTop: 16 }}>
-              <Space>
-                {scanned && (
-                  <Text type="secondary" style={{ fontSize: 12 }}>
-                    已搜 {formatNumber(scanned.snapshots)} 个快照
-                  </Text>
-                )}
-                <Spin spinning={loadMorePending || isFetching}>
-                  <Button onClick={() => void loadMore()}>加载更多</Button>
-                </Spin>
-              </Space>
-            </div>
-          )}
+          <CursorPager
+            pageSize={pageSize}
+            onPageSizeChange={changePageSize}
+            canPrev={pageIndex > 0}
+            onPrev={goPrev}
+            canNext={data?.has_more ?? false}
+            onNext={goNext}
+            hint={`第 ${pageIndex + 1} 页 · 本页 ${items.length} 条`}
+          />
         </Card>
       ) : (
         !isFetching && (

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Button,
   Card,
@@ -11,14 +11,15 @@ import {
 } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
 import ErrorAlert from './ErrorAlert'
+import CursorPager from './CursorPager'
 import ResizableTable from './ResizableTable'
 import { useSkipped, useSnapshot } from '../api/hooks'
 import { formatNumber } from '../utils/format'
-import { getSkipped, type SkippedItem, type SkippedResponse } from '../api/client'
+import type { SkippedItem } from '../api/client'
 
 const { Text } = Typography
 
-const PAGE_SIZE = 200
+const DEFAULT_PAGE_SIZE = 50
 
 /** scanner 产出的全部跳过原因（src/cold_manifest/scanner.py 的 warning_type 常量）。 */
 const WARNING_TYPES = [
@@ -52,56 +53,47 @@ const WARNING_COLOR: Record<string, string> = {
 export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
   const [stage, setStage] = useState<string | undefined>(undefined)
   const [warningType, setWarningType] = useState<string | undefined>(undefined)
-  // 翻页只追加 extraPages（在事件处理器里 setState）；首页由 react-query 管理
-  const [extraPages, setExtraPages] = useState<SkippedResponse[]>([])
-  const [loadingMore, setLoadingMore] = useState(false)
+  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  const pageIndex = cursorStack.length - 1
+  const tableTopRef = useRef<HTMLDivElement | null>(null)
+  const mountedRef = useRef(false)
 
   const { data: snapshot } = useSnapshot(snapshotId)
   const { data: page, isLoading, error } = useSkipped(snapshotId, {
-    limit: PAGE_SIZE,
+    limit: pageSize,
     stage,
     warning_type: warningType,
+    cursor: cursorStack[pageIndex] ?? undefined,
   })
 
-  const changeStage = (v: string | undefined) => {
-    setStage(v)
-    setExtraPages([])
+  // 筛选变化 → 重置回第一页（渲染期同步，避免 effect 级联）
+  const filterKey = `${stage ?? ''}|${warningType ?? ''}`
+  const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
+  if (filterKey !== syncedFilterKey) {
+    setSyncedFilterKey(filterKey)
+    setCursorStack([null])
   }
-  const changeWarningType = (v: string | undefined) => {
-    setWarningType(v)
-    setExtraPages([])
+
+  // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
+    }
+    tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [pageIndex, pageSize])
+
+  const items: SkippedItem[] = useMemo(() => page?.items ?? [], [page])
+
+  const goNext = () => {
+    if (page?.has_more && page.next_cursor) setCursorStack((s) => [...s, page.next_cursor!])
   }
-
-  const items = useMemo(() => {
-    const seen = new Set<string>()
-    const out: SkippedItem[] = []
-    for (const it of [...(page?.items ?? []), ...extraPages.flatMap((p) => p.items)]) {
-      const key = `${it.path}\u0000${it.warning_type}`
-      if (!seen.has(key)) {
-        seen.add(key)
-        out.push(it)
-      }
-    }
-    return out
-  }, [page, extraPages])
-
-  const lastPage = extraPages.length > 0 ? extraPages[extraPages.length - 1] : page
-  const cursor = lastPage?.next_cursor ?? null
-
-  const loadMore = async () => {
-    if (!cursor) return
-    setLoadingMore(true)
-    try {
-      const res = await getSkipped(snapshotId, {
-        cursor,
-        limit: PAGE_SIZE,
-        stage,
-        warning_type: warningType,
-      })
-      setExtraPages((prev) => [...prev, res])
-    } finally {
-      setLoadingMore(false)
-    }
+  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
+  const changePageSize = (n: number) => {
+    setPageSize(n)
+    setCursorStack([null])
   }
 
   // 按原因汇总（基于已加载条目；全量总数见快照的 skipped_count）
@@ -158,15 +150,14 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
                 value={stage}
                 onChange={(v) => setStage(v)}
                 options={[{ value: 'scan', label: 'scan' }]}
-              />
-            </Space>
+              />            </Space>
           </div>
         </Space>
 
         {byReason.length > 0 && (
           <div style={{ marginTop: 16 }}>
             <Text type="secondary" style={{ marginRight: 8 }}>
-              已加载 {formatNumber(items.length)}{!filtered && total > 0 ? ` / ${formatNumber(total)}` : ''} 条，按原因分布：
+              本页 {formatNumber(items.length)}{!filtered && total > 0 ? ` / 全部 ${formatNumber(total)}` : ''} 条，按原因分布：
             </Text>
             {byReason.map(([t, n]) => (
               <Tag key={t} color={WARNING_COLOR[t] ?? 'default'} style={{ marginBottom: 4 }}>
@@ -184,8 +175,8 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
             icon={<ReloadOutlined />}
             size="small"
             onClick={() => {
-              changeStage(undefined)
-              changeWarningType(undefined)
+              setStage(undefined)
+              setWarningType(undefined)
             }}
             disabled={!filtered}
           >
@@ -193,6 +184,7 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
           </Button>
         }
       >
+        <div ref={tableTopRef} />
         <ResizableTable
           tableId="skipped"
           rowKey={(r) => `${r.path}\u0000${r.warning_type}`}
@@ -205,13 +197,15 @@ export default function SkippedPanel({ snapshotId }: { snapshotId: string }) {
           scroll={{ x: 'max-content' }}
           locale={{ emptyText: <Empty description={isLoading ? '加载中…' : '没有跳过项（采集完整）'} /> }}
         />
-        {cursor && (
-          <div style={{ textAlign: 'center', marginTop: 16 }}>
-            <Button loading={loadingMore} onClick={loadMore}>
-              加载更多（已加载 {formatNumber(items.length)} 条）
-            </Button>
-          </div>
-        )}
+        <CursorPager
+          pageSize={pageSize}
+          onPageSizeChange={changePageSize}
+          canPrev={pageIndex > 0}
+          onPrev={goPrev}
+          canNext={page?.has_more ?? false}
+          onNext={goNext}
+          hint={`第 ${pageIndex + 1} 页 · 本页 ${items.length} 条`}
+        />
       </Card>
     </div>
   )

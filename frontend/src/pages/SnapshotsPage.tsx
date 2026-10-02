@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback } from 'react'
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
 import {
@@ -65,6 +65,7 @@ import {
 } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
+import CursorPager from '../components/CursorPager'
 import ResizableTable from '../components/ResizableTable'
 import DuplicateReport from '../components/DuplicateReport'
 import HashPanel from '../components/HashPanel'
@@ -74,7 +75,7 @@ import { VerifyCopyButton, VerifyCopyResultCard } from '../components/VerifyCopy
 import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
 import { formatFileSize, formatDateTime, formatNumber, nsToDate } from '../utils/format'
 import { dirNameOf, joinChildPath } from '../utils/path'
-import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, listEntries, searchEntries, getTree, apiErrorDetail, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport, type Snapshot } from '../api/client'
+import { exportSnapshotUrl, snapshotReportUrl, REPORT_SECTIONS, getTree, apiErrorDetail, type Entry, type TreeDir, type SearchItem, type DeleteSnapshotBlocked, type VerifyCopyReport, type Snapshot } from '../api/client'
 import axios from 'axios'
 
 const { Title, Text } = Typography
@@ -83,8 +84,7 @@ const { Option } = Select
 type SortKey = 'name' | 'size' | 'mtime'
 type Order = 'asc' | 'desc'
 
-const ENTRY_PAGE_SIZE = 200
-const SEARCH_PAGE_SIZE = 200
+const DEFAULT_PAGE_SIZE = 50
 
 function getSnapshotDisplayName(snapshot_id: string) {
   const parts = snapshot_id.split('/')
@@ -843,9 +843,12 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
   const [extApplied, setExtApplied] = useState('')
   const [minSize, setMinSize] = useState<number | undefined>(undefined)
   const [maxSize, setMaxSize] = useState<number | undefined>(undefined)
-  const [allItems, setAllItems] = useState<Entry[]>([])
-  const [cursor, setCursor] = useState<string | null>(null)
-  const [loadingMore, setLoadingMore] = useState(false)
+  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  const pageIndex = cursorStack.length - 1
+  const tableTopRef = useRef<HTMLDivElement | null>(null)
+  const mountedRef = useRef(false)
   const [drawerEntry, setDrawerEntry] = useState<Entry | null>(null)
   const [treeData, setTreeData] = useState<TreeNodeData[]>([])
   const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([])
@@ -896,7 +899,8 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
   const { data: treeRoot, isLoading: treeLoading } = useTree(snapshotId, 0)
   const { data: entriesRes, isLoading: entriesLoading, error: entriesError } = useEntries(snapshotId, {
     parent_id: parentId,
-    limit: ENTRY_PAGE_SIZE,
+    limit: pageSize,
+    cursor: cursorStack[pageIndex] ?? undefined,
     sort,
     order,
     type: typeFilter as any,
@@ -905,6 +909,35 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
     max_size: maxSize,
     q: qApplied || undefined,
   })
+  const entries = entriesRes?.items ?? []
+
+  // 父目录 / 排序 / 筛选变化 → 重置回第一页（渲染期同步，避免 effect 级联）
+  const filterKey = `${parentId}\u0000${sort}\u0000${order}\u0000${typeFilter ?? ''}\u0000${extApplied}\u0000${qApplied}\u0000${minSize ?? ''}\u0000${maxSize ?? ''}`
+  const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
+  if (filterKey !== syncedFilterKey) {
+    setSyncedFilterKey(filterKey)
+    setCursorStack([null])
+  }
+
+  // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
+  useEffect(() => {
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
+    }
+    tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [pageIndex, pageSize])
+
+  const goNext = () => {
+    if (entriesRes?.has_more && entriesRes.next_cursor) {
+      setCursorStack((s) => [...s, entriesRes.next_cursor!])
+    }
+  }
+  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
+  const changePageSize = (n: number) => {
+    setPageSize(n)
+    setCursorStack([null])
+  }
 
   const hasFilters = !!(qApplied || extApplied || minSize != null || maxSize != null || typeFilter)
 
@@ -922,13 +955,6 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
     setMaxSize(undefined)
     setTypeFilter(undefined)
   }
-
-  useEffect(() => {
-    if (entriesRes) {
-      setAllItems(entriesRes.items)
-      setCursor(entriesRes.next_cursor)
-    }
-  }, [entriesRes])
 
   useEffect(() => {
     if (treeRoot?.dirs) {
@@ -950,29 +976,6 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
     const next = new URLSearchParams(searchParams)
     next.set('parent_id', String(info.node.entryId))
     setSearchParams(next, { replace: true })
-  }
-
-  const loadMore = async () => {
-    if (!cursor) return
-    setLoadingMore(true)
-    try {
-      const data = await listEntries(snapshotId, {
-        parent_id: parentId,
-        cursor,
-        limit: ENTRY_PAGE_SIZE,
-        sort,
-        order,
-        type: typeFilter as any,
-        ext: extApplied || undefined,
-        min_size: minSize,
-        max_size: maxSize,
-        q: qApplied || undefined,
-      })
-      setAllItems((prev) => [...prev, ...data.items])
-      setCursor(data.next_cursor)
-    } finally {
-      setLoadingMore(false)
-    }
   }
 
   const onTableChange: TableProps<Entry>['onChange'] = (_pagination, _filters, sorter) => {
@@ -1176,6 +1179,7 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
         </Col>
         <Col xs={24} md={17} lg={19}>
           <Card>
+            <div ref={tableTopRef} />
             <ResizableTable
               tableId="browse-entries"
               rowKey="entry_id"
@@ -1183,7 +1187,7 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
               loading={entriesLoading}
               tableLayout="fixed"
               columns={columns}
-              dataSource={allItems}
+              dataSource={entries}
               pagination={false}
               scroll={{ x: 'max-content' }}
               onChange={onTableChange}
@@ -1192,13 +1196,15 @@ function DirectoryBrowser({ snapshotId }: { snapshotId: string }) {
               })}
               locale={{ emptyText: <Empty description="空目录" /> }}
             />
-            {cursor && (
-              <div style={{ textAlign: 'center', marginTop: 16 }}>
-                <Button loading={loadingMore} onClick={loadMore}>
-                  加载更多（剩余未加载）
-                </Button>
-              </div>
-            )}
+            <CursorPager
+              pageSize={pageSize}
+              onPageSizeChange={changePageSize}
+              canPrev={pageIndex > 0}
+              onPrev={goPrev}
+              canNext={entriesRes?.has_more ?? false}
+              onNext={goNext}
+              hint={`第 ${pageIndex + 1} 页 · 本页 ${entries.length} 条`}
+            />
           </Card>
         </Col>
       </Row>
@@ -1270,9 +1276,12 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   const [ext, setExt] = useState('')
   const [minSize, setMinSize] = useState<number | undefined>(undefined)
   const [maxSize, setMaxSize] = useState<number | undefined>(undefined)
-  const [results, setResults] = useState<SearchItem[]>([])
-  const [cursor, setCursor] = useState<string | null>(null)
-  const [loadingMore, setLoadingMore] = useState(false)
+  // cursor 栈分页：栈底 null = 第一页；上一页弹栈，下一页压入 next_cursor
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  const pageIndex = cursorStack.length - 1
+  const tableTopRef = useRef<HTMLDivElement | null>(null)
+  const mountedRef = useRef(false)
   const [hasSearched, setHasSearched] = useState(false)
   const [fulltextAvailable, setFulltextAvailable] = useState<boolean | null>(null)
 
@@ -1349,20 +1358,36 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
   const { data: searchRes, isLoading, error, refetch } = useSearch(snapshotId, {
     q,
     mode,
-    limit: SEARCH_PAGE_SIZE,
+    limit: pageSize,
+    cursor: cursorStack[pageIndex] ?? undefined,
     type: typeFilter as any,
     ext: ext || undefined,
     min_size: minSize,
     max_size: maxSize,
   })
 
+  // 关键词 / 模式 / 筛选变化 → 重置回第一页（渲染期同步，避免 effect 级联）
+  const filterKey = `${q}\u0000${mode}\u0000${typeFilter ?? ''}\u0000${ext}\u0000${minSize ?? ''}\u0000${maxSize ?? ''}`
+  const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
+  if (filterKey !== syncedFilterKey) {
+    setSyncedFilterKey(filterKey)
+    setCursorStack([null])
+  }
+
+  // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
   useEffect(() => {
-    if (searchRes) {
-      setResults(searchRes.items)
-      setCursor(searchRes.next_cursor)
-      if (typeof searchRes.fulltext_available === 'boolean') {
-        setFulltextAvailable(searchRes.fulltext_available)
-      }
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
+    }
+    tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [pageIndex, pageSize])
+
+  const results = searchRes?.items ?? []
+
+  useEffect(() => {
+    if (searchRes && typeof searchRes.fulltext_available === 'boolean') {
+      setFulltextAvailable(searchRes.fulltext_available)
     }
   }, [searchRes])
 
@@ -1371,25 +1396,15 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
     refetch()
   }
 
-  const loadMore = async () => {
-    if (!cursor) return
-    setLoadingMore(true)
-    try {
-      const data = await searchEntries(snapshotId, {
-        q,
-        mode,
-        cursor,
-        limit: SEARCH_PAGE_SIZE,
-        type: typeFilter as any,
-        ext: ext || undefined,
-        min_size: minSize,
-        max_size: maxSize,
-      })
-      setResults((prev) => [...prev, ...data.items])
-      setCursor(data.next_cursor)
-    } finally {
-      setLoadingMore(false)
+  const goNext = () => {
+    if (searchRes?.has_more && searchRes.next_cursor) {
+      setCursorStack((s) => [...s, searchRes.next_cursor!])
     }
+  }
+  const goPrev = () => setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
+  const changePageSize = (n: number) => {
+    setPageSize(n)
+    setCursorStack([null])
   }
 
   const columns = [
@@ -1506,6 +1521,7 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
         <Card title={`搜索结果（${formatNumber(results.length)} 条）`}>
           {results.length ? (
             <>
+              <div ref={tableTopRef} />
               <ResizableTable
                 tableId="snapshot-search"
                 rowKey="entry_id"
@@ -1519,11 +1535,15 @@ function SearchPanel({ snapshotId }: { snapshotId: string }) {
                   onContextMenu: (e) => rowMenu.open(e, searchTarget(record)),
                 })}
               />
-              {cursor && (
-                <div style={{ textAlign: 'center', marginTop: 16 }}>
-                  <Button loading={loadingMore} onClick={loadMore}>加载更多</Button>
-                </div>
-              )}
+              <CursorPager
+                pageSize={pageSize}
+                onPageSizeChange={changePageSize}
+                canPrev={pageIndex > 0}
+                onPrev={goPrev}
+                canNext={searchRes?.has_more ?? false}
+                onNext={goNext}
+                hint={`第 ${pageIndex + 1} 页 · 本页 ${results.length} 条`}
+              />
             </>
           ) : (
             <Empty description="无结果，尝试放宽条件" />

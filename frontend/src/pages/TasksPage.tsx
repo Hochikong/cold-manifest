@@ -6,13 +6,14 @@ import { useTasks, useCancelTask, useBatch } from '../api/hooks'
 import { listTasks, type Task, type Batch, type TaskStatus } from '../api/client'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
+import CursorPager from '../components/CursorPager'
 import { useShowApiError } from '../utils/apiError'
 import { formatTaskMessage, formatTaskStatus } from '../utils/taskMessage'
 import { formatDateTime } from '../utils/format'
 import ResizableTable from '../components/ResizableTable'
 
 const { Text } = Typography
-const PAGE_SIZE = 20
+const DEFAULT_PAGE_SIZE = 20
 
 /** 后端 GET /api/tasks?status= 只接受单个状态（且不含 cancelling）；多选由前端并行请求合并。 */
 const FILTERABLE_STATUSES: TaskStatus[] = ['pending', 'running', 'done', 'error', 'cancelled']
@@ -56,62 +57,67 @@ interface StatusCursor {
 
 export default function TasksPage() {
   const navigate = useNavigate()
-  const [items, setItems] = useState<Task[]>([])
-  const [cursor, setCursor] = useState<string | null>(null)
-  const [loadingMore, setLoadingMore] = useState(false)
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null)
 
   const [statusFilter, setStatusFilter] = useState<TaskStatus[]>([])
   const [typeFilter, setTypeFilter] = useState<Task['type'] | undefined>(undefined)
   const multiMode = statusFilter.length >= 2
 
-  // 单请求模式（未筛选 / 单状态）：走 useTasks，活跃任务 4s 轮询
-  const { data, isLoading, error: singleError, refetch } = useTasks({ limit: PAGE_SIZE, status: statusFilter[0] }, !multiMode)
+  // cursor 栈分页：单状态栈存 cursor（null=第一页），多状态栈存各状态的 cursor map
+  const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
+  const [cursorStack, setCursorStack] = useState<(string | null)[]>([null])
+  const [multiMaps, setMultiMaps] = useState<Record<string, string | undefined>[]>([{}])
+  const pageIndex = cursorStack.length - 1
+  const multiIndex = multiMaps.length - 1
+  const tableTopRef = useRef<HTMLDivElement | null>(null)
+  const mountedRef = useRef(false)
 
-  // 多状态并行合并
+  // 单请求模式（未筛选 / 单状态）：走 useTasks，活跃任务 4s 轮询
+  const { data, isLoading, error: singleError, refetch } = useTasks(
+    { limit: pageSize, status: statusFilter[0], cursor: cursorStack[pageIndex] ?? undefined },
+    !multiMode,
+  )
+
+  // 多状态并行合并：当前页 items 与各状态的 cursor/hasMore
+  const [multiItems, setMultiItems] = useState<Task[]>([])
   const [multiLoading, setMultiLoading] = useState(false)
   const [multiError, setMultiError] = useState<unknown>(null)
-  const [cursors, setCursors] = useState<Record<string, StatusCursor>>({})
-  const hasPagedRef = useRef(false)
+  const [multiCursors, setMultiCursors] = useState<Record<string, StatusCursor>>({})
   const hasActiveRef = useRef(false)
 
   useEffect(() => {
-    hasActiveRef.current = multiMode && items.some(isActiveStatus)
-  }, [multiMode, items])
+    hasActiveRef.current = multiItems.some(isActiveStatus)
+  }, [multiItems])
 
-  /** 清空累积，从头拉（筛选变化时由 onChange 调用）。 */
-  const resetPaging = useCallback(() => {
-    setItems([])
-    setCursor(null)
-    setCursors({})
+  /** 筛选变化 → 重置回第一页（渲染期同步，避免 effect 级联）。 */
+  const filterKey = `${statusFilter.join(',')}|${pageSize}`
+  const [syncedFilterKey, setSyncedFilterKey] = useState(filterKey)
+  if (filterKey !== syncedFilterKey) {
+    setSyncedFilterKey(filterKey)
+    setCursorStack([null])
+    setMultiMaps([{}])
+    setMultiItems([])
+    setMultiCursors({})
     setMultiError(null)
-    hasPagedRef.current = false
-  }, [])
-
-  const applyStatusFilter = (v: TaskStatus[]) => {
-    setStatusFilter(v)
-    resetPaging()
   }
 
-  /** 拉一页（每状态各一页）并按创建时间倒序合并；append=false 时保留旧尾部去重（轮询不丢已加载页）。 */
+  /** 拉一页（每状态各一页）并按创建时间倒序合并去重；轮询复用同一 map 刷新当前页。 */
   const fetchMultiPage = useCallback(
-    async (cursorMap: Record<string, string | undefined>, append: boolean) => {
+    async (map: Record<string, string | undefined>) => {
       setMultiLoading(true)
       try {
         const results = await Promise.all(
           statusFilter.map(async (s) => {
-            const res = await listTasks({ limit: PAGE_SIZE, status: s, cursor: cursorMap[s] })
+            const res = await listTasks({ limit: pageSize, status: s, cursor: map[s] })
             return [s, res] as const
           }),
         )
         const fresh = results.flatMap(([, r]) => r.items)
-        setItems((prev) => {
-          const seen = new Set(fresh.map((t) => t.id))
-          const base = prev.filter((t) => !seen.has(t.id))
-          const merged = append ? [...base, ...fresh] : [...fresh, ...base]
-          return merged.sort(byCreatedDesc)
-        })
-        setCursors(
+        // 各状态各一页，fresh 内部无重复；直接整页替换（轮询/翻页都不残留旧行）
+        const seen = new Set<number | string>()
+        const merged = fresh.filter((t) => (seen.has(t.id) ? false : (seen.add(t.id), true)))
+        setMultiItems(merged.sort(byCreatedDesc))
+        setMultiCursors(
           Object.fromEntries(results.map(([s, r]) => [s, { cursor: r.next_cursor, hasMore: r.has_more }])),
         )
         setMultiError(null)
@@ -121,98 +127,78 @@ export default function TasksPage() {
         setMultiLoading(false)
       }
     },
-    [statusFilter],
+    [statusFilter, pageSize],
   )
 
-  // 多状态模式：首拉（延后一拍，避免 effect 内同步 setState）+ 活跃任务轮询
+  // 多状态模式：map/页码变化时拉取；活跃任务 4s 轮询刷新当前页
   useEffect(() => {
     if (!multiMode) return
     const first = window.setTimeout(() => {
-      void fetchMultiPage({}, false)
+      void fetchMultiPage(multiMaps[multiIndex])
     }, 0)
     const timer = window.setInterval(() => {
-      if (hasActiveRef.current) void fetchMultiPage({}, false)
+      if (hasActiveRef.current) void fetchMultiPage(multiMaps[multiIndex])
     }, 4_000)
     return () => {
       window.clearTimeout(first)
       window.clearInterval(timer)
     }
-  }, [multiMode, fetchMultiPage])
+  }, [multiMode, fetchMultiPage, multiMaps, multiIndex])
 
-  // 单请求模式：合并刷新数据（保留已翻页尾部）
+  // 翻页 / 改行数后滚回表格顶部（首次挂载不滚）
   useEffect(() => {
-    if (multiMode || !data) return
-    if (!hasPagedRef.current) {
-      setItems(data.items)
-      setCursor(data.next_cursor)
-    } else {
-      setItems((prev) => {
-        const seen = new Set(data.items.map((t) => t.id))
-        const tail = prev.filter((t) => !seen.has(t.id))
-        return [...data.items, ...tail]
-      })
+    if (!mountedRef.current) {
+      mountedRef.current = true
+      return
     }
-  }, [data, multiMode])
+    tableTopRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [pageIndex, multiIndex, pageSize])
 
-  const loadMoreSingle = async () => {
-    if (!cursor) return
-    setLoadingMore(true)
-    try {
-      const res = await listTasks({ limit: PAGE_SIZE, cursor, status: statusFilter[0] })
-      hasPagedRef.current = true
-      setItems((prev) => [...prev, ...res.items])
-      setCursor(res.next_cursor)
-    } finally {
-      setLoadingMore(false)
+  const goNext = () => {
+    if (multiMode) {
+      const next: Record<string, string | undefined> = {}
+      let any = false
+      for (const [s, c] of Object.entries(multiCursors)) {
+        if (c.hasMore && c.cursor) {
+          next[s] = c.cursor
+          any = true
+        }
+      }
+      if (any) setMultiMaps((maps) => [...maps, next])
+    } else if (data?.has_more && data.next_cursor) {
+      setCursorStack((s) => [...s, data.next_cursor!])
     }
   }
-
-  const loadMoreMulti = async () => {
-    const next: Record<string, string | undefined> = {}
-    for (const [s, c] of Object.entries(cursors)) {
-      if (c.hasMore && c.cursor) next[s] = c.cursor
-    }
-    if (Object.keys(next).length === 0) return
-    setLoadingMore(true)
-    try {
-      const results = await Promise.all(
-        statusFilter
-          .filter((s) => next[s])
-          .map(async (s) => {
-            const res = await listTasks({ limit: PAGE_SIZE, status: s, cursor: next[s] })
-            return [s, res] as const
-          }),
-      )
-      const fresh = results.flatMap(([, r]) => r.items)
-      setItems((prev) => {
-        const seen = new Set(prev.map((t) => t.id))
-        return [...prev, ...fresh.filter((t) => !seen.has(t.id))].sort(byCreatedDesc)
-      })
-      setCursors((prev) => {
-        const out = { ...prev }
-        for (const [s, r] of results) out[s] = { cursor: r.next_cursor, hasMore: r.has_more }
-        return out
-      })
-      hasPagedRef.current = true
-    } finally {
-      setLoadingMore(false)
-    }
+  const goPrev = () => {
+    if (multiMode) setMultiMaps((maps) => (maps.length > 1 ? maps.slice(0, -1) : maps))
+    else setCursorStack((s) => (s.length > 1 ? s.slice(0, -1) : s))
+  }
+  const changePageSize = (n: number) => {
+    setPageSize(n)
+    setCursorStack([null])
+    setMultiMaps([{}])
+    setMultiItems([])
+    setMultiCursors({})
   }
 
-  const loadMore = () => (multiMode ? loadMoreMulti() : loadMoreSingle())
   const refresh = () => {
-    if (multiMode) void fetchMultiPage({}, false)
+    if (multiMode) void fetchMultiPage(multiMaps[multiIndex])
     else void refetch()
   }
+
+  const items = useMemo(
+    () => (multiMode ? multiItems : (data?.items ?? [])),
+    [multiMode, multiItems, data],
+  )
+  const canNext = multiMode
+    ? Object.values(multiCursors).some((c) => c.hasMore)
+    : (data?.has_more ?? false)
+  const error = multiMode ? multiError : singleError
 
   const visibleItems = useMemo(
     () => (typeFilter ? items.filter((t) => t.type === typeFilter) : items),
     [items, typeFilter],
   )
-  const hasMore = multiMode
-    ? Object.values(cursors).some((c) => c.hasMore)
-    : cursor != null
-  const error = multiMode ? multiError : singleError
 
   const cancelTaskMutation = useCancelTask()
   const showApiError = useShowApiError()
@@ -227,7 +213,7 @@ export default function TasksPage() {
       onOk: async () => {
         try {
           await cancelTaskMutation.mutateAsync(record.id)
-          if (multiMode) void fetchMultiPage({}, false)
+          if (multiMode) void fetchMultiPage(multiMaps[multiIndex])
         } catch (e) {
           // 取消失败（任务已结束/后端拒绝）也要让用户看到原因
           showApiError(e, '取消任务失败')
@@ -356,7 +342,7 @@ export default function TasksPage() {
           placeholder="全部状态"
           style={{ minWidth: 280 }}
           value={statusFilter}
-          onChange={applyStatusFilter}
+          onChange={(v) => setStatusFilter(v)}
           maxTagCount="responsive"
           options={FILTERABLE_STATUSES.map((s) => ({ value: s, label: statusMap[s].label }))}
         />
@@ -385,6 +371,7 @@ export default function TasksPage() {
         <Spin style={{ display: 'block', margin: '32px auto' }} />
       ) : visibleItems.length ? (
         <>
+          <div ref={tableTopRef} />
           <ResizableTable
             tableId="tasks"
             rowKey="id"
@@ -395,12 +382,16 @@ export default function TasksPage() {
             pagination={false}
             scroll={{ x: 'max-content' }}
           />
-          {hasMore && !typeFilter && (
-            <div style={{ textAlign: 'center', marginTop: 16 }}>
-              <Button loading={loadingMore} onClick={loadMore}>
-                加载更多
-              </Button>
-            </div>
+          {!typeFilter && (
+            <CursorPager
+              pageSize={pageSize}
+              onPageSizeChange={changePageSize}
+              canPrev={multiMode ? multiIndex > 0 : pageIndex > 0}
+              onPrev={goPrev}
+              canNext={canNext}
+              onNext={goNext}
+              hint={`第 ${(multiMode ? multiIndex : pageIndex) + 1} 页 · 本页 ${visibleItems.length} 条`}
+            />
           )}
         </>
       ) : (
