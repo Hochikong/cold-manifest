@@ -45,6 +45,26 @@ SMART_KEYS = (
     "form_factor",       # form_factor.name（如 3.5 inches）
 )
 
+# SSD 专属字段的 API 契约键（前端并行开发中，契约冻结；缺项 null/[]）
+SSD_CONTRACT_KEYS = (
+    "life_left_pct",         # 寿命剩余 0-100
+    "percentage_used",       # NVMe 寿命已用 %
+    "available_spare_pct",   # 备用空间 %
+    "written_bytes",         # 累计写入字节
+    "read_bytes",            # 累计读取字节
+    "written_tb",            # 累计写入（TB，人类可读）
+    "read_tb",
+    "media_errors",
+    "unsafe_shutdowns",
+    "power_cycles",
+    "controller_busy_minutes",
+    "temp_sensors",          # [int]
+    "source",                # 'nvme' | 'ata'
+)
+
+# NVMe data unit = 1000 × 512 字节（smartmontools 对 data_units_* 的定义）
+_NVME_UNIT_BYTES = 1000 * 512
+
 _TIMEOUT = 30
 
 # exit_status 位掩码语义（smartctl 文档）：
@@ -82,6 +102,142 @@ def _lo16(v: int | None) -> int | None:
     return None if v is None else v & 0xFFFF
 
 
+def _int_or_none(v: Any) -> "int | None":
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp_life(v: "int | None") -> "int | None":
+    """寿命 0-100 归一；越界/None → None。"""
+    if v is None or not 0 <= v <= 100:
+        return None
+    return v
+
+
+def _ata_attr_entry(sj: dict, attr_id: int) -> "dict | None":
+    table = sj.get("ata_smart_attributes")
+    if not isinstance(table, dict):
+        return None
+    for entry in table.get("table") or []:
+        if isinstance(entry, dict) and entry.get("id") == attr_id:
+            return entry
+    return None
+
+
+def _ata_attr_raw_int(sj: dict, attr_id: int) -> "int | None":
+    """属性 raw 值：优先 raw.string（48-bit 多字十进制串，smartctl 已拼好），
+    回退 raw.value；解析不了 → None。"""
+    entry = _ata_attr_entry(sj, attr_id)
+    if entry is None:
+        return None
+    raw = entry.get("raw") or {}
+    for key in ("string", "value"):
+        v = _int_or_none(str(raw.get(key)).strip() if raw.get(key) is not None else None)
+        if v is not None:
+            return v
+    return None
+
+
+def _lba_to_bytes(v: "int | None") -> "int | None":
+    """Total_LBAs_Read/Written → 字节（×512）。注意部分盘报的是 32MiB 单位，
+    smartmontools 未在 JSON 里标注单位，无法可靠区分——按 LBA 换算是
+    最常见口径，解析不了就 None，绝不猜。"""
+    return None if v is None else v * 512
+
+
+def _parse_ssd_nvme(sj: dict) -> "dict | None":
+    """nvme_smart_health_information_log → SSD 子字典；无该段 → None。"""
+    nvme = sj.get("nvme_smart_health_information_log")
+    if not isinstance(nvme, dict):
+        return None
+    out: dict = {"source": "nvme"}
+    pct_used = _int_or_none(nvme.get("percentage_used"))
+    if pct_used is not None:
+        out["percentage_used"] = pct_used
+        out["life_left_pct"] = _clamp_life(100 - pct_used)
+    for src, dst in (("available_spare", "available_spare_pct"),):
+        v = _int_or_none(nvme.get(src))
+        if v is not None:
+            out[dst] = v
+    out["available_spare_threshold"] = _int_or_none(
+        nvme.get("available_spare_threshold"))
+    for src, dst in (("data_units_read", "read_bytes"),
+                     ("data_units_written", "written_bytes")):
+        units = _int_or_none(nvme.get(src))
+        if units is not None:
+            out[dst] = units * _NVME_UNIT_BYTES
+            out["read_tb" if dst == "read_bytes" else "written_tb"] = \
+                round(out[dst] / 1e12, 2)
+    for key in ("host_reads", "host_writes", "media_errors",
+                "num_err_log_entries", "unsafe_shutdowns", "power_cycles"):
+        out[key] = _int_or_none(nvme.get(key))
+    out["controller_busy_minutes"] = _int_or_none(nvme.get("controller_busy_time"))
+    out["warning_temp_time"] = _int_or_none(nvme.get("warning_temp_time"))
+    out["critical_comp_time"] = _int_or_none(nvme.get("critical_comp_time"))
+    sensors = nvme.get("temperature_sensors")
+    out["temp_sensors"] = [
+        t for t in (_int_or_none(s) for s in sensors or []) if t is not None
+    ] if isinstance(sensors, list) else []
+    return out
+
+
+# ATA 侧 SSD 寿命属性：SSD_Life_Left(231, 255=未知)、
+# Media_Wearout_Indicator(233, 100 起步递减)、Percent_Lifetime_Remain(202)
+_LIFE_ATTRS = (231, 233, 202)
+# 能证明这是 SSD 的 ATA 属性集合
+_SSD_ATTRS = (241, 242, 231, 233, 202, 177)
+
+
+def _parse_ssd_ata(sj: dict) -> "dict | None":
+    """ata_smart_attributes 按 ID 提取 SATA/ATA SSD 字段；无 SSD 属性 → None。"""
+    ids = {i: _ata_attr_raw_int(sj, i) for i in (241, 242, 231, 233, 202, 177)}
+    if all(v is None for v in ids.values()):
+        return None
+    out: dict = {"source": "ata"}
+    for attr, dst in ((241, "written_bytes"), (242, "read_bytes")):
+        b = _lba_to_bytes(ids[attr])
+        if b is not None:
+            out[dst] = b
+            out["written_tb" if dst == "written_bytes" else "read_tb"] = \
+                round(b / 1e12, 2)
+    for attr in _LIFE_ATTRS:
+        life = _clamp_life(ids[attr])
+        if life is not None:
+            out["life_left_pct"] = life
+            break
+    if ids[177] is not None:
+        out["wear_leveling_count"] = ids[177]
+    return out
+
+
+def parse_ssd(sj: dict) -> dict:
+    """smartctl JSON dict → SSD 专属子字典；非 SSD / 读不到 → {}（绝不抛）。"""
+    try:
+        ssd = _parse_ssd_nvme(sj) or _parse_ssd_ata(sj)
+        return ssd or {}
+    except Exception:  # noqa: BLE001 — 诊断路径绝不抛
+        return {}
+
+
+def ssd_contract(ssd: "dict | None") -> dict:
+    """SSD 子字典 → API 契约字段（冻结键集，缺项 null/[]）。"""
+    ssd = ssd or {}
+    out: dict = {k: None for k in SSD_CONTRACT_KEYS}
+    out["temp_sensors"] = []
+    for k in ("life_left_pct", "percentage_used", "available_spare_pct",
+              "written_bytes", "read_bytes", "written_tb", "read_tb",
+              "media_errors", "unsafe_shutdowns", "power_cycles",
+              "controller_busy_minutes"):
+        out[k] = ssd.get(k)
+    ts = ssd.get("temp_sensors")
+    if isinstance(ts, list):
+        out["temp_sensors"] = [t for t in ts if isinstance(t, int)]
+    out["source"] = ssd.get("source")
+    return out
+
+
 def parse_smart(raw: "str | None", exit_status: "int | None" = None) -> dict:
     """smartctl JSON 文本 → 结构化字段。坏 JSON/缺失字段不抛异常。
 
@@ -96,6 +252,7 @@ def parse_smart(raw: "str | None", exit_status: "int | None" = None) -> dict:
     """
     out: dict = {k: None for k in SMART_KEYS}
     out["health"] = "unavailable"
+    out["ssd"] = {}
     if not raw or not isinstance(raw, str):
         return out
     try:
@@ -152,6 +309,7 @@ def parse_smart(raw: "str | None", exit_status: "int | None" = None) -> dict:
         out["rotation_rate"] = None
     ff = sj.get("form_factor")
     out["form_factor"] = ff.get("name") if isinstance(ff, dict) else (ff or None)
+    out["ssd"] = parse_ssd(sj)
     return out
 
 
@@ -695,15 +853,26 @@ def record_smart(conn: sqlite3.Connection, disk_id: str, snapshot_id: str,
     不 commit——由调用方事务统一提交。
     """
     when = collected_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ssd = parsed.get("ssd") or {}
     conn.execute(
         "INSERT OR REPLACE INTO disk_smart(disk_id, snapshot_id, collected_at, health,"
         " temperature_c, power_on_hours, reallocated_ct, pending_ct, start_stop_ct,"
-        " spin_up_ms, device_type, raw_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        " spin_up_ms, device_type, raw_json,"
+        " life_left_pct, percentage_used, available_spare_pct, written_bytes,"
+        " read_bytes, media_errors, unsafe_shutdowns, power_cycles,"
+        " controller_busy_minutes, ssd_json)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (disk_id, snapshot_id, when, parsed.get("health") or "unavailable",
          parsed.get("temperature_c"), parsed.get("power_on_hours"),
          parsed.get("reallocated_ct"), parsed.get("pending_ct"),
          parsed.get("start_stop_ct"), parsed.get("spin_up_ms"),
-         parsed.get("device_type"), raw_json),
+         parsed.get("device_type"), raw_json,
+         ssd.get("life_left_pct"), ssd.get("percentage_used"),
+         ssd.get("available_spare_pct"), ssd.get("written_bytes"),
+         ssd.get("read_bytes"), ssd.get("media_errors"),
+         ssd.get("unsafe_shutdowns"), ssd.get("power_cycles"),
+         ssd.get("controller_busy_minutes"),
+         json.dumps(ssd, ensure_ascii=False) if ssd else None),
     )
 
 

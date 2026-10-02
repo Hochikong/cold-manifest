@@ -95,6 +95,24 @@ def _migrate_catalog(conn: sqlite3.Connection) -> None:
         tcols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if tcols and "nickname" not in tcols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN nickname TEXT")
+
+    # SSD 专属列（P4-②扩展）：disk_smart 补列，幂等
+    sm_cols = {r[1] for r in conn.execute("PRAGMA table_info(disk_smart)")}
+    if sm_cols:
+        for name, decl in (
+            ("life_left_pct", "INTEGER"),
+            ("percentage_used", "INTEGER"),
+            ("available_spare_pct", "INTEGER"),
+            ("written_bytes", "INTEGER"),
+            ("read_bytes", "INTEGER"),
+            ("media_errors", "INTEGER"),
+            ("unsafe_shutdowns", "INTEGER"),
+            ("power_cycles", "INTEGER"),
+            ("controller_busy_minutes", "INTEGER"),
+            ("ssd_json", "TEXT"),
+        ):
+            if name not in sm_cols:
+                conn.execute(f"ALTER TABLE disk_smart ADD COLUMN {name} {decl}")
     conn.commit()
 
 

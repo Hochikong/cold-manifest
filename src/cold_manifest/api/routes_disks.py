@@ -32,6 +32,24 @@ def _latest_catalog_smart(conn: Any, disk_id: str) -> "dict | None":
     return dict(row) if row else None
 
 
+def _ssd_fields(item: Any) -> dict:
+    """SMART 行（catalog 行 / meta 回填项）→ SSD 契约字段。
+
+    catalog 行带 ssd_json 列；meta 回填项已带解析好的 ``ssd`` 子字典。
+    """
+    ssd = None
+    if isinstance(item, dict):
+        ssd = item.get("ssd")
+        if not ssd:
+            raw = item.get("ssd_json")
+            if raw:
+                try:
+                    ssd = json.loads(raw)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    ssd = None
+    return smart.ssd_contract(ssd)
+
+
 def _meta_backfill(state: Any, disk_id: str) -> "list[dict]":
     """读时回填（不写库）：历史表无行但快照库 meta 有 smart_raw_json 的快照，
     现场解析并标 source='meta'。库缺失/解析失败静默跳过。"""
@@ -210,6 +228,7 @@ def disk_detail(disk_id: str, request: Request) -> dict:
         back = _meta_backfill(state, disk_id)
         latest = back[-1] if back else None
     detail["latest_smart"] = latest
+    detail["ssd"] = _ssd_fields(latest)
     detail["smart_error"] = _latest_meta_smart_error(state, disk_id)
     return detail
 
@@ -225,8 +244,11 @@ def disk_smart_history(disk_id: str, request: Request) -> dict:
     items = []
     for r in list_smart_rows(state, disk_id):
         r["source"] = "catalog"
+        r["ssd"] = _ssd_fields(r)
         items.append(r)
-    items.extend(_meta_backfill(state, disk_id))
+    for item in _meta_backfill(state, disk_id):
+        item["ssd"] = _ssd_fields(item)
+        items.append(item)
     items.sort(key=lambda x: x.get("collected_at") or "")
     return {"disk_id": disk_id, "items": items, "count": len(items),
             "smart_error": _latest_meta_smart_error(state, disk_id)}
@@ -399,6 +421,8 @@ def disk_smart_read(disk_id: str, request: Request,
     if cap_status:
         res.setdefault("scan_info", {})["capacity_check"] = cap_status
     device = res.get("device") or (cands[0]["device"] if cands else "")
+    parsed = smart.parse_smart(res["raw"],
+                               exit_status=res.get("exit_status")) if res["ok"] else None
     out: dict = {
         "disk_id": disk_id,
         "device": device,
@@ -411,8 +435,8 @@ def disk_smart_read(disk_id: str, request: Request,
         "raw_excerpt": res["raw_excerpt"],
         "attempts": res["attempts"],
         "exit_status": res.get("exit_status"),
-        "parsed": smart.parse_smart(res["raw"],
-                                    exit_status=res.get("exit_status")) if res["ok"] else None,
+        "parsed": parsed,
+        "ssd": _ssd_fields(parsed) if parsed else None,
     }
     return out
 

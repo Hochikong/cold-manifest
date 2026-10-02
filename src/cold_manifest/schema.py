@@ -161,6 +161,17 @@ CREATE TABLE IF NOT EXISTS disk_smart (
   spin_up_ms INTEGER,
   device_type TEXT,                      -- smartctl -d 生效类型（sat/ata/...）
   raw_json TEXT,
+  -- SSD 专属（P4-②扩展）：HDD 行/旧库均为 NULL
+  life_left_pct INTEGER,
+  percentage_used INTEGER,
+  available_spare_pct INTEGER,
+  written_bytes INTEGER,
+  read_bytes INTEGER,
+  media_errors INTEGER,
+  unsafe_shutdowns INTEGER,
+  power_cycles INTEGER,
+  controller_busy_minutes INTEGER,
+  ssd_json TEXT,                         -- SSD 子字典 JSON 兜底
   PRIMARY KEY (disk_id, snapshot_id)
 );
 """

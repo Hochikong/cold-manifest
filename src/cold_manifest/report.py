@@ -430,6 +430,30 @@ def generate_snapshot_report(conn: sqlite3.Connection,
                 unit = "h" if key == "power_on_hours" else \
                     ("°C" if key == "temperature_c" else "")
                 parts.append(f"{lbl} {v}{unit}")
+        # SSD 寿命/写入量（catalog 行 ssd_json 优先，meta smart_ssd_json 兜底）
+        ssd = None
+        raw_ssd = sm.get("ssd_json") if sm else None
+        if raw_ssd:
+            try:
+                ssd = json.loads(raw_ssd)
+            except (ValueError, TypeError):
+                ssd = None
+        if not ssd:
+            raw_ssd = meta.get("smart_ssd_json")
+            if raw_ssd:
+                try:
+                    ssd = json.loads(raw_ssd)
+                except (ValueError, TypeError):
+                    ssd = None
+        if isinstance(ssd, dict):
+            if ssd.get("life_left_pct") is not None:
+                parts.append(f"剩余寿命 {ssd['life_left_pct']}%")
+            wb = ssd.get("written_bytes")
+            if wb:
+                parts.append(f"累计写入 {fmt_bytes(int(wb))}")
+            rb = ssd.get("read_bytes")
+            if rb:
+                parts.append(f"累计读取 {fmt_bytes(int(rb))}")
         smart_line = " · ".join(parts)
     elif meta.get("smart_status"):
         smart_line = f"SMART：{meta['smart_status']}"

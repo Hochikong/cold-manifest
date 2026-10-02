@@ -792,3 +792,233 @@ def test_collect_smart_linkage(tmp_path: Path, monkeypatch,
         assert "smart_temperature_c" not in meta
         assert meta["smart_status"] == "unavailable"
     cat.close()
+
+
+# ---------------------------------------------------------------- SSD 字段（P4-②扩展）
+
+# 用户实机真实 NVMe JSON（WD Blue SN570 2TB，smartctl -i -H -A -j /dev/sdb）
+NVME_SAMPLE = json.dumps({
+    "device": {"name": "/dev/sdb", "type": "nvme", "protocol": "NVMe"},
+    "model_name": "WD Blue SN570 2TB SSD",
+    "serial_number": "23024Q800919",
+    "smart_status": {"passed": True},
+    "temperature": {"current": 60},
+    "nvme_smart_health_information_log": {
+        "temperature": 60, "available_spare": 100,
+        "available_spare_threshold": 10, "percentage_used": 0,
+        "data_units_read": 15578192,
+        "data_units_written": 17379040,
+        "host_reads": 47631956, "host_writes": 92383099,
+        "controller_busy_time": 174, "power_cycles": 308,
+        "power_on_hours": 923, "unsafe_shutdowns": 22,
+        "media_errors": 0, "num_err_log_entries": 0,
+        "warning_temp_time": 1, "critical_comp_time": 0,
+        "temperature_sensors": [82, 52],
+    },
+})
+
+# SATA SSD 属性表夹具（属性 ID 口径）
+SATA_SSD_SAMPLE = json.dumps({
+    "device": {"name": "/dev/sdc", "type": "sat", "protocol": "ATA"},
+    "model_name": "Kingston SA400S37240G",
+    "serial_number": "50026B77820ABCDE",
+    "smart_status": {"passed": True},
+    "temperature": {"current": 32},
+    "rotation_rate": 0,
+    "ata_smart_attributes": {"table": [
+        {"id": 5, "name": "Reallocated_Sector_Ct", "raw": {"value": 0, "string": "0"}},
+        {"id": 9, "name": "Power_On_Hours", "raw": {"value": 9000, "string": "9000"}},
+        {"id": 177, "name": "Wear_Leveling_Count", "raw": {"value": 91, "string": "91"}},
+        {"id": 202, "name": "Percent_Lifetime_Remain", "raw": {"value": 9, "string": "9"}},
+        {"id": 231, "name": "SSD_Life_Left", "raw": {"value": 91, "string": "91"}},
+        {"id": 241, "name": "Total_LBAs_Written", "raw": {"value": 117440512,
+                                                          "string": "117440512"}},
+        {"id": 242, "name": "Total_LBAs_Read", "raw": {"value": 234881024,
+                                                       "string": "234881024"}},
+    ]},
+})
+
+
+def test_parse_smart_nvme_ssd_fields() -> None:
+    p = smart.parse_smart(NVME_SAMPLE)
+    ssd = p["ssd"]
+    assert ssd["source"] == "nvme"
+    assert ssd["percentage_used"] == 0
+    assert ssd["life_left_pct"] == 100
+    assert ssd["available_spare_pct"] == 100
+    assert ssd["available_spare_threshold"] == 10
+    # 17379040 units × 1000 × 512B ≈ 8.9 TB
+    assert ssd["written_bytes"] == 17379040 * 1000 * 512
+    assert abs(ssd["written_bytes"] - 8.9e12) < 0.01e12
+    assert ssd["written_tb"] == round(17379040 * 512000 / 1e12, 2)
+    assert ssd["read_bytes"] == 15578192 * 1000 * 512
+    assert ssd["host_reads"] == 47631956 and ssd["host_writes"] == 92383099
+    assert ssd["media_errors"] == 0
+    assert ssd["unsafe_shutdowns"] == 22
+    assert ssd["power_cycles"] == 308
+    assert ssd["controller_busy_minutes"] == 174
+    assert ssd["temp_sensors"] == [82, 52]
+    assert ssd["num_err_log_entries"] == 0
+    assert ssd["warning_temp_time"] == 1 and ssd["critical_comp_time"] == 0
+
+
+def test_parse_smart_sata_ssd_fields() -> None:
+    p = smart.parse_smart(SATA_SSD_SAMPLE)
+    ssd = p["ssd"]
+    assert ssd["source"] == "ata"
+    assert ssd["life_left_pct"] == 91          # 231 优先
+    assert ssd["written_bytes"] == 117440512 * 512
+    assert ssd["read_bytes"] == 234881024 * 512
+    assert ssd["wear_leveling_count"] == 91
+    assert p["power_on_hours"] == 9000
+    assert p["health"] == "passed"
+
+
+def test_parse_smart_sata_life_attr_priority() -> None:
+    """231 缺 → 233；233 缺 → 202；255（未知）不进 life_left_pct。"""
+    raw = json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 233, "name": "Media_Wearout_Indicator", "raw": {"value": 87}},
+        {"id": 202, "name": "Percent_Lifetime_Remain", "raw": {"value": 13}},
+    ]}})
+    assert smart.parse_smart(raw)["ssd"]["life_left_pct"] == 87
+    raw = json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 202, "name": "Percent_Lifetime_Remain", "raw": {"value": 13}},
+    ]}})
+    assert smart.parse_smart(raw)["ssd"]["life_left_pct"] == 13
+    raw = json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 231, "name": "SSD_Life_Left", "raw": {"value": 255}},
+    ]}})
+    assert smart.parse_smart(raw)["ssd"].get("life_left_pct") is None
+
+
+def test_parse_smart_hdd_no_ssd() -> None:
+    """HDD（SAMPLE 无任何 SSD 属性/NVMe 段）→ ssd 为空字典。"""
+    p = smart.parse_smart(SAMPLE)
+    assert p["ssd"] == {}
+    assert smart.parse_smart("{}")["ssd"] == {}
+    assert smart.parse_smart(None)["ssd"] == {}
+    assert smart.parse_smart("garbage")["ssd"] == {}
+
+
+def test_ssd_contract_frozen_keys() -> None:
+    c = smart.ssd_contract(smart.parse_smart(NVME_SAMPLE)["ssd"])
+    assert set(c.keys()) == set(smart.SSD_CONTRACT_KEYS)
+    assert c["life_left_pct"] == 100
+    assert c["written_bytes"] == 17379040 * 1000 * 512
+    assert c["written_tb"] == round(17379040 * 512000 / 1e12, 2)
+    assert c["temp_sensors"] == [82, 52]
+    assert c["source"] == "nvme"
+    # 缺失兜底：全 null / []
+    c = smart.ssd_contract({})
+    assert set(c.keys()) == set(smart.SSD_CONTRACT_KEYS)
+    assert c["temp_sensors"] == []
+    assert all(c[k] is None for k in smart.SSD_CONTRACT_KEYS if k not in
+               ("temp_sensors",))
+
+
+def test_disk_smart_ssd_columns_roundtrip(tmp_path: Path) -> None:
+    data_root, conn = _mk_catalog(tmp_path)
+    for raw in (NVME_SAMPLE, SAMPLE):
+        smart.record_smart(conn, "D1", f"vol/2026010{2 if raw == SAMPLE else 1}T000000Z",
+                           smart.parse_smart(raw), raw_json=raw)
+    conn.commit()
+    hist = smart.list_smart(conn, "D1")
+    assert len(hist) == 2
+    nvme_row = next(r for r in hist if r["raw_json"] == NVME_SAMPLE)
+    assert nvme_row["life_left_pct"] == 100
+    assert nvme_row["percentage_used"] == 0
+    assert nvme_row["written_bytes"] == 17379040 * 1000 * 512
+    assert nvme_row["read_bytes"] == 15578192 * 1000 * 512
+    assert nvme_row["media_errors"] == 0
+    assert nvme_row["unsafe_shutdowns"] == 22
+    assert nvme_row["power_cycles"] == 308
+    assert nvme_row["controller_busy_minutes"] == 174
+    assert json.loads(nvme_row["ssd_json"])["source"] == "nvme"
+    hdd_row = next(r for r in hist if r["raw_json"] == SAMPLE)
+    assert hdd_row["life_left_pct"] is None and hdd_row["ssd_json"] is None
+    conn.close()
+
+
+def test_catalog_migration_adds_ssd_columns_idempotent(tmp_path: Path) -> None:
+    """旧库（无 SSD 列）init_catalog 补列且幂等，旧行缺列为 NULL。"""
+    import sqlite3 as _sq
+
+    from cold_manifest.db import init_catalog
+    from cold_manifest.schema import CATALOG_DDL
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    db = data_root / "catalog.db"
+    # 手工建一个"旧版"库：把 SSD 列声明从 DDL 里裁掉
+    import re
+
+    m = re.search(r"(CREATE TABLE IF NOT EXISTS disk_smart.*?)\n\);", CATALOG_DDL, re.S)
+    disk_smart_old = re.sub(
+        r"\n  -- SSD 专属.*?\n", "\n", m.group(1), flags=re.S) + "\n);"
+    old_ddl = CATALOG_DDL[:m.start()] + disk_smart_old + CATALOG_DDL[m.end():]
+    conn = _sq.connect(db)
+    conn.row_factory = _sq.Row
+    conn.executescript(old_ddl)
+    conn.execute("INSERT INTO disk_smart(disk_id, snapshot_id, health)"
+                 " VALUES('D1', 's1', 'passed')")
+    conn.commit()
+    init_catalog(conn)  # 第一次迁移
+    init_catalog(conn)  # 幂等
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(disk_smart)")}
+    for c in ("life_left_pct", "percentage_used", "available_spare_pct",
+              "written_bytes", "read_bytes", "media_errors",
+              "unsafe_shutdowns", "power_cycles", "controller_busy_minutes",
+              "ssd_json"):
+        assert c in cols
+    row = conn.execute("SELECT * FROM disk_smart").fetchone()
+    assert row["health"] == "passed" and row["ssd_json"] is None
+    conn.close()
+
+
+def test_collect_smart_ssd_meta(tmp_path: Path, monkeypatch) -> None:
+    """采集链路：SSD 字段落 meta smart_ssd_json + disk_smart 列。"""
+    scan_root = tmp_path / "vol"
+    _make_tree(scan_root)
+    data_root = tmp_path / "data"
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _fake_probe_with_smart(str(scan_root), NVME_SAMPLE))
+    result = collect_volume(scan_root, data_root=data_root)
+    conn = sqlite3.connect(result.db_path)
+    conn.row_factory = sqlite3.Row
+    meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
+    conn.close()
+    ssd_meta = json.loads(meta["smart_ssd_json"])
+    assert ssd_meta["source"] == "nvme"
+    assert ssd_meta["written_bytes"] == 17379040 * 1000 * 512
+
+    cat = connect_catalog(data_root)
+    rows = smart.list_smart(cat, "SER123")
+    assert len(rows) == 1
+    assert rows[0]["life_left_pct"] == 100
+    assert rows[0]["written_bytes"] == 17379040 * 1000 * 512
+    cat.close()
+
+
+def test_snapshot_report_shows_ssd(tmp_path: Path) -> None:
+    """快照 HTML 报告：meta smart_ssd_json → SMART 行带剩余寿命/累计写入。"""
+    import io
+
+    from cold_manifest.db import init_snapshot
+    from cold_manifest.report import generate_snapshot_report
+
+    db = tmp_path / "snapshot.db"
+    conn = sqlite3.connect(db)
+    init_snapshot(conn)
+    ssd = smart.parse_smart(NVME_SAMPLE)["ssd"]
+    conn.executemany(
+        "INSERT INTO meta(key, value) VALUES(?, ?)",
+        [("status", "sealed"), ("volume_id", "vol"),
+         ("smart_health", "passed"),
+         ("smart_ssd_json", json.dumps(ssd, ensure_ascii=False))])
+    conn.commit()
+    buf = io.StringIO()
+    generate_snapshot_report(conn, buf, snapshot_id="vol/x")
+    html = buf.getvalue()
+    assert "剩余寿命 100%" in html
+    assert "累计写入" in html and "TB" in html
+    conn.close()

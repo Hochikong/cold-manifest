@@ -366,3 +366,111 @@ def test_preflight_sm_failures_degrade(client: TestClient, tmp_path: Path,
     body = client.post("/api/collect/preflight", json={"path": str(target)}).json()
     assert body["is_smart_capable"] is False
     assert any("SMART" in w for w in body["warnings"])
+
+
+# ---------------------------------------------------------------- SSD 契约字段
+
+
+def _mk_nvme_disk(tmp_cat) -> None:
+    """在 catalog 里加一块 NVMe 盘 D2 + 卷 + 快照，并落 NVMe SMART 行。"""
+    from test_smart import NVME_SAMPLE  # noqa: E402
+
+    cat = tmp_cat
+    ensure_disk(cat, "D2", physical_model="WD Blue SN570 2TB SSD")
+    ensure_volume(cat, "vol2", "D2", filesystem="ntfs")
+    register_snapshot(cat, "vol2/20260302T000000Z", "vol2", status="sealed",
+                      host_path="/y", collected_at="2026-03-02T00:00:00Z")
+    smart.record_smart(cat, "D2", "vol2/20260302T000000Z",
+                       smart.parse_smart(NVME_SAMPLE),
+                       collected_at="2026-03-02T00:00:00Z", raw_json=NVME_SAMPLE)
+    cat.commit()
+
+
+@pytest.fixture()
+def client_with_nvme(tmp_path: Path) -> TestClient:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _build_snapshot_db(data_root / "vol" / "20260101T000000Z" / "snapshot.db", SAMPLE)
+    cat = sqlite3.connect(catalog_path(data_root))
+    init_catalog(cat)
+    ensure_disk(cat, "D1", physical_model="TOSHIBA HDWG480")
+    ensure_volume(cat, "vol", "D1", filesystem="ext4")
+    register_snapshot(cat, SID_OLD, "vol", status="sealed", host_path="/x",
+                      collected_at="2026-01-01T00:00:00Z")
+    _mk_nvme_disk(cat)
+    cat.close()
+    with TestClient(create_app(data_root=str(data_root))) as c:
+        yield c
+
+
+def test_disk_detail_ssd_contract(client_with_nvme: TestClient) -> None:
+    r = client_with_nvme.get("/api/disks/D2")
+    assert r.status_code == 200
+    body = r.json()
+    ssd = body["ssd"]
+    assert set(ssd.keys()) == set(smart.SSD_CONTRACT_KEYS)
+    assert ssd["life_left_pct"] == 100
+    assert ssd["percentage_used"] == 0
+    assert ssd["written_bytes"] == 17379040 * 1000 * 512
+    assert abs(ssd["written_tb"] - 8.9) < 0.1
+    assert ssd["temp_sensors"] == [82, 52]
+    assert ssd["source"] == "nvme"
+    # HDD 盘 → 全 null / [] 兜底
+    d1 = client_with_nvme.get("/api/disks/D1").json()
+    assert d1["latest_smart"]["health"] == "passed"
+    assert d1["ssd"]["life_left_pct"] is None
+    assert d1["ssd"]["temp_sensors"] == []
+
+
+def test_smart_history_ssd_fields(client_with_nvme: TestClient) -> None:
+    r = client_with_nvme.get("/api/disks/D2/smart")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert len(items) == 1
+    ssd = items[0]["ssd"]
+    assert set(ssd.keys()) == set(smart.SSD_CONTRACT_KEYS)
+    assert ssd["source"] == "nvme"
+    assert ssd["unsafe_shutdowns"] == 22
+    assert ssd["power_cycles"] == 308
+    assert ssd["controller_busy_minutes"] == 174
+    assert ssd["read_bytes"] == 15578192 * 1000 * 512
+
+
+def test_smart_history_meta_backfill_ssd_contract(client_with_nvme: TestClient) -> None:
+    """meta 回填项（catalog 无行）也带 SSD 契约字段（HDD → 全 null 兜底）。"""
+    r = client_with_nvme.get("/api/disks/D1/smart")
+    items = r.json()["items"]
+    assert items[0]["source"] == "meta"
+    assert set(items[0]["ssd"].keys()) == set(smart.SSD_CONTRACT_KEYS)
+    assert items[0]["ssd"]["source"] is None
+    assert items[0]["ssd"]["temp_sensors"] == []
+
+
+def test_smart_read_response_ssd(client_with_nvme: TestClient, monkeypatch) -> None:
+    from test_smart import NVME_SAMPLE  # noqa: E402
+
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True,
+        "items": [{"device": "/dev/sdb", "model": "M", "serial": "D2",
+                   "size_bytes": 100, "volumes": []}],
+        "count": 1,
+    })
+    monkeypatch.setattr(
+        smart, "read_smart_verbose",
+        lambda dev=None, *, devices=None, **kw:
+            _ok_verbose(NVME_SAMPLE, device_type="nvme"))
+    body = client_with_nvme.post("/api/disks/D2/smart/read").json()
+    assert body["ok"] is True
+    ssd = body["ssd"]
+    assert set(ssd.keys()) == set(smart.SSD_CONTRACT_KEYS)
+    assert ssd["life_left_pct"] == 100 and ssd["source"] == "nvme"
+
+    # 读取失败 → ssd 为 null
+    monkeypatch.setattr(smart, "read_smart_verbose",
+                        lambda dev=None, *, devices=None, **kw: {
+                            "ok": False, "raw": None, "device": "",
+                            "device_type": "", "exit_status": None,
+                            "reason": "timeout", "message": "超时",
+                            "raw_excerpt": "", "attempts": []})
+    body = client_with_nvme.post("/api/disks/D2/smart/read").json()
+    assert body["ok"] is False and body["ssd"] is None
