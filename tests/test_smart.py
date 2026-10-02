@@ -317,6 +317,170 @@ def test_read_smart_verbose_success_has_scan_info(monkeypatch) -> None:
     assert res["scan_info"]["devices"] == [{"device": "/dev/sdb", "type": "sat"}]
 
 
+# ---------------------------------------------------------------- Windows USB 桥实机形态
+
+
+def test_windows_type_chain_sat_before_auto() -> None:
+    """Windows 通路：sat 先于 auto（auto 会把 USB 桥误判成 jmb39x 报
+    Invalid argument），auto 只在末尾兜底；扫描建议类型最优先。"""
+    chain = smart._device_types("sat", windows=True)
+    assert chain[0] == "sat"
+    assert chain[-1] == ""
+    assert chain.index("sat") < chain.index("")
+    assert "sat,12" in chain
+    # Linux 顺序不变：auto 仍最前
+    assert smart._device_types("sat")[0] == ""
+
+
+def test_read_smart_windows_chain_order(monkeypatch) -> None:
+    """PhysicalDrive 形态的设备走 Windows 链：第一个尝试就是 -d sat。"""
+    fake, calls = _fake_cmd([_proc(SAMPLE, rc=0)])
+    monkeypatch.setattr(smart, "_run_cmd", fake)
+    res = smart.read_smart("\\\\.\\PhysicalDrive2")
+    assert res is not None and res["device_type"] == "sat"
+    assert len(calls) == 1
+    assert calls[0][1:3] == ["-d", "sat"]
+    assert calls[0][-1] == "\\\\.\\PhysicalDrive2"
+
+
+def test_read_smart_verbose_admin_rights_hint(monkeypatch) -> None:
+    """非管理员时 smartctl stderr 提示 limited functionality → permission_denied。"""
+    import subprocess
+
+    def fake2(cmd):
+        return subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="",
+            stderr="Limited functionality due to missing admin rights"), None
+
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake2)
+    res = smart.read_smart_verbose("/dev/sdc")
+    assert res["ok"] is False
+    assert res["reason"] == "permission_denied"
+    assert "管理员" in res["message"]
+
+
+def test_read_smart_verbose_error5_is_permission_denied(monkeypatch) -> None:
+    """实机 USB 桥形态：rc bit1(2) + messages "Open failed, Error=5"
+    → permission_denied（不再误报 device_open），message 指向管理员启动。"""
+    import subprocess
+
+    def fake2(cmd):
+        out = json.dumps({"smartctl": {"exit_status": 2}, "messages": [
+            {"string": "Smartctl open device: \\\\.\\PhysicalDrive2 [SAT] failed:"
+                       " \\\\.\\PhysicalDrive2: Open failed, Error=5"}]})
+        return subprocess.CompletedProcess(args=[], returncode=2,
+                                           stdout=out, stderr=""), None
+
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake2)
+    res = smart.read_smart_verbose("\\\\.\\PhysicalDrive2")
+    assert res["ok"] is False
+    assert res["reason"] == "permission_denied"
+    assert "管理员" in res["message"]
+    assert "NVMe" in res["message"]
+    assert "-d sat" in res["message"]
+
+
+def test_read_smart_verbose_no_pd_retry(monkeypatch) -> None:
+    """调研定案：\\\\.\\PhysicalDriveN 不进候选链、失败后也不动态追加——
+    sd 报"设备不存在"时就地失败（pd 形态裸传本来就是 EINVAL）。"""
+    monkeypatch.setattr(smart, "_run_cmd_ex",
+                        lambda cmd: (_proc("", rc=2), "not_found"))
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [])
+    res = smart.read_smart_verbose(devices=[
+        {"device": "/dev/sdc", "type": "sat", "source": "scan"}])
+    assert res["ok"] is False and res["reason"] == "not_found"
+    assert {a["device"] for a in res["attempts"]} == {"/dev/sdc"}
+    assert [c["device"] for c in res["scan_info"]["candidates"]] == ["/dev/sdc"]
+
+
+def test_read_smart_verbose_scan_info_note_passthrough(monkeypatch) -> None:
+    """候选的 note（同盘合并/动态追加原因）透传到 scan_info.candidates。"""
+    fake, _ = _fake_cmd_ex([_proc("", rc=4)])
+    monkeypatch.setattr(smart, "_run_cmd_ex", fake)
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [])
+    res = smart.read_smart_verbose(devices=[
+        {"device": "/dev/sdc", "type": "sat", "source": "scan",
+         "note": "pd 形态已合并"}])
+    assert res["scan_info"]["candidates"][0]["note"] == "pd 形态已合并"
+
+
+# ---------------------------------------------------------------- 假 smartctl 实测脚本（真子进程）
+
+
+def _write_fake_smartctl(tmp_path: Path, mode: str) -> str:
+    """生成可执行的假 smartctl（bash）：mode 决定失败剧本。
+
+    - auto_jmb39x：无 -d 或非 sat 的 -d → jmb39x Invalid argument（rc 2）；
+      -d sat → 真 JSON（rc 0）——复现实机"auto 误判、sat 能读"；
+    - error5：一律 Error=5 Open failed（rc 2）——权限不足形态。
+    """
+    script = tmp_path / f"fake_smartctl_{mode}.sh"
+    if mode == "auto_jmb39x":
+        body = r'''
+if [ "$1" = "-d" ] && [ "$2" = "sat" ]; then
+  echo '__SAMPLE__'
+  exit 0
+fi
+echo '{"smartctl": {"exit_status": 2}, "messages": [{"string": "Smartctl open device: jmb39x_disk_0 failed: Invalid argument"}]}'
+exit 2
+'''
+        body = body.replace("__SAMPLE__", SAMPLE)
+    else:
+        body = (
+            'echo \'{"smartctl": {"exit_status": 2}, "messages": '
+            '[{"string": "Smartctl open device: failed: Open failed, Error=5"}]}\'\n'
+            "exit 2\n"
+        )
+    script.write_text("#!/bin/bash\n" + body)
+    script.chmod(0o755)
+    return str(script)
+
+
+def test_fake_smartctl_auto_jmb39x_then_sat(tmp_path: Path,
+                                            monkeypatch) -> None:
+    """假 smartctl 场景①：auto 误判 jmb39x + Invalid argument → 后续 sat
+    成功；尝试顺序里 sat 在 auto 之前（Windows 通路）。"""
+    monkeypatch.setenv("CLDM_SMARTCTL",
+                       _write_fake_smartctl(tmp_path, "auto_jmb39x"))
+    monkeypatch.delenv("CLDM_SMARTCTL_ARGS", raising=False)
+    monkeypatch.delenv("CLDM_SMARTCTL_DEVICE", raising=False)
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [
+        {"device": "/dev/sda", "type": "nvme"},
+        {"device": "/dev/sdb", "type": "nvme"},
+        {"device": "/dev/sdc", "type": "sat"},
+    ])
+    cands = smart.smart_device_candidates(2)
+    # 场景③/④：扫描给出 sat 类型且同盘去重后只有一条候选
+    assert len(cands) == 1
+    assert cands[0]["device"] == "/dev/sdc" and cands[0]["type"] == "sat"
+    res = smart.read_smart_verbose(devices=[
+        {"device": "\\\\.\\PhysicalDrive2", "type": "", "source": "scan"}])
+    assert res["ok"] is True
+    assert res["device_type"] == "sat"
+    # Windows 通路 sat 最优先：auto（jmb39x 误判）根本没被尝试
+    assert res["attempts"] == []
+    # 对照：Linux 通路（/dev/sdc）顺序不变，auto 先试失败后 sat 兜住
+    res2 = smart.read_smart_verbose("/dev/sdc", suggested_type="sat")
+    assert res2["ok"] is True and res2["device_type"] == "sat"
+    tried = [a["device_type"] for a in res2["attempts"]]
+    assert tried[0] == "default"        # auto 失败（jmb39x 误判）
+    assert "sat" not in tried           # sat 成功，不进失败尝试
+    assert "jmb39x" in res2["attempts"][0]["stdout_messages"]
+
+
+def test_fake_smartctl_error5_permission_denied(tmp_path: Path,
+                                                monkeypatch) -> None:
+    """假 smartctl 场景②：Error=5 → permission_denied，message 含"管理员"。"""
+    monkeypatch.setenv("CLDM_SMARTCTL",
+                       _write_fake_smartctl(tmp_path, "error5"))
+    monkeypatch.delenv("CLDM_SMARTCTL_ARGS", raising=False)
+    res = smart.read_smart_verbose("\\\\.\\PhysicalDrive2")
+    assert res["ok"] is False
+    assert res["reason"] == "permission_denied"
+    assert "管理员" in res["message"]
+    assert "-d sat" in res["message"]
+
+
 # ---------------------------------------------------------------- exit_status 位掩码 / 设备名 / 类型兜底链
 
 # 实测三行 scan 输出形态（Windows USB 桥盘为第三行）
@@ -364,13 +528,32 @@ def test_parse_scan_output_json_info_name_fallback() -> None:
 
 
 def test_scan_devices_prefers_json(monkeypatch) -> None:
-    """scan_devices 走 -j JSON 分支（parse_scan_output 认 JSON）。"""
+    """scan_devices 首选 --scan-open -j（真实打开、附 open_error 可跳）。"""
     monkeypatch.setattr(smart, "_SCAN_CACHE", None)
-    fake, calls = _fake_cmd([_proc(SCAN_JSON, rc=0)])
+    calls: list[list[str]] = []
+
+    def fake(cmd: list[str]):
+        calls.append(cmd)
+        return _proc(SCAN_JSON, rc=0)
+
     monkeypatch.setattr(smart, "_run_cmd", fake)
     entries = smart.scan_devices()
     assert [e["device"] for e in entries] == ["/dev/sda", "/dev/sdb"]
-    assert len(calls) == 1  # JSON 成功即不再回退文本
+    assert calls[0][:2] == ["smartctl", "--scan-open"]
+    assert len(calls) == 1  # 第一个变体成功即不再回退
+
+
+def test_scan_open_skips_open_error_entries(monkeypatch) -> None:
+    """--scan-open 里带 open_error 的设备（权限/休眠）跳过，不进映射。"""
+    raw = json.dumps({"devices": [
+        {"name": "/dev/sda", "type": "nvme"},
+        {"name": "/dev/sdc", "type": "sat",
+         "open_error": "Access is denied"},
+    ]})
+    monkeypatch.setattr(smart, "_SCAN_CACHE", None)
+    monkeypatch.setattr(smart, "_run_cmd",
+                        lambda cmd: _proc(raw, rc=0))
+    assert smart.scan_devices() == [{"device": "/dev/sda", "type": "nvme"}]
 
 
 def test_parse_scan_output_empty_noise() -> None:
@@ -456,17 +639,19 @@ def test_smart_device_env_override(monkeypatch) -> None:
     assert smart.smart_device(2) == ("/dev/sdz", "")
 
 
-def test_smart_device_candidates_both_forms(monkeypatch) -> None:
-    """扫描映射不可用时，候选链同时含 /dev/sdN 与 \\\\.\\PhysicalDriveN
-    （单选回退曾导致 USB 盘永远落在打不开的 PhysicalDrive 上）。"""
+def test_smart_device_candidates_dedup_same_disk(monkeypatch) -> None:
+    """候选只出 /dev/sdN 形态：\\\\.\\PhysicalDriveN 不是 smartctl 认可的
+    设备名（裸传报 Invalid argument），调研定案一律不进候选链。"""
     monkeypatch.setattr(smart, "_SCAN_CACHE", [])
     monkeypatch.delenv("CLDM_SMARTCTL_DEVICE", raising=False)
     cands = smart.smart_device_candidates(2)
-    assert [c["device"] for c in cands] == \
-        ["/dev/sdc", "\\\\.\\PhysicalDrive2"]
-    assert [c["source"] for c in cands] == ["fallback-sd", "fallback-pd"]
+    assert [c["device"] for c in cands] == ["/dev/sdc"]
+    assert cands[0]["source"] == "fallback-sd"
+    assert "PhysicalDrive" in cands[0]["note"]
     # 首选仍向后兼容（smart_device 取第一候选）
     assert smart.smart_device(2) == ("/dev/sdc", "")
+    # sd 形态给不出（≥26）→ 没有任何形态可用（pd 不合法，不兜底）
+    assert smart.smart_device_candidates(30) == []
 
 
 def test_smart_device_candidates_scan_first(monkeypatch) -> None:
@@ -476,36 +661,35 @@ def test_smart_device_candidates_scan_first(monkeypatch) -> None:
         {"device": "/dev/sdc", "type": "sat"},
     ])
     cands = smart.smart_device_candidates(2)
-    assert cands[0] == {"device": "/dev/sdc", "type": "sat", "source": "scan"}
-    # /dev/sdc 已在首选里，不重复
-    assert [c["device"] for c in cands] == \
-        ["/dev/sdc", "\\\\.\\PhysicalDrive2"]
+    assert cands[0]["device"] == "/dev/sdc" and cands[0]["type"] == "sat"
+    # /dev/sdc 已在首选里，fallback-sd 去重，pd 形态不进候选链
+    assert [c["device"] for c in cands] == ["/dev/sdc"]
 
 
 def test_device_type_chain_order() -> None:
-    """auto → sat → sat,12 → 扫描建议 → 桥专用；去重保序。"""
+    """Linux: auto → sat → sat,12 → sat,auto → 扫描建议 → 桥专用；去重保序。"""
     chain = smart._device_types("sat")
     assert chain[0] == "" and chain[1] == "sat" and chain[2] == "sat,12"
     assert "sat" not in chain[3:]
-    for b in ("usbjmicron", "usbsunplus", "usbprolific", "jms56x,0"):
+    for b in smart._BRIDGE_TYPES:
         assert b in chain
     assert len(chain) == len(set(chain))
     # 未给扫描建议时 base + 桥
-    assert smart._device_types() == ["", "sat", "sat,12",
-                                     "usbjmicron", "usbsunplus",
-                                     "usbprolific", "jms56x,0"]
+    assert smart._device_types() == ["", "sat", "sat,12", "sat,auto",
+                                     "usbjmicron", "usbjmicron,p",
+                                     "usbjmicron,x", "usbsunplus",
+                                     "usbprolific"]
 
 
-def test_bridge_types_jms56x_legal_form() -> None:
-    """jms56x 必须写成 jms56x,0：smartctl VALID ARGUMENTS 要求
-    `jms56x,N[,sLBA][,force][+TYPE]`，裸写报 Unknown JMicron type（rc bit0）。"""
-    assert "jms56x,0" in smart._BRIDGE_TYPES
-    assert "jms56x" not in smart._BRIDGE_TYPES
-    chain = smart._device_types()
-    assert "jms56x,0" in chain
-    assert "jms56x" not in chain
-    # 其余三个桥类型按 VALID ARGUMENTS 可裸用
-    for b in ("usbjmicron", "usbsunplus", "usbprolific"):
+def test_bridge_types_no_raid_writers() -> None:
+    """jms56x/jmb39x/sntjmicron 是 RAID 盒专用（会向 RAID 卷写 LBA，
+    普通单盘有覆写风险），绝不进兜底链；usbjmicron 变体安全可用。"""
+    for banned in ("jms56x,0", "jms56x", "jmb39x", "sntjmicron"):
+        assert banned not in smart._BRIDGE_TYPES
+        assert banned not in smart._device_types()
+        assert banned not in smart._device_types(windows=True)
+    for b in ("usbjmicron", "usbjmicron,p", "usbjmicron,x",
+              "usbsunplus", "usbprolific"):
         assert b in smart._BRIDGE_TYPES
 
 
@@ -516,7 +700,7 @@ def test_scan_devices_does_not_cache_failure(monkeypatch) -> None:
 
     def fake(cmd: list[str]):
         state["n"] += 1
-        if state["n"] <= 4:  # 第一次 scan_devices：两轮重试共 4 次调用全空
+        if state["n"] <= 6:  # 第一次 scan_devices：两轮重试 × 3 个变体全空
             return _proc("")
         return _proc('/dev/sdb -d sat # [SAT], ATA device')
 
@@ -554,10 +738,10 @@ def test_device_candidates_for_path_linux(monkeypatch) -> None:
 
 
 def test_device_candidates_for_path_with_disk_index(monkeypatch) -> None:
-    """给了盘号直接走 smart_device_candidates 全链（含 fallback 两形态）。"""
+    """给了盘号直接走 smart_device_candidates 全链（同盘去重后只剩 sd 形态）。"""
     monkeypatch.setattr(smart, "_SCAN_CACHE", [])
     cands = smart.device_candidates_for_path("/mnt/x", disk_index=1)
-    assert [c["device"] for c in cands] == ["/dev/sdb", "\\\\.\\PhysicalDrive1"]
+    assert [c["device"] for c in cands] == ["/dev/sdb"]
 
 
 def test_type_fallback_chain_commands(monkeypatch) -> None:

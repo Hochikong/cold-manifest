@@ -11,6 +11,22 @@
 
 首次启动时 Windows 防火墙会弹窗询问是否允许 Python 监听网络端口——点「允许访问」（仅专用网络即可）。
 
+## 为什么建议以管理员身份启动
+
+**SMART 采集（磁盘健康：温度、通电时间、重映射扇区等）在 Windows 上分两类：**
+
+- **NVMe 盘（M.2 固态）**：普通权限即可读取；
+- **USB 桥接盘 / SATA 盘（走 `\\.\PhysicalDriveN` 打开）**：**必须管理员权限**，否则 smartctl 报 `Open failed, Error=5`（拒绝访问），SMART 采集失败。
+
+服务如果以普通用户启动，就会出现「NVMe 盘 SMART 正常、USB 机械盘读不到」的现象——这不是盘坏了，是权限不够。`start.cmd` 启动时会检测管理员权限：非管理员会给出醒目警告，并询问是否**以管理员身份重新启动**（弹出 UAC 确认框）；`cldm.cmd` 非管理员运行时也会打印警告。
+
+排查单个盘的 SMART 可直接在管理员终端执行（`-d sat` 是 USB 桥最常用的通路）：
+
+```bat
+smartctl --scan -j
+smartctl -i -H -A -j -d sat /dev/sdN
+```
+
 ## CLI 采集示例
 
 ```bat
