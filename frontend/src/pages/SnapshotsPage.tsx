@@ -130,8 +130,12 @@ export default function SnapshotsPage() {
 
   const [volumeFilter, setVolumeFilter] = useState<string | undefined>(undefined)
   const { data: snapshots, isLoading: listLoading, error: listError, refetch: refetchSnapshots } = useSnapshots(volumeFilter)
-  // 详情页标题用 label（与列表/对比页同口径）；与 SnapshotOverview 共享同一查询缓存
-  const { data: snapshotMeta } = useSnapshot(snapshotId)
+  // 快照已被删除 → 可读空态。用快照列表做存在性判断（≤20 条，缓存与任务页共享），
+  // 在确认存在之前不挂载任何会 GET /snapshots/{sid} 的组件——已删快照的 404 会污染 console。
+  const { data: allSnapshots, isLoading: allSnapshotsLoading } = useSnapshots()
+  const snapshotMissing =
+    !!snapshotId && !allSnapshotsLoading && !!allSnapshots &&
+    !allSnapshots.items.some((s) => s.snapshot_id === snapshotId)
   const deleteMutation = useDeleteSnapshot()
 
   // 置顶状态由列表行自带的 pinned 字段提供（PATCH 后 invalidate ['snapshots'] 刷新）
@@ -253,6 +257,63 @@ export default function SnapshotsPage() {
     )
   }
 
+  if (snapshotId) {
+    // 列表还在加载 → 先不判定存在性，也不发详情请求
+    if (allSnapshotsLoading || !allSnapshots) {
+      return <Spin style={{ display: 'block', margin: '64px auto' }} />
+    }
+    if (snapshotMissing) {
+      return (
+        <div style={{ paddingTop: 64 }}>
+          <Empty
+            description="该快照已删除或不存在"
+            style={{ margin: '32px 0' }}
+          >
+            <Button type="primary" onClick={() => navigate('/snapshots')}>
+              返回快照列表
+            </Button>
+          </Empty>
+        </div>
+      )
+    }
+    return (
+      <SnapshotDetailView
+        snapshotId={snapshotId}
+        activeTab={activeTab}
+        onTabChange={setTab}
+        onDelete={() => openDelete(snapshotId)}
+        deleteModal={
+          <DeleteSnapshotModal
+            target={deleteTarget}
+            onDisk={deleteOnDisk}
+            onDiskChange={setDeleteOnDisk}
+            force={deleteForce}
+            forceChange={setDeleteForce}
+            blocked={deleteBlocked}
+            error={deleteError}
+            loading={deleteMutation.isPending}
+            onCancel={closeDelete}
+            onConfirm={doDelete}
+          />
+        }
+      />
+    )
+  }
+  return null
+}
+
+/** 快照详情视图：仅在确认快照存在后挂载（父组件做存在性兜底）。 */
+function SnapshotDetailView({ snapshotId, activeTab, onTabChange, onDelete, deleteModal }: {
+  snapshotId: string
+  activeTab: string
+  onTabChange: (tab: string) => void
+  onDelete: () => void
+  deleteModal: React.ReactNode
+}) {
+  const navigate = useNavigate()
+  // 详情页标题用 label（与列表/对比页同口径）
+  const { data: snapshotMeta, isLoading: snapshotMetaLoading } = useSnapshot(snapshotId)
+
   return (
     <div>
       <Space align="center" style={{ marginBottom: 16 }} wrap>
@@ -264,11 +325,14 @@ export default function SnapshotsPage() {
         </Title>
         {!!snapshotMeta?.label && <Text type="secondary" code copyable={{ tooltips: ['复制快照 ID', '已复制'] }}>{snapshotId}</Text>}
       </Space>
+      {snapshotMetaLoading && !snapshotMeta ? (
+        <Spin style={{ display: 'block', margin: '48px auto' }} />
+      ) : (
       <Tabs
         activeKey={activeTab}
-        onChange={setTab}
+        onChange={onTabChange}
         items={[
-          { key: 'overview', label: '概览', children: <SnapshotOverview snapshotId={snapshotId} onDelete={() => openDelete(snapshotId)} /> },
+          { key: 'overview', label: '概览', children: <SnapshotOverview snapshotId={snapshotId} onDelete={onDelete} /> },
           { key: 'browse', label: '浏览', children: <DirectoryBrowser snapshotId={snapshotId} /> },
           { key: 'duplicates', label: '重复文件', children: <DuplicateReport snapshotId={snapshotId} /> },
           { key: 'search', label: '搜索', children: <SearchPanel snapshotId={snapshotId} /> },
@@ -276,18 +340,8 @@ export default function SnapshotsPage() {
           { key: 'export', label: '导出', children: <ExportPanel snapshotId={snapshotId} /> },
         ]}
       />
-      <DeleteSnapshotModal
-        target={deleteTarget}
-        onDisk={deleteOnDisk}
-        onDiskChange={setDeleteOnDisk}
-        force={deleteForce}
-        forceChange={setDeleteForce}
-        blocked={deleteBlocked}
-        error={deleteError}
-        loading={deleteMutation.isPending}
-        onCancel={closeDelete}
-        onConfirm={doDelete}
-      />
+      )}
+      {deleteModal}
     </div>
   )
 }

@@ -37,6 +37,7 @@ import {
   rebuildCatalog,
   createCollect,
   cancelTask,
+  deleteTask,
   listTasks,
   getTask,
   getBatch,
@@ -421,6 +422,14 @@ export function useCancelTask() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (id: string) => cancelTask(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['tasks'] }),
+  })
+}
+
+export function useDeleteTask() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => deleteTask(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['tasks'] }),
   })
 }

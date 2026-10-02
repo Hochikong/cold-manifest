@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Card, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal, Drawer, Select, Tooltip } from 'antd'
-import { ReloadOutlined, StopOutlined, ApartmentOutlined } from '@ant-design/icons'
-import { useTasks, useCancelTask, useBatch } from '../api/hooks'
+import { Card, Button, Tag, Progress, Space, Typography, Empty, Spin, Modal, Drawer, Select, Tooltip, App } from 'antd'
+import { ReloadOutlined, StopOutlined, ApartmentOutlined, DeleteOutlined } from '@ant-design/icons'
+import { useTasks, useCancelTask, useDeleteTask, useBatch, useSnapshots } from '../api/hooks'
 import { listTasks, type Task, type Batch, type TaskStatus } from '../api/client'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
@@ -56,7 +56,7 @@ interface StatusCursor {
 }
 
 export default function TasksPage() {
-  const navigate = useNavigate()
+  const { message } = App.useApp()
   const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null)
 
   const [statusFilter, setStatusFilter] = useState<TaskStatus[]>([])
@@ -211,6 +211,7 @@ export default function TasksPage() {
   )
 
   const cancelTaskMutation = useCancelTask()
+  const deleteTaskMutation = useDeleteTask()
   const showApiError = useShowApiError()
 
   const handleCancel = (record: Task) => {
@@ -227,6 +228,30 @@ export default function TasksPage() {
         } catch (e) {
           // 取消失败（任务已结束/后端拒绝）也要让用户看到原因
           showApiError(e, '取消任务失败')
+        }
+      },
+    })
+  }
+
+  const handleDelete = (record: Task) => {
+    Modal.confirm({
+      title: '删除任务记录',
+      content: `确认删除 ${typeMap[record.type] ?? record.type} 任务 ${record.id.slice(0, 12)}… 的记录吗？只删除这条任务记录，不影响已采集的快照与对比数据。`,
+      okText: '确认删除',
+      okButtonProps: { danger: true, icon: <DeleteOutlined /> },
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          await deleteTaskMutation.mutateAsync(record.id)
+          message.success('任务记录已删除')
+          // 删掉当前页最后一条且不是第一页 → 回退一页再刷新，避免落在空页上
+          const wasLastRowOnPage = visibleItems.length === 1 && visibleItems[0].id === record.id
+          if (wasLastRowOnPage && (multiMode ? multiIndex > 0 : pageIndex > 0)) goPrev()
+          if (multiMode) void fetchMultiPage(multiMaps[Math.max(0, multiMaps.length - (wasLastRowOnPage && multiIndex > 0 ? 2 : 1))])
+          else void refetch()
+        } catch (e) {
+          // 例如刚被别的操作改成运行中 → 409，给出后端可读原因而非裸错误
+          showApiError(e, '删除任务失败')
         }
       },
     })
@@ -292,38 +317,46 @@ export default function TasksPage() {
     {
       title: '操作',
       key: 'action',
-      width: 100,
+      width: 150,
       render: (_: unknown, record: Task) => {
         const cancellable = record.status === 'pending' || record.status === 'running' || record.status === 'cancelling'
-        if (!cancellable) return '-'
+        const deleteDisabled = cancellable
         return (
-          <Button
-            size="small"
-            danger
-            icon={<StopOutlined />}
-            loading={cancelTaskMutation.isPending}
-            onClick={() => handleCancel(record)}
-          >
-            取消
-          </Button>
+          <Space size={4}>
+            {cancellable && (
+              <Button
+                size="small"
+                danger
+                icon={<StopOutlined />}
+                loading={cancelTaskMutation.isPending}
+                onClick={() => handleCancel(record)}
+              >
+                取消
+              </Button>
+            )}
+            <Tooltip title={deleteDisabled ? '任务正在运行或排队中，请先取消或等它结束' : '删除这条任务记录'}>
+              <Button
+                size="small"
+                danger
+                type="text"
+                icon={<DeleteOutlined />}
+                aria-label="删除任务记录"
+                disabled={deleteDisabled}
+                loading={deleteTaskMutation.isPending && deleteTaskMutation.variables === record.id}
+                onClick={() => handleDelete(record)}
+              />
+            </Tooltip>
+          </Space>
         )
       },
     },
     {
       title: '结果',
       key: 'result',
-      width: 140,
+      width: 180,
       render: (_: unknown, record: Task) => {
         if (record.status === 'done' && record.result?.snapshot_id) {
-          return (
-            <Button
-              type="link"
-              style={{ padding: 0 }}
-              onClick={() => navigate(`/snapshots?snapshot=${encodeURIComponent(record.result!.snapshot_id!)}`)}
-            >
-              查看快照
-            </Button>
-          )
+          return <SnapshotJumpCell snapshotId={record.result.snapshot_id} />
         }
         if (record.status === 'error' && record.error) {
           return <Text type="danger" ellipsis title={record.error}>失败</Text>
@@ -496,8 +529,39 @@ function BatchDrawer({ batchId, onClose }: { batchId: string | null; onClose: ()
   )
 }
 
-function ProgressCell({ task }: { task: Task }) {
-  if (task.status === 'done') {
+/** 结果列的"查看快照"：快照已被删除时显示标记并禁用跳转。 */
+function SnapshotJumpCell({ snapshotId }: { snapshotId: string }) {
+  const navigate = useNavigate()
+  // 用快照列表做存在性判断（快照总数 ≤20，单次 200 请求缓存共享），
+  // 不逐个 GET 详情——已删快照的 404 会污染 console。
+  const { data: snapshots } = useSnapshots()
+  const missing = !!snapshots && !snapshots.items.some((s) => s.snapshot_id === snapshotId)
+  if (missing) {
+    return (
+      <Space size={4} wrap>
+        <Tooltip title="该快照已删除或不存在">
+          <Tag style={{ margin: 0 }}>快照已删除</Tag>
+        </Tooltip>
+        <Tooltip title="该快照已删除或不存在，无法跳转">
+          <Button type="link" size="small" disabled style={{ padding: 0 }}>
+            查看快照
+          </Button>
+        </Tooltip>
+      </Space>
+    )
+  }
+  return (
+    <Button
+      type="link"
+      style={{ padding: 0 }}
+      onClick={() => navigate(`/snapshots?snapshot=${encodeURIComponent(snapshotId)}`)}
+    >
+      查看快照
+    </Button>
+  )
+}
+
+function ProgressCell({ task }: { task: Task }) {  if (task.status === 'done') {
     return <Progress percent={100} size="small" status="success" />
   }
   if (task.status === 'error' || task.status === 'cancelled' || task.status === 'cancelling') {

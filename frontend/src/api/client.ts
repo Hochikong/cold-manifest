@@ -1187,6 +1187,22 @@ export async function cancelTask(id: string): Promise<CancelTaskResponse> {
   return data
 }
 
+export interface DeleteTaskResponse {
+  deleted: boolean
+  task_id: string
+}
+
+/** 删除任务登记行（只删记录，不删快照/对比等数据）。pending/running/cancelling → 409。 */
+export async function deleteTask(id: string): Promise<DeleteTaskResponse> {
+  const { data } = await client.delete(`/tasks/${encodeURIComponent(id)}`)
+  return data
+}
+
+/** 判断错误是否为后端 404（资源不存在/已删除）。 */
+export function isApiNotFound(e: unknown): boolean {
+  return axios.isAxiosError(e) && e.response?.status === 404
+}
+
 export type TaskType = 'import' | 'collect' | 'hash' | 'diff' | 'build_fts' | 'build_stats'
 export type TaskStatus = 'pending' | 'running' | 'cancelling' | 'cancelled' | 'done' | 'error'
 
