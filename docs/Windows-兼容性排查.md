@@ -193,7 +193,11 @@
 >
 > ✅ **同日按真机证据放宽（2026-10-03）**：真机照片证实东芝盒 / JMicron 盒**都透传真盘序列号**（`16NDT0O1T` / `X0DG6A2GS`，与 CrystalDiskInfo 一致）——不可靠的不是 USB 盒本身，而是**系统枚举层（Windows Get-Disk）**报的 ID（如 `20260123004775F`、占位号 `0123456789ABCDEF`），旧版本拿它当磁盘身份才是"两盘撞号"的根源。因此上面"经 USB 盒接入必须手填"的口径**放宽为按序列号可用性判定**：能读到 ATA 直通真盘序列号（USB 盒透传属常见）或可用的系统枚举序列号 → **直接采集，不要求手填**；只有两者都拿不到时才要求手填盘体序列号（前端 `requires_manual_serial=true` 禁用「开始采集」，后端 400、CLI rc=2）。preflight 响应新增 `smart_serial`（ATA 直通真序列号）与 `serial_usable` 字段，`manual_serial_reason` 如实区分两个来源的可信度。历史结论（系统枚举 ID 不能单独作身份依据、判据 `unique_capacity_match` 容量+型号唯一匹配）不变；见《升级方案》§4.3/§4.4 与《Windows-真机复验清单》§11。
 
+> ⚠️ **UAT 更正（2026-10-03，真机 UAT 后，口径再次收紧）**：上面"**或可用的系统枚举序列号 → 直接采集**"一句已被真机 UAT 推翻——真机证实系统枚举层不仅给盒子 ID，还会给出**看似正常**的值（如 `16NDT0O1T` 形态），且设备定位层曾因"同容量并列"按扫描顺序读到**别的盘**的序列号（东芝 P300 快照被登记到 WD SN570 名下，修复 `8c25aaf`）。最终口径（`33134e1`）：**Windows 上系统枚举（Get-Disk/WMI）序列号一律不得充当磁盘身份**，只有 `serial_source=="smartctl"`（ATA 直通已验证）或手填（manual）才放行；`smartctl_unverified`（读到了但未确认是目标盘）宁严勿松亦拦。判据唯一入口 `requires_manual_serial()`（`src/cold_manifest/collect.py:92`），采集前依赖检查与采集引擎同参（`d977044`）。历史口径保留如上，仅供追溯。
+
 - **触发场景**：Windows 下 USB 桥接硬盘，smartctl 对盘符（`E:`）常无效，需用 `\\.\PhysicalDriveN`。代码已尝试 `-d sat` 回退，但设备路径本身仍可能是盘符。
+
+> ⚠️ **UAT 更正（2026-10-03）**：上面"smartctl 对盘符常无效"的判断**被真机 UAT 推翻**——真机实测 `smartctl -i -j C:` 直接接受盘符并给出精确型号+真盘序列号（与 `/dev/sdX` 读数一致），快选层已改为盘符直读真序列号（`608bd40`）。保留原文仅供追溯。另：直读路径曾写死 `smartctl` 而未走 `smart.smartctl_exec()`，Windows 上 smartctl 不在 PATH 时整条 ATA 直读**静默失败**退回系统枚举假值——已修（`608bd40`，回归测试盯死必须用解析出的可执行文件）。
 - **证据**：`src/cold_manifest/smart.py:186-188` `device_for_path` 在 Windows 下仅返回盘符；`probe/windows.py:278` 在 smartctl 分支里会尝试用 `PhysicalDrive{idx}`，但 `smart.py` 的独立调用（如 `check_smartctl` / CLI 直接调）仍走盘符。
 - ~~建议修法~~（已被本轮实现取代）：见上方更正后的结论；采集 meta 现记录 `smart_attempts_json`（每次尝试的参数/退出码/stderr 片段），失败原因归类为 permission_denied / device_type_unknown / not_found / timeout / other 并给可读文案。
 - **Linux 回归测试**：mock `probe_path_win` 返回 `disk.index=3`，断言 `device_for_path("E:\\")` 返回 `\\.\PhysicalDrive3`。
