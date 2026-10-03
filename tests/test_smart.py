@@ -1537,3 +1537,132 @@ def test_ata_contract_enriches_historical_rows():
         [{"id": unknown_id, "name": "Vendor_Specific"}], ensure_ascii=False)})
     assert out2["ata_attributes"][0]["name_zh"] == ""          # 未知 ID 回退英文
     assert out2["ata_attributes"][0]["name"] == "Vendor_Specific"
+
+
+# ---------------------------------------------------------- display_* 展示语义
+
+
+# 用户真机夹具：希捷酷鹰 4T（ST4000VM002/HKVS002），smartctl -j 输出片段。
+# 240 打包编码（真实小时 3，raw.value 是打包值）、1/7/195 厂商私有编码。
+_SEAGATE_ATTRS = [
+    {"id": 1, "name": "Raw_Read_Error_Rate", "value": 120, "worst": 100,
+     "thresh": 6, "raw": {"value": 167933169, "string": "167933169"}},
+    {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100,
+     "thresh": 10, "raw": {"value": 0, "string": "0"}},
+    {"id": 7, "name": "Seek_Error_Rate", "value": 120, "worst": 100,
+     "thresh": 30, "raw": {"value": 547432, "string": "547432"}},
+    {"id": 9, "name": "Power_On_Hours", "value": 100, "worst": 100,
+     "thresh": 0, "raw": {"value": 7254, "string": "7254"}},
+    {"id": 12, "name": "Power_Cycle_Count", "value": 100, "worst": 100,
+     "thresh": 0, "raw": {"value": 371, "string": "371"}},
+    {"id": 190, "name": "Airflow_Temperature_Cel", "value": 69, "worst": 52,
+     "thresh": 45, "raw": {"value": 439779580513, "string": "33 (Min/Max 25/33)"}},
+    {"id": 194, "name": "Temperature_Celsius", "value": 31, "worst": 46,
+     "thresh": 0, "raw": {"value": 53975218590225, "string": "33 (0 15 0 0 0)"}},
+    {"id": 195, "name": "Hardware_ECC_Recovered", "value": 120, "worst": 120,
+     "thresh": 0, "raw": {"value": 167933169, "string": "167933169"}},
+    {"id": 199, "name": "UDMA_CRC_Error_Count", "value": 200, "worst": 200,
+     "thresh": 0, "raw": {"value": 0, "string": "0"}},
+    {"id": 240, "name": "Head_Flying_Hours", "value": 100, "worst": 100,
+     "thresh": 0, "raw": {"value": 152114856722435, "string": "3 (138 89 0)"}},
+]
+
+
+def _attrs_by_id(p: dict) -> dict:
+    return {a["id"]: a for a in p["ata_attributes"]}
+
+
+def test_display_fields_seagate_real_device():
+    """真实希捷 JSON：composite 取前导整数；1/7/195 厂商编码不展示数值。"""
+    from cold_manifest import smart
+
+    p = smart.parse_smart(json.dumps(
+        {"ata_smart_attributes": {"table": _SEAGATE_ATTRS}}))
+    a = _attrs_by_id(p)
+    # 240：打包编码 → composite/3（修复"飞行 1.5 亿亿小时"）
+    assert a[240]["display_kind"] == "composite"
+    assert a[240]["display_value"] == 3
+    assert a[240]["display_text"] == "3 (138 89 0)"
+    assert a[240]["raw_value"] == 152114856722435  # 原始值不丢
+    # 1/7/195：希捷私有编码 → vendor_encoded/None
+    for i in (1, 7, 195):
+        assert a[i]["display_kind"] == "vendor_encoded", i
+        assert a[i]["display_value"] is None, i
+        assert a[i]["raw_value"] > 0  # raw 数据仍在
+    assert a[1]["raw_value"] == 167933169
+    assert a[7]["raw_value"] == 547432
+    # 194/190：温度等复合串 → composite 前导整数
+    assert a[194]["display_kind"] == "composite"
+    assert a[194]["display_value"] == 33
+    assert a[190]["display_value"] == 33
+    # 5/9/12：纯整数 → plain 且等于 raw.value
+    for i in (5, 9, 12):
+        assert a[i]["display_kind"] == "plain", i
+        assert a[i]["display_value"] == a[i]["raw_value"], i
+    # 199：UDMA CRC 0 → plain/0
+    assert a[199]["display_kind"] == "plain"
+    assert a[199]["display_value"] == 0
+
+
+def test_display_fields_non_seagate_vendor_ids_still_suppressed():
+    """非希捷风格夹具：1 的 raw.string 为 "0" → vendor_encoded/None（展示端用
+    归一化值），但 raw_value 仍为 0（不丢数据）。"""
+    from cold_manifest import smart
+
+    p = smart.parse_smart(json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 1, "name": "Raw_Read_Error_Rate", "raw": {"value": 0,
+                                                         "string": "0"}},
+    ]}}))
+    a = p["ata_attributes"][0]
+    assert a["display_kind"] == "vendor_encoded"
+    assert a["display_value"] is None
+    assert a["raw_value"] == 0
+    assert a["display_text"] == "0"
+
+
+def test_display_fields_missing_raw_never_raises():
+    """任一属性缺 raw 段 → display_text=""、display_value=None，不抛异常。"""
+    from cold_manifest import smart
+
+    p = smart.parse_smart(json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 5, "name": "Reallocated_Sector_Ct"},
+        {"id": 9, "name": "Power_On_Hours", "raw": {}},
+        {"id": 240, "name": "Head_Flying_Hours", "raw": {"value": 42}},
+    ]}}))
+    a = _attrs_by_id(p)
+    for i in (5, 9):
+        assert a[i]["display_text"] == ""
+        assert a[i]["display_value"] is None
+    assert a[240]["display_text"] == "42"   # 无 string 回退 value 字符串
+    assert a[240]["display_value"] == 42
+    assert a[240]["display_kind"] == "plain"
+
+
+def test_ata_contract_passes_display_fields_through():
+    """ata_contract 透出三个新键（契约只增不改）。"""
+    from cold_manifest import smart
+
+    assert all(k in smart.ATA_CONTRACT_KEYS for k in ())  # 契约顶层键不变
+    p = smart.parse_smart(json.dumps(
+        {"ata_smart_attributes": {"table": _SEAGATE_ATTRS}}))
+    out = smart.ata_contract(p)
+    a = {x["id"]: x for x in out["ata_attributes"]}
+    assert a[240]["display_value"] == 3
+    assert a[240]["display_kind"] == "composite"
+    assert a[1]["display_kind"] == "vendor_encoded"
+    assert a[1]["display_value"] is None
+    for row in out["ata_attributes"]:
+        assert set(("display_text", "display_value", "display_kind")) <= set(row)
+
+
+def test_display_table_evidence(capsys: object) -> None:
+    """打印夹具 display_* 对照表作为证据。"""
+    from cold_manifest import smart
+
+    p = smart.parse_smart(json.dumps(
+        {"ata_smart_attributes": {"table": _SEAGATE_ATTRS}}))
+    print(f"\n{'id':>4} {'name':<26} {'kind':<15} "
+          f"{'display_value':>15}  display_text")
+    for a in p["ata_attributes"]:
+        print(f"{a['id']:>4} {(a['name'] or ''):<26} {a['display_kind']:<15} "
+              f"{str(a['display_value']):>15}  {a['display_text']}")

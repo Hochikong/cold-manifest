@@ -440,12 +440,53 @@ def ata_contract(item: "dict | None") -> dict:
     return out
 
 
+# 厂商私有编码属性 ID：Seagate 把 Raw_Read_Error_Rate(1)/Seek_Error_Rate(7)/
+# Hardware_ECC_Recovered(195) 的 raw 编码成厂商私有格式（如 167933169），
+# 与"错误计数"无对应关系，不能当数值展示；WD/HGST 等同 ID 的 raw 才是真计数。
+# 这些属性 display_value=None、display_kind="vendor_encoded"（raw_value 不动）。
+VENDOR_ENCODED_ATTR_IDS = frozenset({1, 7, 195})
+
+
+def _display_fields(attr_id: "int | None", raw_string: "str | None",
+                    raw_value: "int | None") -> "tuple[str, int | None, str]":
+    """属性 → (display_text, display_value, display_kind)。
+
+    display_text：优先 raw.string，没有则 raw.value 字符串形式，都没有 → ""。
+    display_value（瓦片展示语义值）：
+      1. raw.string 形如「前导整数 + 额外内容」（括号/单位等，如
+         "3 (138 89 0)"、"33 (Min/Max 32/33)"）→ 取前导整数，kind="composite"；
+      2. raw.string 是纯整数：属性 ∈ VENDOR_ENCODED_ATTR_IDS →
+         None + kind="vendor_encoded"；否则取该整数，kind="plain"；
+      3. 都不行 → None + kind="plain"。
+    """
+    text = ""
+    if isinstance(raw_string, str) and raw_string.strip():
+        text = raw_string.strip()
+    elif raw_value is not None:
+        text = str(raw_value)
+    # raw.string 缺失时回退 raw.value 字符串形式参与语义判定
+    s = (raw_string.strip() if isinstance(raw_string, str) else "") or \
+        (str(raw_value) if raw_value is not None else "")
+    m = re.match(r"^(\d+)\s+(.+)$", s)
+    if m:
+        return text, _int_or_none(m.group(1)), "composite"
+    if s and re.fullmatch(r"\d+", s):
+        v = _int_or_none(s)
+        if v is not None:
+            if attr_id in VENDOR_ENCODED_ATTR_IDS:
+                return text, None, "vendor_encoded"
+            return text, v, "plain"
+    return text, None, "plain"
+
+
 def _parse_ata_attributes(sj: dict) -> list:
     """ata_smart_attributes.table → 规整列表（每项 id/name/value/worst/thresh/
-    raw_value/raw_string/when_failed）；段缺失（NVMe）→ []。绝不抛异常。
+    raw_value/raw_string/display_text/display_value/display_kind/when_failed）；
+    段缺失（NVMe）→ []。绝不抛异常。
 
     raw_value：优先 raw.string 里可解析的整数（48-bit 多字时 smartctl 已拼好
     十进制串），回退 raw.value；都解析不了 → None（raw_string 保留原文）。
+    display_text/display_value/display_kind 见 _display_fields。
     """
     try:
         table = sj.get("ata_smart_attributes")
@@ -462,6 +503,8 @@ def _parse_ata_attributes(sj: dict) -> list:
             if raw_value is None:
                 raw_value = _int_or_none(raw.get("value"))
             wf = e.get("when_failed")
+            display_text, display_value, display_kind = _display_fields(
+                _int_or_none(e.get("id")), raw_string, raw_value)
             out.append({
                 "id": _int_or_none(e.get("id")),
                 "name": e.get("name") or None,
@@ -472,6 +515,11 @@ def _parse_ata_attributes(sj: dict) -> list:
                 "thresh": _int_or_none(e.get("thresh")),
                 "raw_value": raw_value,
                 "raw_string": str(raw_string) if raw_string is not None else None,
+                # 展示语义（瓦片用）：display_value 是可展示的数值，
+                # display_kind ∈ plain/composite/vendor_encoded（见 _display_fields）
+                "display_text": display_text,
+                "display_value": display_value,
+                "display_kind": display_kind,
                 # smartctl 用 "" 表示"从未失败"，保留原文；仅缺失才置 None
                 "when_failed": wf if isinstance(wf, str) else None,
                 "when_failed_zh": _when_failed_zh(wf),
