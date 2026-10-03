@@ -346,15 +346,20 @@ def _disk_index_of(item: dict) -> "int | None":
 
 
 def _locate_attached_candidates(disk_id: str, path: "str | None"
-                                ) -> "tuple[Any, list[dict]]":
-    """定位当前插着的盘的**候选链**：返回 (attached 容量或 None, 候选列表)。
+                                ) -> "tuple[Any, list[dict], dict]":
+    """定位当前插着的盘的**候选链**：返回 (attached 容量或 None, 候选列表, 定位信息)。
 
-    现场读取必须走候选链（smart_device_candidates），单设备曾导致 USB 桥盘
+    定位信息 loc = {expected_serial?, scan_info?}：能拿到目标盘序列号时走
+    resolve_smart_device 按身份（序列号优先）定位，scan_info 透传给调用方
+    展示映射结论（mapped_by/identity_ambiguity）。
+
+    现场读取必须走候选链，单设备曾导致 USB 桥盘
     永远打不开（PhysicalDrive 形态在桥上常 Invalid argument）。有 path：
     Windows 优先在 attached 枚举里反查盘号走全链，反查不到退回
     smart.device_candidates_for_path；Linux 直接 /proc/mounts 定位。
     无 path：按序列号在 attached 里找。定位不到抛 HTTPException 404。
     """
+    loc: dict = {}
     attached: "dict | None" = None
     need_attached = path is None or sys.platform == "win32"
     if need_attached:
@@ -388,14 +393,22 @@ def _locate_attached_candidates(disk_id: str, path: "str | None"
             )
         if item is not None:
             idx = _disk_index_of(item)
-            cands = (smart.smart_device_candidates(idx) if idx is not None
-                     else smart.device_candidates_for_path(path))
-            return item.get("size_bytes"), cands
+            exp_serial = str(item.get("serial") or "").strip() or None
+            if exp_serial or idx is not None:
+                cands, si = smart.resolve_smart_device(
+                    expected_serial=exp_serial,
+                    expected_capacity_bytes=item.get("size_bytes"),
+                    expected_model=str(item.get("model") or "").strip() or None,
+                    disk_index=idx)
+                loc = {"expected_serial": exp_serial, "scan_info": si}
+            else:
+                cands = smart.device_candidates_for_path(path)
+            return item.get("size_bytes"), cands, loc
         cands = smart.device_candidates_for_path(path)
         if not cands:
             raise HTTPException(status_code=404,
                                 detail=f"无法定位 {path} 所在物理盘")
-        return None, cands
+        return None, cands, loc
 
     want = (disk_id or "").strip()
     item = next(
@@ -407,19 +420,24 @@ def _locate_attached_candidates(disk_id: str, path: "str | None"
         raise HTTPException(status_code=404,
                             detail=f"盘 {disk_id} 当前不在线（未在 /api/disks/attached 中）")
     idx = _disk_index_of(item)
-    if idx is not None:
-        return item.get("size_bytes"), smart.smart_device_candidates(idx)
-    dev = str(item.get("device") or "").strip()
-    if not dev and item.get("volumes"):
-        cands = smart.device_candidates_for_path(
-            item["volumes"][0].get("path") or "")
-        if cands:
-            return item.get("size_bytes"), cands
-    if not dev:
+    cands, si = smart.resolve_smart_device(
+        expected_serial=want or None,
+        expected_capacity_bytes=item.get("size_bytes"),
+        expected_model=str(item.get("model") or "").strip() or None,
+        disk_index=idx)
+    loc = {"expected_serial": want or None, "scan_info": si}
+    if not cands:
+        # 扫描表空且无盘号回退形态：退回 attached 枚举的设备串/卷路径
+        dev = str(item.get("device") or "").strip()
+        if dev:
+            cands = [{"device": dev, "type": "", "source": "attached"}]
+        elif item.get("volumes"):
+            cands = smart.device_candidates_for_path(
+                item["volumes"][0].get("path") or "")
+    if not cands:
         raise HTTPException(status_code=404,
                             detail=f"盘 {disk_id} 在线但无法定位物理设备")
-    return item.get("size_bytes"), [{"device": dev, "type": "",
-                                     "source": "attached"}]
+    return item.get("size_bytes"), cands, loc
 
 
 def _capacity_screen(cands: "list[dict]",
@@ -458,7 +476,7 @@ def disk_smart_read(disk_id: str, request: Request,
     盘不在（404 之外）的读取失败一律 200 + ok=false + 人话原因，绝不 500。
     """
     get_state(request)  # 仅确认服务已挂 data_root
-    size_bytes, cands = _locate_attached_candidates(
+    size_bytes, cands, loc = _locate_attached_candidates(
         disk_id, body.path if body else None)
     size_bytes, cap_status = _capacity_screen(cands, size_bytes)
     if not cands:
@@ -466,9 +484,34 @@ def disk_smart_read(disk_id: str, request: Request,
     res = smart.read_smart_verbose(devices=cands)
     if cap_status:
         res.setdefault("scan_info", {})["capacity_check"] = cap_status
+    loc_si = loc.get("scan_info")
+    if loc_si:
+        merged_si = dict(res.get("scan_info") or {})
+        for k in ("mapped_by", "identity_risk", "identity_ambiguity"):
+            if loc_si.get(k) is not None:
+                merged_si[k] = loc_si[k]
+        res["scan_info"] = merged_si
     device = res.get("device") or (cands[0]["device"] if cands else "")
     parsed = smart.parse_smart(res["raw"],
                                exit_status=res.get("exit_status")) if res["ok"] else None
+    # 身份核验（PR-B）：读到序列号与目标盘期望序列号不一致 → ok=false，
+    # 防止把另一块盘的 SMART 当成目标盘的数据返回
+    reason = res["reason"]
+    message = res["message"]
+    expected_serial = str(loc.get("expected_serial") or "").strip()
+    loc_si = loc.get("scan_info") or {}
+    if parsed and expected_serial and loc_si.get("mapped_by"):
+        # 仅当定位真走过身份解析（scan_info 带 mapped_by）时才核验，
+        # 避免退化路径（attached 单候选等）误伤
+        got = str(parsed.get("serial") or "").strip()
+        if got and got.upper() != expected_serial.upper():
+            res["ok"] = False
+            reason = "identity_mismatch"
+            message = (
+                f"读到的是另一块盘：smartctl 报告序列号 {got}，"
+                f"与目标盘期望序列号 {expected_serial} 不一致"
+                "（同型号同容量多盘时映射可能错位）；"
+                "建议拔掉其它同型号盘再试，或用 --serial 显式区分")
     out: dict = {
         "disk_id": disk_id,
         "device": device,
@@ -476,8 +519,8 @@ def disk_smart_read(disk_id: str, request: Request,
         "scan_info": res.get("scan_info"),
         "ok": res["ok"],
         "device_type": res["device_type"],
-        "reason": res["reason"],
-        "message": res["message"],
+        "reason": reason,
+        "message": message,
         "raw_excerpt": res["raw_excerpt"],
         "attempts": res["attempts"],
         "exit_status": res.get("exit_status"),

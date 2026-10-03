@@ -47,6 +47,10 @@ class DiskInfo:
     smart_attempts: "list | None" = None  # smartctl 类型兜底链逐次尝试记录
     smart_exit_status: "int | None" = None  # 生效那次的 smartctl exit_status
     smart_scan_info: "dict | None" = None  # 设备映射结论（扫描表/候选链/生效设备）
+    identity_verified: "bool | None" = None  # smartctl 设备身份是否按序列号验证通过
+    identity_risk: str = ""  # 身份风险标记（如 unverified_index_mapping）
+    identity_ambiguity: "str | None" = None  # 身份歧义说明（多台无法区分时的人话）
+    identity_warnings: "list | None" = None  # 身份判定过程的留痕 warning
 
 
 @dataclass

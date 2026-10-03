@@ -162,6 +162,8 @@ def test_smart_read_live_ok(client: TestClient, monkeypatch) -> None:
                    "size_bytes": 100, "volumes": []}],
         "count": 1,
     })
+    monkeypatch.setattr(smart, "resolve_smart_device", lambda **kw:
+                        ([{"device": "/dev/sdb", "type": "", "source": "attached"}], {}))
     monkeypatch.setattr(
         smart, "read_smart_verbose",
         lambda dev=None, *, devices=None, **kw: _ok_verbose())
@@ -214,12 +216,12 @@ def test_smart_read_live_uses_candidate_chain(client: TestClient,
     """现场读取走候选链：attached 项的设备传入 read_smart_verbose(devices=...)。"""
     seen: dict = {}
 
-    def fake_cands(disk_index, letter=None):
-        seen["disk_index"] = disk_index
+    def fake_resolve(**kw):
+        seen["disk_index"] = kw.get("disk_index")
         return [{"device": "/dev/sdb", "type": "nvme", "source": "scan"},
-                {"device": "\\\\.\\PhysicalDrive1", "type": "", "source": "fallback-pd"}]
+                {"device": "\\\\.\\PhysicalDrive1", "type": "", "source": "fallback-pd"}], {}
 
-    monkeypatch.setattr(smart, "smart_device_candidates", fake_cands)
+    monkeypatch.setattr(smart, "resolve_smart_device", fake_resolve)
 
     def fake_verbose(dev=None, *, devices=None, **kw):
         seen["devices"] = devices
@@ -241,7 +243,7 @@ def test_smart_read_live_uses_candidate_chain(client: TestClient,
     assert r.status_code == 200
     body = r.json()
     assert seen["devices"][0]["device"] == "/dev/sdb"
-    assert body["device_candidates"] == ["/dev/sdb"]
+    assert body["device_candidates"] == ["/dev/sdb", "\\\\.\\PhysicalDrive1"]
     assert seen.get("disk_index") is None  # linux 设备名不产盘号，不走 smart_device_candidates
 
 
@@ -250,13 +252,13 @@ def test_smart_read_live_physicaldrive_index_chain(client: TestClient,
     """attached 项是 \\\\.\\PhysicalDriveN 时提取盘号 → smart_device_candidates(N)。"""
     seen: dict = {}
 
-    def fake_cands(disk_index, letter=None):
-        seen["disk_index"] = disk_index
+    def fake_resolve(**kw):
+        seen["disk_index"] = kw.get("disk_index")
         return [{"device": "/dev/sdb", "type": "", "source": "fallback-sd"},
-                {"device": f"\\\\.\\PhysicalDrive{disk_index}", "type": "",
-                 "source": "fallback-pd"}]
+                {"device": f"\\\\.\\PhysicalDrive{kw.get('disk_index')}",
+                 "type": "", "source": "fallback-pd"}], {}
 
-    monkeypatch.setattr(smart, "smart_device_candidates", fake_cands)
+    monkeypatch.setattr(smart, "resolve_smart_device", fake_resolve)
     monkeypatch.setattr(
         smart, "read_smart_verbose",
         lambda dev=None, *, devices=None, **kw: {
@@ -459,6 +461,8 @@ def test_smart_read_response_ssd(client_with_nvme: TestClient, monkeypatch) -> N
                    "size_bytes": 100, "volumes": []}],
         "count": 1,
     })
+    monkeypatch.setattr(smart, "resolve_smart_device", lambda **kw:
+                        ([{"device": "/dev/sdb", "type": "", "source": "attached"}], {}))
     monkeypatch.setattr(
         smart, "read_smart_verbose",
         lambda dev=None, *, devices=None, **kw:
@@ -559,6 +563,8 @@ def test_smart_read_ata_contract(ata_client: TestClient, monkeypatch) -> None:
                    "size_bytes": 100, "volumes": []}],
         "count": 1,
     })
+    monkeypatch.setattr(smart, "resolve_smart_device", lambda **kw:
+                        ([{"device": "/dev/sdb", "type": "", "source": "attached"}], {}))
     monkeypatch.setattr(
         smart, "read_smart_verbose",
         lambda dev=None, *, devices=None, **kw: {

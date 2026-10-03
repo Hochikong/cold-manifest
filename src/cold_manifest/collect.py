@@ -245,6 +245,20 @@ def _write_meta(conn: sqlite3.Connection, scan_root: Path, volume_id: str,
     smart_scan_info = getattr(disk, "smart_scan_info", None)
     if smart_scan_info:
         meta["smart_scan_info_json"] = json.dumps(smart_scan_info, ensure_ascii=False)
+    # 设备身份校验结论（PR-B）：仅在有值时写
+    identity_verified = getattr(disk, "identity_verified", None)
+    if identity_verified is not None:
+        meta["identity_verified"] = "1" if identity_verified else "0"
+    identity_risk = getattr(disk, "identity_risk", None)
+    if identity_risk:
+        meta["identity_risk"] = str(identity_risk)
+    identity_ambiguity = getattr(disk, "identity_ambiguity", None)
+    if identity_ambiguity:
+        meta["identity_ambiguity"] = str(identity_ambiguity)
+    identity_warnings = getattr(disk, "identity_warnings", None)
+    if identity_warnings:
+        meta["identity_warnings_json"] = json.dumps(identity_warnings,
+                                                    ensure_ascii=False)
     if serial_fallback:
         # 序列号回退时的原始探测值（诊断用：说明为何 volume_id 用了卷序列号）
         meta["probe_serial_raw"] = probe_serial_raw
@@ -379,7 +393,11 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
                           physical_serial=disk.physical_serial or None,
                           bridge_model=disk.bridge_model or None,
                           capacity_bytes=disk.capacity_bytes,
-                          interface_type=disk.interface_type or None)
+                          interface_type=disk.interface_type or None,
+                          identity_verified=(
+                              (1 if disk.identity_verified else 0)
+                              if getattr(disk, "identity_verified", None)
+                              is not None else None))
         if reg["conflicts"]:
             fields_seen = "、".join(c["field"] for c in reg["conflicts"])
             warnings.append(

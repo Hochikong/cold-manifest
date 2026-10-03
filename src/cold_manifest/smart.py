@@ -592,42 +592,225 @@ def scan_devices() -> "list[dict]":
     return entries
 
 
-def smart_device_candidates(disk_index: "int | None", letter: "str | None" = None
-                            ) -> "list[dict]":
-    """候选设备串（按优先级，去重保序）：[{device, type, source, note?}]。
+# ---------------------------------------------------------------- 设备身份解析
+# 设计（PR-B）：定位不再"按盘号下标"信任 smartctl --scan 行序——同型号同容量
+# 多盘时下标映射可能错位，读到另一块盘的 SMART。改为：枚举扫描表全部条目，
+# 逐台 `smartctl -i -j` 读身份，与期望序列号/容量/型号打分排序，序列号精确
+# 匹配的排最前；下标回退形态显式标 risk="unverified_index_mapping"。
 
-    source ∈ env / scan / fallback-sd / letter；note（可选）记录候选
-    背景，供 scan_info 展示。**只出 /dev/sdN / 盘符形态**——外部调研
-    定案：\\\\.\\PhysicalDriveN 不是 smartctl 认可的设备名（只认
-    /dev/sd[a-z]、/dev/pdN、X:），裸传报 EINVAL "Invalid argument"，
-    与 -d 无关，因此一律不进候选链。
+
+def read_device_identity(device: str, suggested_type: "str | None" = None
+                         ) -> "dict | None":
+    """读一台设备的身份（serial/model/capacity）。失败/无 JSON → None。
+
+    按 ``smartctl -i -j`` 走类型兜底链（_device_types，语义与 read_smart
+    一致），第一次读到 JSON 即解析返回：
+    ``{serial, capacity_bytes, model, device_type, raw}``。绝不抛异常。
+    """
+    for dt in _device_types(suggested_type, windows=_is_windows_device(device)):
+        cmd = [smartctl_exec(), *extra_args(), *(["-d", dt] if dt else []),
+               "-i", "-j", device]
+        try:
+            proc = _run_cmd(cmd)
+            if proc is None or not (proc.stdout or "").lstrip().startswith("{"):
+                continue
+            if proc.returncode & _FAIL_MASK:
+                continue
+            sj = json.loads(proc.stdout)
+        except Exception:  # noqa: BLE001 — 身份探测绝不抛
+            continue
+        if not isinstance(sj, dict):
+            continue
+        dev = sj.get("device") if isinstance(sj.get("device"), dict) else {}
+        try:
+            cap = int((sj.get("user_capacity") or {}).get("bytes"))
+        except (TypeError, ValueError):
+            cap = None
+        return {
+            "serial": (sj.get("serial_number") or "").strip() or None,
+            "capacity_bytes": cap,
+            "model": sj.get("model_name") or sj.get("device_model")
+            or dev.get("model") or None,
+            "device_type": dt,
+            "raw": proc.stdout,
+        }
+    return None
+
+
+def _score_identity_match(ident: "dict | None",
+                          expected_serial: "str | None",
+                          expected_capacity_bytes: "int | None",
+                          expected_model: "str | None") -> int:
+    """身份匹配打分：serial 精确(忽略大小写) 100；serial 缺/占位且容量≤5%
+    且型号匹配 80；容量≤20% 且型号匹配 50；仅容量≤20% 20；否则 0。
+
+    双方都有序列号但不一致 → 0（证明是另一块盘）。
+    """
+    if not ident:
+        return 0
+    serial = (ident.get("serial") or "").strip()
+    if expected_serial:
+        exp = expected_serial.strip()
+        if serial:
+            return 100 if serial.upper() == exp.upper() else 0
+        # serial 缺失/占位（桥常报全 0 / 乱占位）：只能靠容量+型号弱匹配
+    cap = ident.get("capacity_bytes")
+    exp_cap = expected_capacity_bytes
+    cap5 = bool(cap and exp_cap and abs(cap - exp_cap) <= 0.05 * max(cap, exp_cap))
+    cap20 = bool(cap and exp_cap and abs(cap - exp_cap) <= 0.20 * max(cap, exp_cap))
+    model_match = bool(
+        expected_model and ident.get("model")
+        and str(ident["model"]).strip().upper()
+        == str(expected_model).strip().upper())
+    if cap5 and model_match:
+        return 80
+    if cap20 and model_match:
+        return 50
+    if cap20:
+        return 20
+    return 0
+
+
+def resolve_smart_device(*, expected_serial: "str | None" = None,
+                         expected_capacity_bytes: "int | None" = None,
+                         expected_model: "str | None" = None,
+                         disk_index: "int | None" = None,
+                         letter: "str | None" = None
+                         ) -> "tuple[list[dict], dict]":
+    """按身份（序列号优先）定位设备：返回 (候选链, scan_info)。
+
+    - CLDM_SMARTCTL_DEVICE 环境覆盖优先（mapped_by="env_override"）；
+    - 枚举 scan_devices() 全部条目，逐台 read_device_identity（同一次调用
+      内按 device 缓存）并 _score_identity_match 打分，按分数降序排候选；
+      有 expected_serial 时，读到不同序列号的条目（证明是另一块盘）剔除；
+    - 末尾追加 /dev/sd{disk_index} 回退候选（risk="unverified_index_mapping"）
+      与盘符候选；
+    - scan_info["mapped_by"] ∈ serial_match | weak_match | env_override |
+      fallback；scan_info["identity_ambiguity"] 非空表示多台设备无法区分
+      （多台同序列号 / 多台弱匹配且都读不到序列号），附中文原因与建议。
     """
     env = os.environ.get("CLDM_SMARTCTL_DEVICE")
     if env and env.strip():
-        return [{"device": env.strip(), "type": "", "source": "env"}]
-    cands: "list[dict]" = []
+        cands: "list[dict]" = [{"device": env.strip(), "type": "",
+                                "source": "env"}]
+        return cands, {
+            "devices": scan_devices(), "candidates": [dict(c) for c in cands],
+            "device_used": None, "mapped_by": "env_override",
+            "mapped_from_scan": False,
+        }
 
-    def _add(device: str, dtype: str, source: str,
-             note: "str | None" = None) -> None:
-        if device and all(c["device"] != device for c in cands):
-            entry = {"device": device, "type": dtype, "source": source}
-            if note:
-                entry["note"] = note
-            cands.append(entry)
+    entries = scan_devices()
+    has_expected = bool(expected_serial or expected_capacity_bytes
+                        or expected_model)
+    ident_cache: "dict[str, dict | None]" = {}
+    scored: "list[tuple[int, dict]]" = []
+    for e in entries:
+        dev = e["device"]
+        if dev not in ident_cache:
+            ident_cache[dev] = read_device_identity(dev, e.get("type") or "")
+        ident = ident_cache[dev]
+        score = _score_identity_match(ident, expected_serial,
+                                      expected_capacity_bytes,
+                                      expected_model)
+        # 读到**不同**序列号：证明是另一块盘，不进候选链；
+        # 读不到序列号（-i 失败/桥占位）保留候选，走弱匹配+歧义检测
+        if expected_serial and ident and (ident.get("serial") or "").strip() \
+                and score == 0:
+            continue
+        entry: dict = {"device": dev, "type": e.get("type") or "",
+                       "source": "scan"}
+        if has_expected:
+            entry["identity_score"] = score
+            if ident and ident.get("serial"):
+                entry["identity_serial"] = ident["serial"]
+        if score == 0:
+            entry.setdefault("risk", "unverified_identity")
+        scored.append((score, entry))
+    scored.sort(key=lambda t: t[0], reverse=True)
 
-    if isinstance(disk_index, int):
-        entries = scan_devices()
-        if 0 <= disk_index < len(entries):
-            e = entries[disk_index]
-            _add(e["device"], e["type"], "scan")
-        if 0 <= disk_index < 26:
-            sd = f"/dev/sd{chr(ord('a') + disk_index)}"
-            _add(sd, "", "fallback-sd", note=(
-                "扫描映射不可用时的回退形态；\\\\.\\PhysicalDriveN 不是"
-                " smartctl 认可的设备名（裸传报 Invalid argument），"
-                "一律不进候选链"))
-    elif letter:
-        _add(f"{letter}:", "", "letter")
+    # 无期望值且给了盘号：保持旧行为——只取扫描表对应下标一条（超出范围
+    # 则扫描表整条不取，仅剩回退形态）（下标映射本身未经验证，risk 由
+    # 回退候选承载）
+    if not has_expected and isinstance(disk_index, int):
+        scored = [scored[disk_index]] if 0 <= disk_index < len(scored) else []
+    elif not has_expected:
+        scored = []  # 旧行为：无盘号时扫描表条目不进候选链（只有盘符等形态）
+
+    cands = [e for _s, e in scored]
+
+    # 歧义检测（多台无法区分）
+    ambiguity: "str | None" = None
+    if expected_serial:
+        hits = [e for _s, e in scored
+                if str(e.get("identity_serial") or "").strip().upper()
+                == expected_serial.strip().upper()
+                and e.get("identity_score") == 100]
+        if len(hits) > 1:
+            ambiguity = (
+                f"多台设备（{'、'.join(e['device'] for e in hits)}）"
+                f"均报告相同序列号 {expected_serial}，无法确定哪块是目标盘；"
+                f"建议拔掉其中一块再采，或用 --serial 显式区分")
+    if ambiguity is None and has_expected and len(scored) >= 2:
+        weak_no_serial = [e for s, e in scored
+                          if e["source"] == "scan" and 0 < s <= 80
+                          and not e.get("identity_serial")]
+        if len(weak_no_serial) >= 2:
+            ambiguity = (
+                f"多台设备（{'、'.join(e['device'] for e in weak_no_serial)}）"
+                "均无法读出序列号且型号/容量相同，无法确定哪块是目标盘；"
+                "建议拔掉其中一块再采，或用 --serial 显式区分")
+
+    # 回退候选：/dev/sd{disk_index}（下标映射未经验证）+ 盘符
+    if isinstance(disk_index, int) and 0 <= disk_index < 26:
+        sd = f"/dev/sd{chr(ord('a') + disk_index)}"
+        if all(c["device"] != sd for c in cands):
+            cands.append({"device": sd, "type": "", "source": "fallback-sd",
+                          "risk": "unverified_index_mapping", "note": (
+                              "扫描映射不可用/未通过身份校验时的回退形态；"
+                              "\\\\.\\PhysicalDriveN 不是 smartctl 认可的"
+                              "设备名，一律不进候选链；下标映射未经验证，"
+                              "同型号同容量多盘可能错位")})
+    if letter:
+        lt = f"{letter.rstrip(':')}:"
+        if all(c["device"] != lt for c in cands):
+            cands.append({"device": lt, "type": "", "source": "letter"})
+
+    mapped_by = "fallback"
+    if cands and cands[0]["source"] == "scan":
+        sc = cands[0].get("identity_score")
+        if sc == 100:
+            mapped_by = "serial_match"
+        elif sc:
+            mapped_by = "weak_match"
+    top_risk = cands[0].get("risk") if cands else None
+    scan_info: dict = {
+        "devices": entries,
+        "candidates": [{"device": c["device"], "type": c.get("type") or "",
+                        "source": c.get("source") or "",
+                        **({"note": c["note"]} if c.get("note") else {}),
+                        **({"risk": c["risk"]} if c.get("risk") else {}),
+                        **({"identity_score": c["identity_score"]}
+                           if "identity_score" in c else {})}
+                       for c in cands],
+        "device_used": None,
+        "mapped_from_scan": any(c["source"] == "scan" for c in cands),
+        "mapped_by": mapped_by,
+    }
+    if top_risk:
+        scan_info["identity_risk"] = top_risk
+    if ambiguity:
+        scan_info["identity_ambiguity"] = ambiguity
+    return cands, scan_info
+
+
+def smart_device_candidates(disk_index: "int | None" = None,
+                            letter: "str | None" = None) -> "list[dict]":
+    """候选设备串（兼容层）：内部走 resolve_smart_device（无期望值）。
+
+    完整身份解析见 resolve_smart_device；无期望值时行为与旧版一致：
+    CLDM_SMARTCTL_DEVICE 覆盖 → 扫描表对应下标 → /dev/sdN 回退 → 盘符。
+    """
+    cands, _si = resolve_smart_device(disk_index=disk_index, letter=letter)
     return cands
 
 
