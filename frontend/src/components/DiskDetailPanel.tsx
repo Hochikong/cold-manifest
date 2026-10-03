@@ -675,6 +675,116 @@ function RawOutputBlock({ text, title }: { text: string; title: string }) {
   )
 }
 
+/** 「现在读取 SMART」拒绝原因 → 警示卡文案（后端"先核验后读取"）。 */
+const SMART_REJECT_META: Record<string, { title: string; hint: string }> = {
+  not_attached: {
+    title: '这块盘现在不在线',
+    hint: '请把盘插上，等系统能识别到它后，再点「现在读取 SMART」。',
+  },
+  identity_mismatch: {
+    title: '检测到另一块盘',
+    hint: '当前插着的和记录的不是同一块盘。请对照下面的序列号，确认插的是要读的盘后再重试。',
+  },
+  serial_unverified: {
+    title: '序列号未经核实',
+    hint: '这次没能从盘上读到可信的序列号（常见于非管理员运行或 USB 盒不直通）。为避免读错盘，建议先核对盘的身份；确有需要时在采集时手工指定序列号后再读。',
+  },
+  enumeration_failed: {
+    title: '设备枚举失败',
+    hint: '系统枚举磁盘时出了错。请重试一次；仍然失败时，尝试以管理员身份运行后再读。',
+  },
+}
+
+/** 现场读取被拒绝时的警示卡：标题按 reason 区分，正文用后端 message；未知/缺失 reason 退回 message 展示。 */
+function SmartRejectAlert({ result, diagText }: { result: SmartReadResult; diagText: string | null }) {
+  const meta = result.reason ? SMART_REJECT_META[result.reason] : undefined
+  const scan = result.scan_info
+  const showSerialPair = result.reason === 'identity_mismatch' &&
+    (result.expected_serial != null || result.current_serial != null)
+  return (
+    <Alert
+      type={result.reason === 'identity_mismatch' ? 'error' : 'warning'}
+      showIcon
+      title={meta?.title ?? '现场读取未完成'}
+      description={
+        <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+          <Text style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {result.message || '未能读取 SMART，原因未知。请稍后重试。'}
+          </Text>
+          {showSerialPair && (
+            <Descriptions size="small" column={1} bordered style={{ maxWidth: 480 }}>
+              <Descriptions.Item label="记录的序列号">
+                <Text code copyable={result.expected_serial ? { text: result.expected_serial, tooltips: ['复制', '已复制'] } : false}>
+                  {result.expected_serial || '—'}
+                </Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="当前盘的序列号">
+                <Text code copyable={result.current_serial ? { text: result.current_serial, tooltips: ['复制', '已复制'] } : false}>
+                  {result.current_serial || '—'}
+                </Text>
+              </Descriptions.Item>
+            </Descriptions>
+          )}
+          {meta && <Text type="secondary">{meta.hint}</Text>}
+          {!meta && result.reason && <Text type="secondary">失败类别：{result.reason}</Text>}
+          {scan?.capacity_check === 'mismatch' && (
+            <Text type="warning" style={{ fontSize: 12 }}>
+              容量软校验不匹配：扫描映射候选的实际容量与该盘枚举容量差超过 20%，已剔除该候选（存在拿错盘风险）。
+            </Text>
+          )}
+          {(scan?.devices?.length || scan?.candidates?.length) && (
+            <div>
+              {scan?.devices?.length ? (
+                <>
+                  <Text type="secondary" style={{ fontSize: 12 }}>扫描表（smartctl --scan）：</Text>
+                  {scan.devices.map((d) => (
+                    <div key={d.device} style={{ fontSize: 12 }}>
+                      <Text code>{d.device}</Text>{d.type ? <Text type="secondary"> · type {d.type}</Text> : null}
+                    </div>
+                  ))}
+                </>
+              ) : null}
+              {scan?.candidates?.length ? (
+                <>
+                  <Text type="secondary" style={{ fontSize: 12 }}>候选链（实际尝试顺序）：</Text>
+                  {scan.candidates.map((c, i) => (
+                    <div key={i} style={{ fontSize: 12 }}>
+                      <Text code>{c.device || '-'}</Text>
+                      <Text type="secondary"> · -d {c.type || 'default'} · 来源 {c.source || '未知'}</Text>
+                    </div>
+                  ))}
+                </>
+              ) : null}
+              {scan?.device_used ? <Text type="secondary" style={{ fontSize: 12 }}>生效设备：<Text code>{scan.device_used}</Text></Text> : null}
+            </div>
+          )}
+          {result.attempts.length > 0 && (
+            <div>
+              <Text type="secondary" style={{ fontSize: 12 }}>尝试记录（共 {result.attempts.length} 次）：</Text>
+              {result.attempts.map((a, i) => (
+                <div key={i} style={{ fontSize: 12, marginTop: 2 }}>
+                  <Text code>{a.device || '-'} · -d {a.device_type}</Text>{' '}
+                  {a.error ? <Text type="danger">错误：{a.error}</Text> : <Text type="secondary">rc/exit_status：{a.exit_status ?? a.rc ?? '-'}</Text>}
+                  {a.stderr_excerpt && <Text type="secondary"> · {a.stderr_excerpt}</Text>}
+                </div>
+              ))}
+            </div>
+          )}
+          {diagText && (
+            <>
+              <RawOutputBlock text={diagText} title="错误详情（扫描表 / 候选链 / 尝试记录）" />
+              <Text copyable={{ text: diagText, tooltips: ['复制诊断信息', '已复制'] }} style={{ fontSize: 12 }}>
+                复制完整诊断信息
+              </Text>
+            </>
+          )}
+          {result.raw_excerpt && <RawOutputBlock text={result.raw_excerpt} title="错误输出" />}
+        </Space>
+      }
+    />
+  )
+}
+
 function HealthCard({
   disk,
   ssd,
@@ -790,90 +900,9 @@ function HealthCard({
           </>
         )}
 
-        {/* 读到别的盘（identity_mismatch）：后端 message 是最关键的人话结论，醒目展示 + 可复制 + 给出固定身份的办法 */}
-        {readResult && !readResult.ok && readResult.reason === 'identity_mismatch' && (
-          <Alert
-            type="error"
-            showIcon
-            title="读取到的不是这块盘！"
-            description={
-              <Space orientation="vertical" size={6} style={{ width: '100%' }}>
-                <Text strong copyable={{ text: readResult.message ?? '', tooltips: ['复制原因说明', '已复制'] }} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                  {readResult.message || '读取到的设备序列号与目标盘期望的序列号不一致。'}
-                </Text>
-                <Text>
-                  当前插着的大概率是另一块同型号盘（或 smartctl 把设备映射到了别的盘）。
-                  采集时可加 <Text code>--serial &lt;序列号&gt;</Text> 固定期望的盘身份，避免读写到同型号的另一块盘；
-                  也可以先拔掉另一块同型号盘，只保留目标盘再重试。
-                </Text>
-              </Space>
-            }
-          />
-        )}
-
+        {/* 拒绝读取（后端"先核验后读取"，恒 200 + ok:false）：按 reason 出人话警示卡 */}
         {readResult && !readResult.ok && (
-          <Alert
-            type="error"
-            showIcon
-            title="现场读取失败"
-            description={
-              <Space orientation="vertical" size={6} style={{ width: '100%' }}>
-                <Text strong>{readResult.message || '读取失败，原因未知'}</Text>
-                {readResult.reason && <Text type="secondary">失败类别：{readResult.reason}</Text>}
-                {scan?.capacity_check === 'mismatch' && (
-                  <Alert
-                    type="warning"
-                    showIcon
-                    title="容量软校验不匹配"
-                    description="扫描映射候选的实际容量与该盘枚举容量差超过 20%，已剔除该候选（存在拿错盘风险）。请核对设备映射，必要时手动指定设备路径。"
-                  />
-                )}
-                {(scan?.devices?.length || scan?.candidates?.length) && (
-                  <div>
-                    {scan?.devices?.length ? (
-                      <>
-                        <Text type="secondary">扫描表（smartctl --scan）：</Text>
-                        {scan.devices.map((d) => (
-                          <div key={d.device} style={{ fontSize: 12 }}>
-                            <Text code>{d.device}</Text>{d.type ? <Text type="secondary"> · type {d.type}</Text> : null}
-                          </div>
-                        ))}
-                      </>
-                    ) : null}
-                    {scan?.candidates?.length ? (
-                      <>
-                        <Text type="secondary">候选链（实际尝试顺序）：</Text>
-                        {scan.candidates.map((c, i) => (
-                          <div key={i} style={{ fontSize: 12 }}>
-                            <Text code>{c.device || '-'}</Text>
-                            <Text type="secondary"> · -d {c.type || 'default'} · 来源 {c.source || '未知'}</Text>
-                          </div>
-                        ))}
-                      </>
-                    ) : null}
-                    {scan?.device_used ? <Text type="secondary">生效设备：<Text code>{scan.device_used}</Text></Text> : null}
-                  </div>
-                )}
-                {readResult.attempts.length > 0 && (
-                  <div>
-                    <Text type="secondary">尝试记录（共 {readResult.attempts.length} 次）：</Text>
-                    {readResult.attempts.map((a, i) => (
-                      <div key={i} style={{ fontSize: 12, marginTop: 2 }}>
-                        <Text code>{a.device || '-'} · -d {a.device_type}</Text>{' '}
-                        {a.error ? <Text type="danger">错误：{a.error}</Text> : <Text type="secondary">rc/exit_status：{a.exit_status ?? a.rc ?? '-'}</Text>}
-                        {a.stderr_excerpt && <Text type="secondary"> · {a.stderr_excerpt}</Text>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <RawOutputBlock text={diagText ?? ''} title="错误详情（扫描表 / 候选链 / 尝试记录）" />
-                <RawOutputBlock text={readResult.raw_excerpt} title="错误输出" />
-                <Text copyable={{ text: diagText ?? '', tooltips: ['复制诊断信息', '已复制'] }} style={{ fontSize: 12 }}>
-                  复制完整诊断信息
-                </Text>
-              </Space>
-            }
-          />
+          <SmartRejectAlert result={readResult} diagText={diagText} />
         )}
 
         {!readResult && !readError && smart && (

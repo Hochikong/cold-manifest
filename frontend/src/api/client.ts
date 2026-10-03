@@ -640,6 +640,9 @@ export interface SmartReadResult {
   device_type: string
   reason: string | null
   message: string | null
+  /** 拒绝读取时的身份对照（后端"先核验后读取"；旧响应可能缺） */
+  expected_serial?: string | null
+  current_serial?: string | null
   raw_excerpt: string
   attempts: SmartReadAttempt[]
   parsed: ParsedSmart | null
