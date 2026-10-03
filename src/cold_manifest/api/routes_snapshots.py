@@ -114,10 +114,18 @@ def list_snapshots(
         params.append(volume_id)
     sql += " ORDER BY s.volume_id, s.collected_at"
     items = [_rowget(r) for r in state.catalog.execute(sql, params)]
+    from ..identity_audit import disk_identity_status
+
+    status_cache: "dict[str, tuple[str, str]]" = {}
     for item in items:
         item["pinned"] = bool(item.get("pinned"))
         item["label"] = display_label(item.get("volume_nickname"),
                                       item.get("disk_nickname"), item["volume_id"])
+        did = item.get("disk_id")
+        if did not in status_cache:
+            status_cache[did] = disk_identity_status(
+                state.catalog, state.data_root, did) if did else ("unknown", "无关联磁盘")
+        item["identity_status"], item["identity_status_reason"] = status_cache[did]
     return {"items": items, "count": len(items)}
 
 
@@ -945,6 +953,14 @@ def snapshot_detail(snapshot_id: str, request: Request) -> dict:
         (row["volume_id"],),
     ).fetchone()
     detail["volume"] = _rowget(vol) if vol else None
+    from ..identity_audit import disk_identity_status
+
+    if vol is not None and vol["disk_id"]:
+        detail["identity_status"], detail["identity_status_reason"] = \
+            disk_identity_status(state.catalog, state.data_root, vol["disk_id"])
+    else:
+        detail["identity_status"] = "unknown"
+        detail["identity_status_reason"] = "无关联磁盘"
     detail["volume_nickname"] = vol["nickname"] if vol else None
     detail["disk_nickname"] = vol["disk_nickname"] if vol else None
     detail["label"] = (display_label(detail["volume_nickname"],

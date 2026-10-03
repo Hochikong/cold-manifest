@@ -2,10 +2,12 @@
 
 import argparse
 import csv
+import json
 import os
 import sqlite3
 import sys
 import time
+from typing import Any
 from pathlib import Path
 
 from . import __version__
@@ -210,6 +212,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_check.add_argument("--all", action="store_true",
                          help="遍历 catalog 里登记的全部快照逐一自查")
     p_check.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+
+    p_identity = sub.add_parser("identity-check",
+                                help="身份审计（只读）：检测既有数据是否可能串盘"
+                                     "（同快照序列号自相矛盾 / 同卷跨快照序列号漂移 /"
+                                     " 过半快照走未验证回退）；"
+                                     "退出码 0=无 high 告警 / 1=有 high 告警 / 2=参数或数据根错误")
+    p_identity.add_argument("--data-root", default=_default_data_root(), help="数据根目录（默认取环境变量 CLDM_DATA_ROOT，否则 ./data）")
+    p_identity.add_argument("--json", action="store_true", help="输出 JSON（供脚本消费）")
 
     p_nick = sub.add_parser(
         "nickname",
@@ -1140,6 +1150,72 @@ def _cmd_integrity_check(args: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
+# ---- identity-check ---------------------------------------------------------
+
+_SEVERITY_ORDER = {"high": 0, "medium": 1}
+
+_ALERT_TYPE_LABELS = {
+    "intra_snapshot_serial_drift": "同快照序列号自相矛盾",
+    "inter_snapshot_serial_volatility": "同卷跨快照序列号漂移",
+    "high_fallback_ratio": "未验证回退占比过高",
+}
+
+
+def _fmt_serials(serials: Any, indent: str = "    ") -> "list[str]":
+    if isinstance(serials, dict):
+        return [f"{indent}{src} = {val}" for src, val in serials.items()]
+    if isinstance(serials, list):
+        return [f"{indent}- {s}" for s in serials]
+    return [f"{indent}{serials}"]
+
+
+def _cmd_identity_check(args: argparse.Namespace) -> int:
+    """身份审计（只读，PR-C）：检测既有数据的串盘迹象。"""
+    from .identity_audit import IdentityAuditError, audit_identities
+
+    try:
+        result = audit_identities(args.data_root)
+    except IdentityAuditError as e:
+        print(f"错误：{e}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        alerts = sorted(
+            result["alerts"],
+            key=lambda a: (_SEVERITY_ORDER.get(a.get("severity"), 9),
+                           a.get("type", ""), a.get("disk_id", "")))
+        if not alerts:
+            print("未发现身份疑点。")
+        for sev in ("high", "medium"):
+            group = [a for a in alerts if a.get("severity") == sev]
+            if not group:
+                continue
+            label = {"high": "高危", "medium": "中危"}[sev]
+            print(f"== {label}（{len(group)} 条） ==")
+            for a in group:
+                print(f"[{sev.upper()}] {_ALERT_TYPE_LABELS.get(a['type'], a['type'])}"
+                      f" —— 盘 {a.get('disk_id')}")
+                if a.get("snapshot_id"):
+                    print(f"    快照: {a['snapshot_id']}")
+                if a.get("volume_id"):
+                    print(f"    卷:   {a['volume_id']}")
+                if a.get("snapshot_ids"):
+                    print(f"    快照: {', '.join(a['snapshot_ids'])}")
+                if "snapshot_count" in a:
+                    print(f"    回退快照: {a['fallback_count']}/{a['snapshot_count']}")
+                for line in _fmt_serials(a.get("serials")):
+                    print(line)
+                print(f"    建议: {a.get('suggestion', '')}")
+                print()
+        if result.get("warnings"):
+            print(f"（另有 {len(result['warnings'])} 条无法审计的快照，见 --json 输出的 warnings）")
+        summary = result["summary"]
+        print(f"共 {len(alerts)} 条告警：high={summary['high']} medium={summary['medium']}")
+    return 1 if result["summary"]["high"] else 0
+
+
 # ---- main -------------------------------------------------------------------
 
 def _reconfigure_console_utf8() -> None:
@@ -1265,6 +1341,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.command == "integrity-check":
         return _cmd_integrity_check(args)
+
+    if args.command == "identity-check":
+        return _cmd_identity_check(args)
 
     if args.command == "hash":
         return _cmd_hash(args)

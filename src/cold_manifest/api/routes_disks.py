@@ -92,9 +92,27 @@ def _meta_backfill(state: Any, disk_id: str) -> "list[dict]":
 # ---------------------------------------------------------------- 盘列表 / 详情
 
 
+@router.get("/identity-audit")
+def identity_audit(request: Request) -> dict:
+    """身份审计（PR-C，只读）：检测既有数据"串盘"迹象。
+
+    同步执行；数据根快照多时可能数秒。返回
+    ``{alerts, affected_disk_ids, summary{high,medium}, warnings}``。
+    """
+    from ..identity_audit import IdentityAuditError, audit_identities
+
+    state = get_state(request)
+    try:
+        return audit_identities(state.data_root)
+    except IdentityAuditError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from None
+
+
 @router.get("/disks")
 def list_disks(request: Request) -> dict:
-    """盘列表：身份 + 最近 SMART 摘要 + 卷数/快照数。"""
+    """盘列表：身份 + 最近 SMART 摘要 + 卷数/快照数 + 身份状态派生。"""
+    from ..identity_audit import disk_identity_status
+
     state = get_state(request)
     rows = state.catalog.execute(
         """
@@ -109,6 +127,10 @@ def list_disks(request: Request) -> dict:
     items = []
     for r in rows:
         item = dict(r)
+        status, reason = disk_identity_status(
+            state.catalog, state.data_root, r["disk_id"])
+        item["identity_status"] = status
+        item["identity_status_reason"] = reason
         latest = _latest_catalog_smart(state.catalog, r["disk_id"])
         if latest is None:
             back = _meta_backfill(state, r["disk_id"])
@@ -215,6 +237,11 @@ def disk_detail(disk_id: str, request: Request) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail=f"盘不存在：{disk_id}")
     detail = dict(row)
+    from ..identity_audit import disk_identity_status
+
+    status, reason = disk_identity_status(state.catalog, state.data_root, disk_id)
+    detail["identity_status"] = status
+    detail["identity_status_reason"] = reason
     detail["volumes"] = [dict(v) for v in state.catalog.execute(
         "SELECT * FROM volumes WHERE disk_id=? ORDER BY volume_id", (disk_id,)
     ).fetchall()]
