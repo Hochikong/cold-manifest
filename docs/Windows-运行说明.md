@@ -66,6 +66,11 @@ packaging\windows\cldm.cmd export VOL_P0\20260101T000000Z --format csv --output 
 packaging\windows\cldm.cmd integrity-check VOL_P0\20260101T000000Z
 packaging\windows\cldm.cmd integrity-check --all
 
+:: 磁盘身份体检（只读）：怀疑两块盘的序列号/SMART 被"串"过时跑一次
+:: 退出码 0=无疑点；1=有高危疑点（如同一快照里序列号自相矛盾）；2=数据根无法审计
+:: 加 --json 可输出机器可读 JSON
+packaging\windows\cldm.cmd identity-check --data-root .\data
+
 :: 给磁盘/分区起速记名（Web 对比历史等处会显示昵称；省略名字=清除）
 packaging\windows\cldm.cmd nickname disk <磁盘序列号> 仓库盘
 packaging\windows\cldm.cmd nickname volume <SN>_P1 备份分区
