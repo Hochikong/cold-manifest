@@ -2,6 +2,7 @@
 
 import sqlite3
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,24 @@ from cold_manifest.probe import DiskInfo, VolumeInfo
 from cold_manifest.schema import SNAPSHOT_DDL
 
 from test_collect import _fake_probe
+
+
+def _fake_probe_smartctl():
+    """共享夹具 + smartctl 已验证的序列号（Windows 场景专用）。
+
+    fix-112 起：Windows 上只有 smartctl 验证过的真序列号（或手填）才不需要
+    手填序列号；本测试与身份无关，只需让采集按新口径正常放行。
+    """
+    probe = _fake_probe()
+
+    def wrapped(path, *, manual_serial=None, smartctl=True):
+        vol, disk = probe(path, manual_serial=manual_serial, smartctl=smartctl)
+        if manual_serial is None:
+            disk = replace(disk, physical_serial=disk.disk_serial,
+                           serial_source="smartctl")
+        return vol, disk
+
+    return wrapped
 
 
 # ---------------------------------------------------------------- 快照夹具
@@ -131,7 +150,8 @@ def test_hint_absent_without_platform_mark(tmp_path: Path) -> None:
 
 def test_long_path_warning_win32(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr("cold_manifest.collect.probe_path", _fake_probe())
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _fake_probe_smartctl())
     # 构造 >200 字符的扫描根
     deep = tmp_path
     while len(str(deep)) <= 210:
