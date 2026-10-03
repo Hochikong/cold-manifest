@@ -130,6 +130,67 @@ def test_usb_bridge_form_three_volumes_no_high(tmp_path: Path) -> None:
     assert all(a["severity"] != "high" for a in res["alerts"])
 
 
+# ------------------------------------------------- 跨盘序列号别名（真问题）
+
+def test_cross_disk_serial_alias_bridge_form(tmp_path: Path) -> None:
+    """用户真实形态：盘 A 的 disk_serial 是**另一块盘 B**的序列号
+    （设备定位错位写入），smart 侧自洽 → 旧规则当桥形态只记 note，
+    新规则必须报 1 条 HIGH cross_disk_serial_alias，且不与 intra 重复。"""
+    alias = "0025_3844_51B1_4EFD."          # 盘 B（Samsung NVMe）的序列号
+    root = _make_root(tmp_path, {
+        "WW67MJJE": ["WW67MJJE_P1"],        # 盘 A：真序列号 WW67MJJE
+        alias: [f"{alias}_P1"],             # 盘 B：持有 0025_…
+    }, {
+        "WW67MJJE_P1/20260101T000000Z": {
+            "disk_serial": alias, "physical_serial": "WW67MJJE",
+            "smart_raw_json": _raw_json("WW67MJJE")},
+    })
+    res = audit_identities(root)
+    crosses = [a for a in res["alerts"]
+               if a["type"] == "cross_disk_serial_alias"]
+    assert len(crosses) == 1
+    a = crosses[0]
+    assert a["severity"] == "high"
+    assert a["disk_id"] == "WW67MJJE"
+    assert a["snapshot_id"] == "WW67MJJE_P1/20260101T000000Z"
+    assert a["serials"] == {"disk_serial": alias}
+    assert a["alias_disk_ids"] == [alias]
+    assert a["suggestion"]
+    # 不与 intra 重复、桥形态 note 被抑制
+    assert not any(x["type"] == "intra_snapshot_serial_drift"
+                   for x in res["alerts"])
+    assert not any(n["issue"] == "usb_bridge_serial_form"
+                   for n in res["notes"])
+    assert res["summary"]["high"] == 1
+
+
+def test_cross_disk_no_alias_single_disk(tmp_path: Path) -> None:
+    """单盘、没有别的盘持有该序列号 → 不报 cross_disk（保持桥形态 note）。"""
+    meta = {"disk_serial": "0025_3844_51B1_4EFD.",
+            "physical_serial": "WW67MJJE",
+            "smart_raw_json": _raw_json("WW67MJJE")}
+    root = _make_root(tmp_path, {"0025_3844_51B1_4EFD": [V1]},
+                      {SID_A1: meta})
+    res = audit_identities(root)
+    assert not any(a["type"] == "cross_disk_serial_alias"
+                   for a in res["alerts"])
+    assert res["summary"]["high"] == 0
+    assert any(n["issue"] == "usb_bridge_serial_form" for n in res["notes"])
+
+
+def test_cross_disk_distinct_serials_no_alerts(tmp_path: Path) -> None:
+    """两盘序列号互不相同 → 0 告警。"""
+    root = _make_root(tmp_path, {D1: [V1], D2: [V2]}, {
+        SID_A1: {"disk_serial": D1, "physical_serial": D1,
+                 "smart_raw_json": _raw_json(D1)},
+        SID_B1: {"disk_serial": D2, "physical_serial": D2,
+                 "smart_raw_json": _raw_json(D2)},
+    })
+    res = audit_identities(root)
+    assert res["alerts"] == []
+    assert res["summary"] == {"high": 0, "medium": 0, "low": 0}
+
+
 # ---------------------------------------------------------------- ② volatility
 
 def test_inter_snapshot_serial_volatility(tmp_path: Path) -> None:

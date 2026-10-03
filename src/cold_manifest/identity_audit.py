@@ -16,7 +16,10 @@
 - inter_snapshot_serial_volatility（high）：同一 volume_id 的多次快照之间
   **同一字段**的真盘序列号证据发生变化（逐字段比较，不混字段）；
 - high_fallback_ratio（medium）：某盘过半快照走了未验证回退；
-- fallback_minority（low）：有快照走未验证回退但未过半（信息性提示）。
+- fallback_minority（low）：有快照走未验证回退但未过半（信息性提示）；
+- cross_disk_serial_alias（high）：快照的 disk_serial / physical_serial 等于
+  **另一块盘**在 catalog 里的已知序列号——设备定位错位把别的盘的序列号写进
+  了这块盘的身份（形态上可能与 USB 桥形态相同，但跨盘即真问题）。
 
 USB 桥正常形态不告警：disk_serial 是桥/外壳上报的 ID，而
 physical_serial == smart_raw.serial_number（smartctl 读到的真盘序列号）
@@ -209,10 +212,11 @@ def audit_identities(data_root: "str | Path") -> dict:
     try:
         disks = [r["disk_id"] for r in catalog.execute(
             "SELECT disk_id FROM disks ORDER BY disk_id")]
+        known = _collect_known_serials(catalog)
         for disk_id in disks:
             snaps = _iter_snapshot_meta(catalog, data_root, disk_id,
                                         warnings)
-            _audit_disk(disk_id, snaps, alerts, notes)
+            _audit_disk(disk_id, snaps, alerts, notes, known)
     finally:
         catalog.close()
 
@@ -224,6 +228,62 @@ def audit_identities(data_root: "str | Path") -> dict:
     }
     return {"alerts": alerts, "affected_disk_ids": affected,
             "summary": summary, "warnings": warnings, "notes": notes}
+
+
+def _collect_known_serials(catalog: sqlite3.Connection) -> "dict[str, set[str]]":
+    """catalog 全部盘的已知序列号 → 持有它的 disk_id 集合（跨盘别名判定用）。
+
+    来源：disks.disk_id（本身就是规范化序列号）、disks.physical_serial，
+    以及（表/列存在时）disk_smart.raw_json 里的 serial_number。空值忽略。
+    """
+    known: "dict[str, set[str]]" = {}
+
+    def _add(serial: Any, disk_id: str) -> None:
+        s = _norm_serial(serial)
+        if s:
+            known.setdefault(s, set()).add(disk_id)
+
+    for row in catalog.execute("SELECT disk_id, physical_serial FROM disks"):
+        _add(row["disk_id"], row["disk_id"])
+        _add(row["physical_serial"], row["disk_id"])
+    if _has_column(catalog, "disk_smart", "raw_json"):
+        for row in catalog.execute("SELECT disk_id, raw_json FROM disk_smart"):
+            _add(_raw_serial_from_smart(row["raw_json"] or ""), row["disk_id"])
+    return known
+
+
+def _cross_disk_alias_alerts(disk_id: str, sid: str, vid: str,
+                             serials: "dict[str, str]",
+                             known: "dict[str, set[str]]",
+                             ) -> "dict | None":
+    """快照序列号等于**另一块盘**的已知序列号 → high；同一盘内部相同不算。"""
+    matched: "dict[str, str]" = {}
+    alias_disks: "set[str]" = set()
+    for field in ("disk_serial", "physical_serial"):
+        v = serials.get(field)
+        if not v:
+            continue
+        others = known.get(v, set()) - {disk_id}
+        if others:
+            matched[field] = v
+            alias_disks |= others
+    if not matched:
+        return None
+    return {
+        "type": "cross_disk_serial_alias",
+        "severity": "high",
+        "disk_id": disk_id,
+        "snapshot_id": sid,
+        "volume_id": vid,
+        "serials": matched,
+        "alias_disk_ids": sorted(alias_disks),
+        "suggestion": (
+            f"快照 {sid} 的序列号（{'、'.join(sorted(matched))}="
+            f"{'、'.join(sorted(set(matched.values())))}）是另一块盘"
+            f"（{'、'.join(sorted(alias_disks))}）的已知序列号；"
+            "设备定位曾错位、把别的盘的序列号写进了本盘身份，"
+            "请核对盘体标签并按正确身份重采该盘"),
+    }
 
 
 def _snapshot_serials(meta: dict) -> "dict[str, str]":
@@ -280,7 +340,21 @@ def _intra_drift_alert(disk_id: str, sid: str, vid: str, meta: dict,
 def _audit_disk(disk_id: str,
                 snaps: "list[tuple[str, str, dict | None]]",
                 alerts: "list[dict]",
-                notes: "list[dict]") -> None:
+                notes: "list[dict]",
+                known: "dict[str, set[str]] | None" = None) -> None:
+    # ⓪ cross_disk_serial_alias：序列号属于另一块盘 → 最具体的告警，
+    #   优先于桥形态 note 与 intra（同证据只报一条）
+    cross_sids: "set[str]" = set()
+    if known:
+        for sid, vid, meta in snaps:
+            if not meta:
+                continue
+            alert = _cross_disk_alias_alerts(
+                disk_id, sid, vid, _snapshot_serials(meta), known)
+            if alert:
+                alerts.append(alert)
+                cross_sids.add(sid)
+
     # ① intra_snapshot_serial_drift：同快照内 smart 侧证据自相矛盾
     intra_sids: "set[str]" = set()
     for sid, vid, meta in snaps:
@@ -289,6 +363,10 @@ def _audit_disk(disk_id: str,
         serials = _snapshot_serials(meta)
         # USB 桥正常形态：disk_serial 是桥上报值，physical_serial 与
         # smart_raw 一致（真盘序列号读取自洽）→ 信息性 notes，不告警
+        if sid in cross_sids:
+            # 跨盘别名是真问题，优先级高于桥形态 note / intra
+            intra_sids.add(sid)
+            continue
         if ("disk_serial" in serials and "physical_serial" in serials
                 and serials["physical_serial"] == serials.get("smart_raw")
                 and len(set(serials.values())) > 1):
