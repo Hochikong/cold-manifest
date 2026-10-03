@@ -49,6 +49,7 @@ class DiskInfo:
     smart_scan_info: "dict | None" = None  # 设备映射结论（扫描表/候选链/生效设备）
     identity_verified: "bool | None" = None  # smartctl 设备身份是否按序列号验证通过
     identity_risk: str = ""  # 身份风险标记（如 unverified_index_mapping）
+    identity_reason: str = ""  # 风险/跳过读取的原因（如 target_not_found）
     identity_ambiguity: "str | None" = None  # 身份歧义说明（多台无法区分时的人话）
     identity_warnings: "list | None" = None  # 身份判定过程的留痕 warning
 

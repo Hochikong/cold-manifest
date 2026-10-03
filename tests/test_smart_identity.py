@@ -120,6 +120,93 @@ def test_env_override_verified(monkeypatch) -> None:
     assert si["mapped_by"] == "env_override"
 
 
+def test_all_serials_mismatch_target_not_found(monkeypatch) -> None:
+    """扫描表每一条都因序列号不符被剔除 → 空候选 + target_not_found，
+    不追加任何未验证回退候选（已证明不是，而非无法证明）。"""
+    _set_scan(monkeypatch, [{"device": "/dev/sda", "type": "sat"},
+                            {"device": "/dev/sdb", "type": "sat"}])
+    _fake_idents(monkeypatch, {"/dev/sda": _ident("SOMEONE-ELSE"),
+                               "/dev/sdb": _ident("OTHER-DISK")})
+    cands, si = smart.resolve_smart_device(
+        expected_serial=EXP, disk_index=0, letter="E")
+    assert cands == []
+    assert si["identity_risk"] == "target_not_found"
+    assert si["identity_reason"]
+    assert "目标盘" in si["identity_reason"]
+    # candidates 里没有空 device 条目，也没有 sd/letter 回退
+    assert all(c["device"] for c in si["candidates"])
+
+
+def test_scan_empty_still_falls_back(monkeypatch) -> None:
+    """回归：扫描表**为空**（无法证明）→ 仍走 sd 回退 + unverified_index_mapping。"""
+    _set_scan(monkeypatch, [])
+    cands, si = smart.resolve_smart_device(expected_serial=EXP, disk_index=2)
+    assert cands[0]["device"] == "/dev/sdc"
+    assert cands[0]["risk"] == "unverified_index_mapping"
+    assert si.get("identity_risk") != "target_not_found"
+
+
+def test_read_smart_verbose_empty_devices_no_fake_call(monkeypatch) -> None:
+    """devices=[] → ok=False、attempts=[]，绝不伪造空设备候选/对 "" 发起调用。"""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd):
+        calls.append(cmd)
+        return None
+
+    monkeypatch.setattr(smart, "_run_cmd", fake_run)
+    monkeypatch.setattr(smart, "_SCAN_CACHE", [])  # 扫描表缓存为空，不再发 --scan
+    res = smart.read_smart_verbose(devices=[])
+    assert res["ok"] is False
+    assert res["attempts"] == []
+    assert res["reason"] == "not_found"
+    assert "没有可用的设备候选" in res["message"]
+    assert res["device"] == ""
+    assert calls == []  # 没有对空串发起任何 smartctl 调用
+    # 旧单设备路径不受影响：给了 device 就照常尝试
+    monkeypatch.setattr(smart, "_run_cmd_ex",
+                        lambda cmd: (None, "not_found"))
+    res2 = smart.read_smart_verbose("/dev/sdz")
+    assert res2["ok"] is False and res2["attempts"]
+
+
+def test_probe_linux_target_not_found_skips_read(monkeypatch, tmp_path) -> None:
+    """Linux probe：目标盘不在扫描表 → 跳过读取、保留 probe 值、留原因 warning。"""
+    import subprocess as sp
+
+    from cold_manifest.probe import linux as pl
+    from test_probe import LSBLK_JSON
+
+    read_calls: list = []
+
+    def fake_verbose(dev=None, *, devices=None, **kw):
+        read_calls.append(devices)
+        return {"ok": False, "raw": None, "device": "", "device_type": "",
+                "exit_status": None, "reason": "not_found", "message": "x",
+                "raw_excerpt": "", "attempts": [], "scan_info": {}}
+
+    monkeypatch.setattr(smart, "resolve_smart_device", lambda **kw: (
+        [], {"devices": [{"device": "/dev/sda", "type": "sat"}],
+             "candidates": [], "device_used": None, "mapped_by": "fallback",
+             "identity_risk": "target_not_found",
+             "identity_reason": "扫描到的设备序列号均与目标盘不符"}))
+    monkeypatch.setattr(smart, "read_smart_verbose", fake_verbose)
+    monkeypatch.setattr(pl, "_run", lambda cmd, **kw: sp.CompletedProcess(
+        cmd, 0, stdout=LSBLK_JSON, stderr=""))
+    monkeypatch.setattr(pl, "find_mount_point",
+                        lambda p: ("/mnt/cold", "/dev/sda1"))
+    monkeypatch.setattr(pl.os, "statvfs", lambda mp: type(
+        "V", (), {"f_bavail": 1, "f_frsize": 4096, "f_blocks": 100})())
+    _volume, info = pl.probe_path_linux("/tmp", smartctl=True)
+    assert read_calls == []  # 未发起任何 SMART 读取
+    assert info.identity_verified is False
+    assert info.smart_attempts is None
+    assert info.identity_risk == "target_not_found"
+    assert info.identity_reason
+    assert info.disk_serial == "WD-WCC123"  # probe 值保留
+    assert any("已跳过 SMART 读取" in w for w in (info.identity_warnings or []))
+
+
 def test_read_device_identity_never_raises(monkeypatch) -> None:
     """-i 失败/无 JSON → None，绝不抛异常。"""
 

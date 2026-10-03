@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from cold_manifest import smart as smart_mod
 from cold_manifest.probe import DiskInfo, ProbeError, VolumeInfo
 from cold_manifest.probe.linux import (
     parse_lsblk,
@@ -273,7 +274,9 @@ class TestDispatch:
         """smartctl 未安装（FileNotFoundError）不阻断，status=unavailable。
 
         P4-② 起 smartctl 调用走 smart.read_smart（smart._run_cmd），不再复用
-        probe.linux._run。
+        probe.linux._run。PR-B 起 Linux probe 先走 resolve_smart_device：
+        扫描表拿不到 → 无候选 → read_smart_verbose 直接 not_found（不再对
+        空设备串发起调用）。
         """
         import subprocess as sp
 
@@ -289,11 +292,14 @@ class TestDispatch:
             return None, "not_found"  # smartctl 不可用（_run_cmd_ex 折叠为 (None, err)）
 
         monkeypatch.setattr("cold_manifest.smart._run_cmd_ex", fake_smart_run)
+        monkeypatch.setattr("cold_manifest.smart._run_cmd", lambda cmd: None)
+        monkeypatch.setattr(smart_mod, "_SCAN_CACHE", None)
         vol, disk = self._run_probe_linux(monkeypatch, fake_run)
-        assert "smartctl" in calls
         assert disk.smart_status == "unavailable"
         assert disk.smart_raw is None
         assert disk.disk_serial == "WD-WCC123"  # lsblk 序号兜底
+        assert disk.identity_verified is False  # 无候选 → 未验证
+        assert "smartctl" not in calls  # 不再对空设备串发起 _run_cmd_ex 调用
 
     def test_smartctl_timeout_not_blocking(self, monkeypatch):
         import subprocess as sp
@@ -311,7 +317,7 @@ class TestDispatch:
         assert disk.smart_status == "unavailable"
 
     def test_smartctl_raw_stored(self, monkeypatch):
-        """S2：smartctl 原始 stdout 存入 smart_raw。"""
+        """S2：smartctl 原始 stdout 存入 smart_raw（含 resolve 身份解析全链）。"""
         import subprocess as sp
 
         def fake_run(cmd, *, check=True):
@@ -319,12 +325,26 @@ class TestDispatch:
             return sp.CompletedProcess(cmd, 0, stdout=LSBLK_JSON, stderr="")
 
         def fake_smart_run(cmd):
+            # resolve 链（--scan / -i -j）：扫描给一台设备、身份与探测值匹配
             assert cmd[0] == "smartctl"
-            assert cmd[1:3] == ["-i", "-H"]
+            if "--scan" in cmd:
+                return sp.CompletedProcess(cmd, 0, stdout=json.dumps(
+                    {"devices": [{"name": "/dev/sda", "type": "sat"}]}), stderr="")
+            return sp.CompletedProcess(cmd, 0, stdout=json.dumps(
+                {"serial_number": "WD-WCC123",
+                 "model_name": "WDC WD40EZRZ-00GXCB0",
+                 "user_capacity": {"bytes": 1000}}), stderr="")
+
+        def fake_smart_run_ex(cmd):
+            # 读取链（-i -H -A -j）
+            assert cmd[0] == "smartctl" and cmd[1:3] == ["-i", "-H"]
             return sp.CompletedProcess(cmd, 0, stdout=SMARTCTL_JSON, stderr=""), None
 
-        monkeypatch.setattr("cold_manifest.smart._run_cmd_ex", fake_smart_run)
+        monkeypatch.setattr("cold_manifest.smart._run_cmd", fake_smart_run)
+        monkeypatch.setattr(smart_mod, "_SCAN_CACHE", None)
+        monkeypatch.setattr("cold_manifest.smart._run_cmd_ex", fake_smart_run_ex)
         vol, disk = self._run_probe_linux(monkeypatch, fake_run)
         assert disk.smart_status == "passed"
         assert disk.smart_raw == SMARTCTL_JSON
         assert disk.physical_model == "WDC WD40EZRZ-00GXCB0"
+        assert disk.identity_verified is True  # 序列号精确匹配（serial_match）

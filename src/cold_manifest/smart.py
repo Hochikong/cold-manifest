@@ -704,6 +704,7 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
                         or expected_model)
     ident_cache: "dict[str, dict | None]" = {}
     scored: "list[tuple[int, dict]]" = []
+    excluded = 0  # 读到不同序列号被剔除的条数
     for e in entries:
         dev = e["device"]
         if dev not in ident_cache:
@@ -716,6 +717,7 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
         # 读不到序列号（-i 失败/桥占位）保留候选，走弱匹配+歧义检测
         if expected_serial and ident and (ident.get("serial") or "").strip() \
                 and score == 0:
+            excluded += 1
             continue
         entry: dict = {"device": dev, "type": e.get("type") or "",
                        "source": "scan"}
@@ -737,6 +739,11 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
         scored = []  # 旧行为：无盘号时扫描表条目不进候选链（只有盘符等形态）
 
     cands = [e for _s, e in scored]
+
+    # "已证明没有目标盘"：扫描表非空但每一条都因序列号不符被剔除。
+    # 与"扫描表为空"（无法证明）不同——此时绝不再追加未验证的 sd/letter
+    # 回退候选，否则可能对一块已证明不是目标盘的设备发起读取。
+    target_not_found = has_expected and excluded > 0 and not scored
 
     # 歧义检测（多台无法区分）
     ambiguity: "str | None" = None
@@ -761,19 +768,20 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
                 "建议拔掉其中一块再采，或用 --serial 显式区分")
 
     # 回退候选：/dev/sd{disk_index}（下标映射未经验证）+ 盘符
-    if isinstance(disk_index, int) and 0 <= disk_index < 26:
-        sd = f"/dev/sd{chr(ord('a') + disk_index)}"
-        if all(c["device"] != sd for c in cands):
-            cands.append({"device": sd, "type": "", "source": "fallback-sd",
-                          "risk": "unverified_index_mapping", "note": (
-                              "扫描映射不可用/未通过身份校验时的回退形态；"
-                              "\\\\.\\PhysicalDriveN 不是 smartctl 认可的"
-                              "设备名，一律不进候选链；下标映射未经验证，"
-                              "同型号同容量多盘可能错位")})
-    if letter:
-        lt = f"{letter.rstrip(':')}:"
-        if all(c["device"] != lt for c in cands):
-            cands.append({"device": lt, "type": "", "source": "letter"})
+    if not target_not_found:
+        if isinstance(disk_index, int) and 0 <= disk_index < 26:
+            sd = f"/dev/sd{chr(ord('a') + disk_index)}"
+            if all(c["device"] != sd for c in cands):
+                cands.append({"device": sd, "type": "", "source": "fallback-sd",
+                              "risk": "unverified_index_mapping", "note": (
+                                  "扫描映射不可用/未通过身份校验时的回退形态；"
+                                  "\\\\.\\PhysicalDriveN 不是 smartctl 认可的"
+                                  "设备名，一律不进候选链；下标映射未经验证，"
+                                  "同型号同容量多盘可能错位")})
+        if letter:
+            lt = f"{letter.rstrip(':')}:"
+            if all(c["device"] != lt for c in cands):
+                cands.append({"device": lt, "type": "", "source": "letter"})
 
     mapped_by = "fallback"
     if cands and cands[0]["source"] == "scan":
@@ -798,6 +806,11 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
     }
     if top_risk:
         scan_info["identity_risk"] = top_risk
+    if target_not_found:
+        scan_info["identity_risk"] = "target_not_found"
+        scan_info["identity_reason"] = (
+            "扫描到的设备序列号均与目标盘不符（目标盘可能未接入或未换回"
+            "原盒）；已跳过 SMART 读取，以免把别的盘参数记到本卷")
     if ambiguity:
         scan_info["identity_ambiguity"] = ambiguity
     return cands, scan_info
@@ -1110,8 +1123,27 @@ def read_smart_verbose(device: "str | None" = None, *,
     if not cands and device:
         cands = [{"device": device, "type": suggested_type or "",
                   "source": ""}]
+    if not cands and device is None:
+        # 没有任何可用候选（身份校验未通过或未提供）：绝不伪造空设备
+        # （对 "" 发起调用只会得到 device_used=""、无 attempts、无原因）
+        scan = _scan_info([])
+        return {
+            "ok": False,
+            "raw": None,
+            "device": "",
+            "device_candidates": [],
+            "device_type": "",
+            "exit_status": None,
+            "reason": "not_found",
+            "message": "没有可用的设备候选（身份校验未通过或未提供）；"
+                       "请确认目标盘已接入，或用 CLDM_SMARTCTL_DEVICE 指定设备串",
+            "raw_excerpt": "",
+            "attempts": [],
+            "scan_info": scan,
+        }
     if not cands:
-        cands = [{"device": "", "type": "", "source": ""}]
+        cands = [{"device": device or "", "type": suggested_type or "",
+                  "source": ""}]
     scan = _scan_info(cands)
     attempts: list[dict] = []
 
