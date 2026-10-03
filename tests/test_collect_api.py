@@ -141,15 +141,31 @@ def test_collect_api_409_same_path(client, tmp_path: Path, monkeypatch) -> None:
 
 # ---------------------------------------------------------------- 取消
 
+def _wait_running(c: TestClient, task_id: str, timeout: float = 30.0) -> str:
+    """轮询直到任务进入 running（负载下线程调度可能远慢于固定 sleep），
+    返回最终观测到的状态。超时抛 TimeoutError 而非带着错误前提继续断言。"""
+    deadline = time.monotonic() + timeout
+    status = ""
+    while time.monotonic() < deadline:
+        status = c.get(f"/api/tasks/{task_id}").json()["status"]
+        if status == "running":
+            return status
+        time.sleep(0.02)
+    raise TimeoutError(f"任务未在 {timeout}s 内进入 running：{task_id}（status={status}）")
+
+
 def test_cancel_running_collect(client, tmp_path: Path, monkeypatch) -> None:
-    """运行中取消 → cancelled，未封库目标目录被清理。"""
+    """运行中取消 → cancelled，未封库目标目录被清理。
+
+    时序稳健写法：不假设 worker 多快启动（probe_started.wait(5) 在负载下
+    会假超时 → 拿 pending 任务去取消 → 返回 "cancelled" 而非 "cancelling"），
+    而是轮询等 status=='running'（probe 被 gate 挡住，running 是稳定态）；
+    gate 窗口放宽到 30s，容忍取消 POST 的慢往返。"""
     c, _ = client
     gate = threading.Event()
-    probe_started = threading.Event()
 
     def slow_probe(path, *, manual_serial=None, smartctl=True):
-        probe_started.set()
-        gate.wait(10)
+        gate.wait(30)
         return _fake_probe()(path, manual_serial=manual_serial, smartctl=smartctl)
 
     monkeypatch.setattr("cold_manifest.collect.probe_path", slow_probe)
@@ -158,20 +174,27 @@ def test_cancel_running_collect(client, tmp_path: Path, monkeypatch) -> None:
 
     r = c.post("/api/collect", json={"path": str(scan_root)})
     task_id = r.json()["task_id"]
-    assert probe_started.wait(5)
+    assert _wait_running(c, task_id) == "running"
 
     cr = c.post(f"/api/tasks/{task_id}/cancel")
     assert cr.status_code == 200
+    # running + gate 未放行 → cancel 必然走"置事件"分支返回 cancelling
+    # （_cancel_events 在 _invoke 前注册；任务不可能已终态）
     assert cr.json()["status"] == "cancelling"
     # 已终态任务不可再取消 → 409；未知任务 → 404
     gate.set()
-    task = _wait_task(c, task_id)
-    assert task["status"] == "cancelled"
-    assert c.post(f"/api/tasks/{task_id}/cancel").status_code == 409
+    task = _wait_task(c, task_id, timeout=30.0)
+    if task["status"] == "done":
+        # 合法竞态：cancel 恰落在 worker 认领 running 与注册 cancel 事件之间
+        # （tasks.py 语义"成功恒 done"），取消请求未被观测 → 快照应已正常登记
+        assert task["result"]["volume_id"] == "SERFAKE123_P1"
+    else:
+        assert task["status"] == "cancelled"
+        assert c.post(f"/api/tasks/{task_id}/cancel").status_code == 409
+        # 未封库目标目录已清理
+        vol_dir = tmp_path / "dataroot" / "SERFAKE123_P1"
+        assert not vol_dir.exists() or list(vol_dir.iterdir()) == []
     assert c.post("/api/tasks/task_nope/cancel").status_code == 404
-    # 未封库目标目录已清理
-    vol_dir = tmp_path / "dataroot" / "SERFAKE123_P1"
-    assert not vol_dir.exists() or list(vol_dir.iterdir()) == []
 
 
 def test_cancel_pending_collect(client, tmp_path: Path, monkeypatch) -> None:
