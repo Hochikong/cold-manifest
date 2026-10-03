@@ -187,27 +187,151 @@ def _attached_linux() -> dict:
     return {"available": True, "items": items, "count": len(items)}
 
 
+# Windows attached 枚举（两阶段）：PowerShell 只输出**原始事实**（Get-Disk /
+# Get-Partition / Win32_DiskDrive / Win32_LogicalDisk 四个数组，各自 try/catch
+# 容错），**关联在 Python 侧 _join_attached 做**（可测）。
+#
+# 为什么不直接在 PS 里 foreach Win32_DiskDrive 再 Get-Partition -DiskNumber
+# $dd.Index：Win32_DiskDrive.Index（WMI 号）与 Get-Disk.Number（Storage 号）
+# 不保证一致（NVMe/USB/RAID 混插实测见过错位），拿 WMI 号去查 Storage 的
+# 分区会把卷挂错盘、把 A 盘的序列号配到 B 盘的卷上（真实事故：用户据此把
+# 一块盘的采集登记到另一块盘名下）。Get-Disk.Number 是唯一主键。
 _PS_ATTACHED = r"""
-$ErrorActionPreference = 'Stop'
-$out = @()
-foreach ($dd in (Get-CimInstance Win32_DiskDrive)) {
-  $vols = @()
-  try {
-    foreach ($p in (Get-Partition -DiskNumber $dd.Index)) {
-      if (-not $p.DriveLetter) { continue }
-      $ld = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($p.DriveLetter):'"
-      if ($ld) {
-        $vols += @{ path = "$($p.DriveLetter):\"; filesystem = $ld.FileSystem;
-                     label = $ld.VolumeName }
-      }
-    }
-  } catch {}
-  $out += @{ device = "\\.\PhysicalDrive$($dd.Index)"; model = $dd.Model;
-             serial = ($dd.SerialNumber -replace '\s+$',''); size_bytes = $dd.Size;
-             volumes = $vols }
+$ErrorActionPreference = 'Continue'
+$res = [pscustomobject]@{
+  disks = @(); partitions = @(); logicalDisks = @(); wmi = @(); warnings = @()
 }
-[pscustomobject]@{ items = $out } | ConvertTo-Json -Depth 5
+try {
+  $res.disks = @(Get-Disk | Select-Object Number, SerialNumber, FriendlyName,
+                 BusType, Size, @{n='OperationalStatus';e={($_.OperationalStatus) -join ','}})
+} catch { $res.warnings += "Get-Disk: $($_.Exception.Message)" }
+try {
+  $res.partitions = @(Get-Partition -ErrorAction SilentlyContinue |
+                      Select-Object DiskNumber, DriveLetter, PartitionNumber, Size)
+} catch { $res.warnings += "Get-Partition: $($_.Exception.Message)" }
+try {
+  $res.logicalDisks = @(Get-CimInstance Win32_LogicalDisk |
+                        Select-Object DeviceID, FileSystem, VolumeName)
+} catch { $res.warnings += "Win32_LogicalDisk: $($_.Exception.Message)" }
+try {
+  $res.wmi = @(Get-CimInstance Win32_DiskDrive |
+               Select-Object Index, Model, SerialNumber, Size, InterfaceType)
+} catch { $res.warnings += "Win32_DiskDrive: $($_.Exception.Message)" }
+$res | ConvertTo-Json -Depth 5
 """
+
+
+def _as_list(x: Any) -> list:
+    """ConvertTo-Json 单元素时输出对象而非数组；统一成列表。"""
+    if isinstance(x, dict):
+        return [x]
+    return list(x or [])
+
+
+def _to_int(v: Any) -> "int | None":
+    try:
+        return int(v) if v is not None and str(v) != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_serial(v: Any) -> str:
+    s = str(v or "").strip()
+    return "" if _is_placeholder_serial(s) else s
+
+
+def _is_placeholder_serial(s: str) -> bool:
+    """占位/哑序列号判定：全同字符（FFFFFF…）、纯 0、0123456789ABCDEF 型
+    递增十六进制串等 USB 桥/虚拟盘常见的假序列号 → 不可信（视为空）。"""
+    t = re.sub(r"[^0-9A-Za-z]", "", s or "").upper()
+    if not t:
+        return False  # 空串不是占位，是缺失
+    if len(set(t)) == 1:
+        return True
+    hexseq = "0123456789ABCDEF"
+    start = hexseq.find(t[0])
+    if start >= 0:
+        expect = "".join(hexseq[(start + k) % 16] for k in range(len(t)))
+        if t == expect:
+            return True
+    return False
+
+
+def _join_attached(disks: Any, parts: Any, wmi: Any,
+                   logical_disks: Any = None) -> "list[dict]":
+    """三源关联（可单测）：以 Get-Disk.Number 为唯一主键。
+
+    - 卷：Get-Partition.DiskNumber == Number（同一 Storage 体系，可信）；
+    - Win32_DiskDrive：必须 **Index 与 Size 同时匹配** 才认是同一块盘，
+      匹配不上绝不使用 WMI 的 model/serial（Index 单独相等不够——那正是
+      本 bug 的根源）；WMI 缺失/匹配不上 → 退化 Storage-only。
+    - 序列号可信性：serial_source ∈ storage（Get-Disk 自报，天然对号）|
+      wmi_verified（Storage 无序列号、WMI Index+Size 双匹配后取 WMI 值）|
+      ""；serial_verified 相应 true/false。拿不到可信序列号时 serial 留空，
+      WMI 原始值放 serial_unverified_raw 仅供诊断（可能是别的盘的）。
+    """
+    ld_by_dev = {
+        str(r.get("DeviceID") or "").upper(): r for r in _as_list(logical_disks)}
+    items: "list[dict]" = []
+    for d in _as_list(disks):
+        num = _to_int(d.get("Number"))
+        if num is None:
+            continue
+        vols = []
+        for p in _as_list(parts):
+            if _to_int(p.get("DiskNumber")) != num:
+                continue
+            letter = str(p.get("DriveLetter") or "").strip().rstrip(":").upper()
+            if not letter:
+                continue
+            ldrow = ld_by_dev.get(f"{letter}:") or {}
+            vols.append({
+                "path": f"{letter}:\\",
+                "drive_letter": letter,
+                "filesystem": str(ldrow.get("FileSystem") or ""),
+                "label": str(ldrow.get("VolumeName") or ""),
+                "partition_number": _to_int(p.get("PartitionNumber")),
+                "size_bytes": _to_int(p.get("Size")),
+            })
+        size = _to_int(d.get("Size"))
+        wrow: "dict | None" = None
+        wmi_index_hit: "dict | None" = None  # 仅 Index 命中（size 未知/不符）
+        for w in _as_list(wmi):
+            if _to_int(w.get("Index")) != num:
+                continue
+            wmi_index_hit = wmi_index_hit or w
+            wsize = _to_int(w.get("Size"))
+            if size and wsize and size == wsize:
+                wrow = w
+                break
+        serial = _clean_serial(d.get("SerialNumber"))
+        serial_source, serial_verified = ("storage", True) if serial else ("", False)
+        serial_unverified_raw = ""
+        if not serial and wrow is not None:
+            wserial = _clean_serial(wrow.get("SerialNumber"))
+            if wserial:
+                serial, serial_source, serial_verified = wserial, "wmi_verified", True
+        if not serial:
+            raw = str((wmi_index_hit or {}).get("SerialNumber") or "").strip()
+            if raw:
+                serial_unverified_raw = raw
+        model = str((wrow or {}).get("Model") or d.get("FriendlyName") or "").strip()
+        items.append({
+            "device": f"\\\\.\\PhysicalDrive{num}",
+            "disk_number": num,
+            "model": model,
+            "serial": serial,
+            "serial_source": serial_source,
+            "serial_verified": serial_verified,
+            "serial_unverified_raw": serial_unverified_raw,
+            "wmi_matched": wrow is not None,
+            "size_bytes": size,
+            "bus_type": str(d.get("BusType") or ""),
+            "operational_status": str(d.get("OperationalStatus") or ""),
+            "interface_type": str((wrow or {}).get("InterfaceType") or ""),
+            "volumes": vols,
+        })
+    return items
 
 
 def _attached_win() -> dict:
@@ -223,10 +347,16 @@ def _attached_win() -> dict:
     if proc.returncode != 0:
         raise RuntimeError(f"PowerShell 枚举失败（rc={proc.returncode}）")
     data = json.loads(_decode(proc.stdout))
-    items = data.get("items") or []
-    if isinstance(items, dict):  # 单盘时 ConvertTo-Json 不产数组
-        items = [items]
-    return {"available": True, "items": items, "count": len(items)}
+    warnings = [str(w) for w in _as_list(data.get("warnings"))]
+    disks = _as_list(data.get("disks"))
+    if not disks:
+        reason = "；".join(warnings) or "Get-Disk 未返回任何磁盘"
+        return {"available": False, "reason": reason, "items": [],
+                "warnings": warnings}
+    items = _join_attached(disks, data.get("partitions"), data.get("wmi"),
+                           data.get("logicalDisks"))
+    return {"available": True, "items": items, "count": len(items),
+            "warnings": warnings}
 
 
 @router.get("/disks/{disk_id}")

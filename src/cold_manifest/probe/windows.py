@@ -21,7 +21,17 @@ $l = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$${letter}:'"
 if (-not $l) {{ throw "logical disk $${letter}: not found" }}
 $p = Get-Partition -DriveLetter $letter
 $dsk = Get-Disk -Number $p.DiskNumber
-$dd = Get-CimInstance Win32_DiskDrive -Filter "Index=$($p.DiskNumber)"
+# WMI 号（Win32_DiskDrive.Index）与 Storage 号（Get-Disk.Number）不保证一致，
+# 不能拿 DiskNumber 当 Index 过滤（曾把 A 盘的 serial/model 配到 B 盘的卷上）。
+# 必须 Index 与 Size 双匹配才认是同一块盘；双匹配失败时该行仅供诊断，
+# serial 由 Python 解析侧按 wmiVerified 标志剔除。
+$dds = @(Get-CimInstance Win32_DiskDrive)
+$dd = $dds | Where-Object {{ $_.Index -eq $p.DiskNumber -and $_.Size -eq $dsk.Size }} |
+      Select-Object -First 1
+$wmiVerified = [bool]$dd
+if (-not $dd) {{
+  $dd = $dds | Where-Object {{ $_.Index -eq $p.DiskNumber }} | Select-Object -First 1
+}}
 [pscustomobject]@{{
   volume = @{{
     fs = $l.FileSystem
@@ -45,6 +55,7 @@ $dd = Get-CimInstance Win32_DiskDrive -Filter "Index=$($p.DiskNumber)"
     interface = $dd.InterfaceType
     firmware = $dd.FirmwareRevision
     size = $dd.Size
+    wmiVerified = $wmiVerified
     friendlyName = $dsk.FriendlyName
     busType = $dsk.BusType
     partitionStyle = $dsk.PartitionStyle
@@ -135,6 +146,10 @@ def parse_windows_json(text: str, drive_letter: str) -> tuple[VolumeInfo, DiskIn
 
     smart_status = "unavailable"  # CIM 路径不提供 SMART；由调用方按需走 smartctl
     disk_serial = s(disk, "serial")
+    # WMI Index+Size 双匹配失败（wmiVerified=false）时 serial 可能是别的盘的，
+    # 绝不采用；缺 wmiVerified 字段（旧输出/夹具）保持原行为。
+    if disk_serial and disk.get("wmiVerified") is False:
+        disk_serial = ""
     serial_source = "probe" if disk_serial else ""
     info = DiskInfo(
         physical_model="",  # CIM 型号可能是 USB 桥，真盘型号留给 smartctl / 手动
