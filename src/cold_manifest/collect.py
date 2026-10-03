@@ -52,58 +52,63 @@ class CollectCancelled(CollectError):
 
 
 class ManualSerialRequired(CollectError):
-    """硬盘盒（USB 桥）/探测序列号不可用且未手填序列号：拒绝提交采集。"""
+    """读不到任何可用序列号（ATA 直通与系统枚举皆占位）且未手填：拒绝提交采集。"""
 
 
 def _is_usb_bridge(disk: DiskInfo) -> bool:
     """判定是否经 USB 硬盘盒接入：interface_type 含 USB（大小写不敏感）。
 
-    注意不能拿 bridge_model 非空当判据——Linux probe 会把 lsblk 的盘型号
+    注意：新口径下此函数**只用于提示文案**（是否提到"经 USB 硬盘盒接入"），
+    不再参与是否强制手填序列号的判定（见 requires_manual_serial）。
+    不能拿 bridge_model 非空当判据——Linux probe 会把 lsblk 的盘型号
     无条件填进 bridge_model，非 USB 盘会被误判。bridge_model 仅作提示展示。
-    interface_type 为空/未知时不拦（宁放行不误拦）。
     """
     it = (getattr(disk, "interface_type", "") or "").upper()
     return "USB" in it
+
+
+def requires_manual_serial(disk: DiskInfo) -> bool:
+    """是否必须手填序列号（唯一判据，collect_volume 与 preflight 共用）：
+
+    只有当既拿不到可用的 ATA 直通真盘序列号（physical_serial）、也拿不到
+    可用的系统枚举序列号（disk_serial）时才强制手填；两者之一可用 → 放行，
+    身份按现有优先级（physical 优先，见 catalog.preferred_disk_serial）。
+    USB 硬盘盒不再单独强制手填；非 USB 盘同样适用本规则（读不到任何
+    序列号 → 也要手填）。
+    """
+    phys = (getattr(disk, "physical_serial", "") or "").strip()
+    sys_serial = (getattr(disk, "disk_serial", "") or "").strip()
+    return not (_usable_serial(phys) or _usable_serial(sys_serial))
 
 
 def serial_required_message(disk: DiskInfo, volume_serial_hex: "str | None",
                             manual_serial: "str | None") -> "str | None":
     """判定是否必须手填序列号；是则返回人话提示，None=可继续采集。
 
-    严格版规则：
-    1. USB 硬盘盒（interface_type 含 USB 或 bridge_model 非空）→ 一律必须手填
-       序列号，无例外。盒子透传/上报的序列号（含"看起来可用"的）不能作为
-       盘体身份，VOL- 卷序列号回退也不放行。
-    2. 非 USB 盘 + 探测序列号不可用（空/全 0/占位）→ 走 VOL-{卷序列号hex}
-       回退命名 + 警告（既有行为）；只有卷序列号也不可用时才拒绝。
+    规则：requires_manual_serial(disk) 为真（ATA 直通与系统枚举序列号
+    都不可用，且手填值也不可用）→ 返回提示。有 USB 盒信息时补充
+    "该盘经 USB 硬盘盒接入"的上下文说明，但 USB 与否不影响判定。
+    volume_serial_hex 形参保留兼容签名：VOL-{卷序列号hex} 回退命名仍在
+    collect_volume 里保留，但在本判定下实际不可达（两者都不可用一律先被拦）。
     """
     if manual_serial and _usable_serial(manual_serial):
         return None
+    if not requires_manual_serial(disk):
+        return None
+    phys = (getattr(disk, "physical_serial", "") or "").strip()
     probe_serial = (getattr(disk, "disk_serial", "") or "").strip()
-    probe_ok = _usable_serial(probe_serial)
+    parts: list[str] = ["该盘读不到可用的序列号"]
     if _is_usb_bridge(disk):
-        parts: list[str] = []
         desc = ((getattr(disk, "bridge_model", "") or "").strip()
                 or (getattr(disk, "interface_type", "") or "").strip() or "USB")
-        parts.append(f"检测到该盘经 USB 硬盘盒接入（盒子：{desc}）")
-        if probe_serial:
-            parts.append(f"盒子报告的序列号 {probe_serial!r} 不能作为磁盘身份依据")
-        parts.append("USB 硬盘盒必须手填盘体标签上的序列号，无例外"
-                     "（CLI: `--serial`，Web: \"磁盘序列号\"输入框）")
-        parts.append("显式 --volume-id 只固定本次卷命名，"
-                     "不能替代序列号作为磁盘身份（catalog 盘身份与复用判重都依赖序列号），"
-                     "因此不因此放行")
-        return "；".join(parts)
-    if probe_ok:
-        return None
-    vhex = (volume_serial_hex or "").strip()
-    if _usable_serial(vhex):
-        return None  # 走卷序列号回退命名（既有行为，采集时附警告）
-    parts = ["未能从盘体读取可用序列号"]
+        parts.append(f"该盘经 USB 硬盘盒接入（盒子：{desc}）")
+    if phys:
+        parts.append(f"ATA 直通读到的序列号 {phys!r} 不可用（空串/全 0/占位）")
     if probe_serial:
-        parts.append(f"探测值 {probe_serial!r} 不可用（空串/全 0/占位）")
-    if manual_serial:
-        parts.append(f"手填序列号 {manual_serial!r} 也不可用（空串/全 0/占位）")
+        parts.append(f"系统枚举（Windows 枚举）上报的序列号 {probe_serial!r} 不可用"
+                     "（空串/全 0/占位，可能是盒子/桥的 ID）")
+    if not phys and not probe_serial:
+        parts.append("未能读到任何序列号")
     parts.append("请在采集时手填盘体标签上的序列号"
                  "（CLI: `--serial`，Web: \"磁盘序列号\"输入框）")
     parts.append("显式 --volume-id 只固定本次卷命名，"
@@ -666,33 +671,47 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
         serial = (disk.disk_serial or "").strip()
         index = vol.partition_index if vol.partition_index is not None else 0
         if not _usable_serial(serial):
-            # 占位序列号（空/"0"/全 0，USB 桥常见）→ 回退卷序列号 hex 命名
-            vhex = (vol.volume_serial_hex or "").strip()
-            if _usable_serial(vhex):
-                volume_id = f"VOL-{vhex.upper()}_P{index}"
+            # 系统枚举序列号不可用 → ATA 直通真盘序列号优先（现有优先级
+            # physical 优先，与 preferred_disk_serial 一致）。
+            phys = (getattr(disk, "physical_serial", "") or "").strip()
+            if _usable_serial(phys):
                 probe_serial_raw = serial
-                serial_fallback = True
-                disk.serial_source = "volume_serial_fallback"
-                disk.disk_serial = ""  # 保持真实：占位值不伪造为盘序列号
+                serial = _sanitize_serial(phys)
                 warnings.append(
-                    f"未能读取盘序列号（探测值={serial!r}，USB 桥常见），"
-                    f"已回退用卷序列号命名 volume_id：{volume_id}（建议显式 --serial 固定命名）")
-                if _is_usb_bridge(disk) and not manual_serial:
-                    _box = ((getattr(disk, "bridge_model", "") or "").strip()
-                            or (getattr(disk, "interface_type", "") or "").strip()
-                            or "USB")
-                    warnings.append(
-                        f"该盘经 USB 硬盘盒接入（盒子：{_box}），卷序列号不能唯一标识"
-                        f"盘体；强烈建议显式 --serial 手填盘体标签序列号后重新采集")
+                    f"系统枚举序列号不可用（探测值={probe_serial_raw!r}），"
+                    f"已改用 ATA 直通真盘序列号命名：{serial}")
             else:
-                # 不可用探测序列号 + 卷序列号也不可用 → 已在 probe 后被
-                # ManualSerialRequired 拒绝（要求手填），此处不应到达
-                raise CollectError(
-                    "未能读取盘序列号（USB 桥常见），请显式指定 `--serial <值>`"
-                    "（或用 --volume-id 手动命名该卷）")
+                # VOL-{卷序列号hex} 回退路径保留但实际不可达：系统枚举与
+                # ATA 直通序列号都不可用时，前面已被 ManualSerialRequired
+                # 拦截（要求手填），走到这里说明 manual_serial 已覆盖
+                # disk_serial（usable），不会进入本分支。
+                vhex = (vol.volume_serial_hex or "").strip()
+                if _usable_serial(vhex):
+                    volume_id = f"VOL-{vhex.upper()}_P{index}"
+                    probe_serial_raw = serial
+                    serial_fallback = True
+                    disk.serial_source = "volume_serial_fallback"
+                    disk.disk_serial = ""  # 保持真实：占位值不伪造为盘序列号
+                    warnings.append(
+                        f"未能读取盘序列号（探测值={serial!r}，USB 桥常见），"
+                        f"已回退用卷序列号命名 volume_id：{volume_id}（建议显式 --serial 固定命名）")
+                    if _is_usb_bridge(disk) and not manual_serial:
+                        _box = ((getattr(disk, "bridge_model", "") or "").strip()
+                                or (getattr(disk, "interface_type", "") or "").strip()
+                                or "USB")
+                        warnings.append(
+                            f"该盘经 USB 硬盘盒接入（盒子：{_box}），卷序列号不能唯一标识"
+                            f"盘体；强烈建议显式 --serial 手填盘体标签序列号后重新采集")
+                else:
+                    # 兜底（理论上不可达）：可用手填序列号会在 probe 阶段覆盖
+                    # disk_serial；两者都不可用已被 ManualSerialRequired 拒绝
+                    raise CollectError(
+                        "未能读取盘序列号（USB 桥常见），请显式指定 `--serial <值>`"
+                        "（或用 --volume-id 手动命名该卷）")
         else:
             # 怪异序列号（空格/斜杠/Unicode 等）清洗为合法 volume_id 字符，再统一校验
             serial = _sanitize_serial(serial)
+        if volume_id is None:
             # 优先复用既有盘/卷：同一块盘再采 → 沿用原 volume_id（历史稳定）；
             # probe 撞车（两块盘报出相同探测序列号）且物理序列号可区分 → 不复用。
             # 显式 --serial 时跳过复用（用户指定的命名优先）

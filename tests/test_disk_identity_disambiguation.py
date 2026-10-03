@@ -2,7 +2,7 @@
 
 - 两块盘 probe 序列号相同、physical_serial 不同 → 各自 disk/volume 行；
 - 同一块盘再采 → 复用同一 disk_id/volume_id（含 probe 值风格的历史卷名）；
-- 探针与物理序列号都不可用 → VOL-… 回退 + warning；
+- 探针与物理序列号都不可用 → 强制手填（ManualSerialRequired，VOL- 回退不可达）；
 - --serial / --volume-id 显式覆盖仍然最高优先。
 """
 
@@ -137,11 +137,12 @@ def test_probe_style_history_volume_reused(env) -> None:
         cat.close()
 
 
-def test_unusable_serials_fall_back_to_volume_hex(env, monkeypatch) -> None:
-    """探针与物理序列号都不可用 → 卷序列号 hex 回退 + warning（行为不变）。"""
-    r = env["collect"](probe_serial="0", physical_serial="")
-    assert r.volume_id == "VOL-ABCD-1234_P2"
-    assert any("回退用卷序列号" in w for w in r.warnings)
+def test_unusable_serials_requires_manual(env, monkeypatch) -> None:
+    """新规则：探针与物理序列号都不可用 → 强制手填（VOL- 回退保留但不可达）。"""
+    from cold_manifest.collect import ManualSerialRequired
+
+    with pytest.raises(ManualSerialRequired):
+        env["collect"](probe_serial="0", physical_serial="")
 
 
 @pytest.mark.parametrize("placeholder", [
@@ -150,14 +151,14 @@ def test_unusable_serials_fall_back_to_volume_hex(env, monkeypatch) -> None:
     "XXXXXXXX", "AAAAAAAA",
 ])
 def test_placeholder_serials_not_used_as_identity(env, placeholder) -> None:
-    """已知占位形态（JMicron 盒报 0123456789ABCDEF 等）→ 不可用作盘身份，
-    回退 VOL-… 命名 + warning；正常序列号不受影响。"""
+    """已知占位形态（JMicron 盒报 0123456789ABCDEF 等）→ 不可用作盘身份；
+    ATA 直通也没有时一律先拦（强制手填），正常序列号不受影响。"""
     from cold_manifest.catalog import _usable_serial
+    from cold_manifest.collect import ManualSerialRequired
 
     assert not _usable_serial(placeholder)
-    r = env["collect"](probe_serial=placeholder, physical_serial="")
-    assert r.volume_id == "VOL-ABCD-1234_P2"
-    assert any("回退用卷序列号" in w for w in r.warnings)
+    with pytest.raises(ManualSerialRequired):
+        env["collect"](probe_serial=placeholder, physical_serial="")
     assert _usable_serial("SERFAKE123")
     assert _usable_serial("X0FGBM2AS")
 

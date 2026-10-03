@@ -390,16 +390,14 @@ def _meta(db: Path, key: str) -> str | None:
 
 
 @pytest.mark.parametrize("placeholder", ["", "0", "0000000"])
-def test_placeholder_serial_falls_back_to_volume_serial(tmp_path, monkeypatch, placeholder):
+def test_placeholder_serial_with_no_ata_serial_requires_manual(tmp_path, monkeypatch, placeholder):
+    # 新规则：ATA 直通与系统枚举序列号都不可用 → 一律先拦（VOL- 卷序列号
+    # 回退路径保留在代码里但不可达）
+    from cold_manifest.collect import ManualSerialRequired
     monkeypatch.setattr("cold_manifest.collect.probe_path",
                         _fake_probe_serial(placeholder, "c4a2126f"))
-    result = _collect_min(tmp_path, _fake_probe_serial)
-    assert result.volume_id == "VOL-C4A2126F_P1"
-    db = Path(result.db_path)
-    assert _meta(db, "serial_source") == "volume_serial_fallback"
-    assert _meta(db, "probe_serial_raw") == placeholder
-    assert _meta(db, "volume_serial_hex") == "c4a2126f"
-    assert any("卷序列号" in w for w in result.warnings)
+    with pytest.raises(ManualSerialRequired):
+        _collect_min(tmp_path, _fake_probe_serial)
 
 
 def test_serial_missing_entirely_errors(tmp_path, monkeypatch):
@@ -424,10 +422,11 @@ def test_explicit_serial_still_wins_over_fallback(tmp_path, monkeypatch):
     assert _meta(Path(result.db_path), "serial_source") == "manual"
 
 
-def test_control_byte_serial_falls_back(tmp_path, monkeypatch):
-    # 廉价 USB 桥实测（KIOXIA TransMemory, F: 盘）：SerialNumber = '\x030'
+def test_control_byte_serial_requires_manual(tmp_path, monkeypatch):
+    # 廉价 USB 桥实测（KIOXIA TransMemory, F: 盘）：SerialNumber = '\x030'。
+    # 新规则：控制字节残串不可用且 ATA 直通也没有 → 拦（不再走卷序列号回退）
+    from cold_manifest.collect import ManualSerialRequired
     monkeypatch.setattr("cold_manifest.collect.probe_path",
                         _fake_probe_serial("\x030", "C4A2126F"))
-    result = _collect_min(tmp_path, _fake_probe_serial)
-    assert result.volume_id == "VOL-C4A2126F_P1"
-    assert _meta(Path(result.db_path), "probe_serial_raw") == "\x030"
+    with pytest.raises(ManualSerialRequired):
+        _collect_min(tmp_path, _fake_probe_serial)

@@ -387,14 +387,16 @@ def _patch_preflight_sm(monkeypatch, raw=SAMPLE) -> None:
             "message": None, "raw_excerpt": "", "attempts": []})
 
 
-def test_preflight_usb_bridge_requires_manual_serial(
+def test_preflight_usb_bridge_with_usable_ata_serial(
         client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    """新规则：USB 盒 + ATA 直通真序列号可用（用户真机形态）→ 不要求手填。"""
     target = tmp_path / "disk"
     target.mkdir()
     _patch_preflight_sm(monkeypatch)
 
     disk = DiskInfo(bridge_model="JMicron Generic SCSI Device",
-                    interface_type="USB", disk_serial="9876ABC")
+                    interface_type="USB", disk_serial="20260123004775F",
+                    physical_serial="16NDT0O1T")
     seen: dict = {}
 
     def fake_probe(path, *, manual_serial=None, smartctl=True):
@@ -406,11 +408,12 @@ def test_preflight_usb_bridge_requires_manual_serial(
     body = client.post("/api/collect/preflight",
                        json={"path": str(target)}).json()
     assert seen["smartctl"] is False
-    assert body["requires_manual_serial"] is True
-    assert "JMicron Generic SCSI Device" in body["manual_serial_reason"]
-    assert "序列号" in body["manual_serial_reason"]
-    # probe_serial 带回（SMART 探测值，供对照）
-    assert body["probe_serial"] == "9876ABC"
+    assert body["requires_manual_serial"] is False
+    assert body["manual_serial_reason"] == ""
+    # 两个序列号来源分开：probe_serial=系统枚举 ID，smart_serial=ATA 直通真盘序列号
+    assert body["probe_serial"] == "20260123004775F"
+    assert body["smart_serial"] == "16NDT0O1T"
+    assert body["serial_usable"] is True
     assert body["bridge_model"] == "JMicron Generic SCSI Device"
     assert body["interface_type"] == "USB"
     # 既有键不受影响
@@ -418,16 +421,40 @@ def test_preflight_usb_bridge_requires_manual_serial(
     assert body["writable"] is True
 
 
+def test_preflight_bridge_placeholder_serials_not_usable(
+        client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    """盒 ID 与真盘序列号都是占位/空 → serial_usable=False。"""
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(
+        monkeypatch,
+        raw='{"smart_status": {"passed": true}, "serial_number": "0000000000"}')
+    disk = DiskInfo(bridge_model="JMicron", interface_type="USB",
+                    disk_serial="0", physical_serial="")
+    monkeypatch.setattr(
+        "cold_manifest.probe.probe_path",
+        lambda p, **kw: (None, disk))
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert body["requires_manual_serial"] is True
+    assert body["probe_serial"] == "0"
+    # smart_serial 是 ATA 直通读到的原值（占位串原样展示），可用性由 serial_usable 表达
+    assert body["smart_serial"] == "0000000000"
+    assert body["serial_usable"] is False
+
+
 def test_preflight_bridge_model_only_not_usb(client: TestClient, tmp_path: Path,
                                              monkeypatch) -> None:
-    """bridge_model 非空但 interface_type 不含 USB → 不算硬盘盒（不误拦：
-    Linux probe 会把 lsblk 盘型号填进 bridge_model）。bridge_model 仅展示。"""
+    """bridge_model 非空但 interface_type 不含 USB → 不算硬盘盒（bridge_model
+    仅展示，Linux probe 会把 lsblk 盘型号填进 bridge_model）。新规则下手填
+    判定只看序列号可用性，与是否 USB 无关。"""
     target = tmp_path / "disk"
     target.mkdir()
     _patch_preflight_sm(monkeypatch)
     monkeypatch.setattr(
         "cold_manifest.probe.probe_path",
-        lambda p, **kw: (None, DiskInfo(bridge_model="Sunplus", interface_type="")))
+        lambda p, **kw: (None, DiskInfo(bridge_model="Sunplus", interface_type="",
+                                        disk_serial="9876ABC")))
     body = client.post("/api/collect/preflight",
                        json={"path": str(target)}).json()
     assert body["requires_manual_serial"] is False
@@ -463,6 +490,8 @@ def test_preflight_sata_no_manual_serial(client: TestClient, tmp_path: Path,
     assert body["requires_manual_serial"] is False
     assert body["manual_serial_reason"] == ""
     assert body["probe_serial"] == "9876ABC"
+    assert body["smart_serial"] == "9876ABC"
+    assert body["serial_usable"] is True
     assert body["bridge_model"] is None
     assert body["interface_type"] == "SATA"
 
@@ -484,7 +513,10 @@ def test_preflight_probe_failure_keeps_defaults(client: TestClient,
     assert body["manual_serial_reason"] == ""
     assert body["bridge_model"] is None
     assert body["interface_type"] is None
-    assert body["probe_serial"] == "9876ABC"  # SMART 仍带回
+    # probe 失败时系统枚举 ID 缺，SMART 直通值仍以 smart_serial 带回
+    assert body["probe_serial"] is None
+    assert body["smart_serial"] == "9876ABC"
+    assert body["serial_usable"] is True
     # 现有错误路径不变：不新增 500 / 新告警
     assert body["is_smart_capable"] is True
     assert body["warnings"] == []

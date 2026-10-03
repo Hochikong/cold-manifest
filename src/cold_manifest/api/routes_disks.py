@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from .. import smart
+from ..catalog import _usable_serial
 from .state import get_state
 
 router = APIRouter(prefix="/api", tags=["disks"])
@@ -778,6 +779,8 @@ def collect_preflight(body: PreflightBody) -> dict:
         "requires_manual_serial": False,
         "manual_serial_reason": "",
         "probe_serial": None,
+        "smart_serial": None,
+        "serial_usable": False,
         "bridge_model": None,
         "interface_type": None,
         "warnings": [],
@@ -820,28 +823,32 @@ def collect_preflight(body: PreflightBody) -> dict:
     if not res["is_smart_capable"]:
         res["warnings"].append("该盘未返回可用的 SMART 状态")
 
-    # 硬盘盒（USB 桥）判定：探测接口/桥型号（不重复跑 SMART），复用采集引擎
-    # 同一判据（collect._is_usb_bridge）——硬盘盒必须手填序列号，提前告知前端。
-    from ..collect import _is_usb_bridge
+    # 序列号手填判定：复用采集引擎同一判据（requires_manual_serial）——
+    # 只有 ATA 直通与系统枚举序列号都不可用时才要求手填；USB 盒与否仅影响文案。
+    from ..collect import requires_manual_serial, serial_required_message
     from ..probe import ProbeError, probe_path
 
-    probe_serial = str(parsed.get("serial") or "").strip()
+    probe_serial = ""
+    smart_serial = ""
     try:
         _, disk = probe_path(body.path, smartctl=False)
     except ProbeError:
         disk = None  # 探测失败沿用现有错误路径，不新增报错
+        # probe 未跑成时真盘序列号仍取上面 read_smart_verbose 的解析结果
+        smart_serial = str(parsed.get("serial") or "").strip()
     if disk is not None:
-        bridge = str(disk.bridge_model or "").strip()
-        iface = str(disk.interface_type or "").strip()
-        res["bridge_model"] = bridge or None
-        res["interface_type"] = iface or None
-        if _is_usb_bridge(disk):
+        # probe_serial = 系统枚举（Windows/Get-Disk 层）上报的 ID，可能是盒子/桥的；
+        # smart_serial = smartctl ATA 直通读到的真盘序列号（probe 未跑 SMART 时
+        # 用上面 read_smart_verbose 的解析结果兜底，两者本应一致）。
+        probe_serial = str(getattr(disk, "disk_serial", "") or "").strip()
+        smart_serial = (str(getattr(disk, "physical_serial", "") or "").strip()
+                        or str(parsed.get("serial") or "").strip())
+        res["bridge_model"] = str(disk.bridge_model or "").strip() or None
+        res["interface_type"] = str(disk.interface_type or "").strip() or None
+        if requires_manual_serial(disk):
             res["requires_manual_serial"] = True
-            desc = bridge or iface or "USB"
-            parts = [f"该盘经 USB 硬盘盒接入（盒子：{desc}）"]
-            if probe_serial:
-                parts.append(f"盒子上报的序列号 {probe_serial} 不能作为磁盘身份依据")
-            parts.append("请在「磁盘序列号」中填写盘体标签上的序列号")
-            res["manual_serial_reason"] = "，".join(parts[:2]) + "；" + parts[-1]
+            res["manual_serial_reason"] = serial_required_message(disk, None, None)
     res["probe_serial"] = probe_serial or None
+    res["smart_serial"] = smart_serial or None
+    res["serial_usable"] = _usable_serial(probe_serial) or _usable_serial(smart_serial)
     return res
