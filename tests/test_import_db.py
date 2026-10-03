@@ -26,7 +26,7 @@ def _fake_probe():
     disk = DiskInfo(
         physical_model="Fake Disk 5000", physical_serial="SERIMP123",
         disk_serial="SERIMP123", serial_source="probe",
-        bridge_model="", interface_type="USB", capacity_bytes=20_000_000_000,
+        bridge_model="", interface_type="SATA", capacity_bytes=20_000_000_000,
         firmware="fw1", smart_status="unavailable",
     )
     return lambda path, *, manual_serial=None, smartctl=True: (vol, disk)

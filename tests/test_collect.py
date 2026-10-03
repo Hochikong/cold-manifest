@@ -22,7 +22,7 @@ def _fake_probe(mount: str = "/mnt/fake"):
     disk = DiskInfo(
         physical_model="Fake Disk 5000", physical_serial="SERFAKE123",
         disk_serial="SERFAKE123", serial_source="probe",
-        bridge_model="", interface_type="USB", capacity_bytes=20_000_000_000,
+        bridge_model="", interface_type="SATA", capacity_bytes=20_000_000_000,
         firmware="fw1", smart_status="unavailable",
     )
 
@@ -358,7 +358,7 @@ def _fake_probe_serial(disk_serial: str, volume_serial_hex: str):
     disk = DiskInfo(
         physical_model="", physical_serial="", disk_serial=disk_serial,
         serial_source="probe" if disk_serial else "",
-        bridge_model="KIOXIA TransMemory", interface_type="USB",
+        bridge_model="", interface_type="SATA",
         capacity_bytes=1_000, firmware="", smart_status="unavailable",
     )
 

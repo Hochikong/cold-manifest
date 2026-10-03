@@ -10,7 +10,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from ..collect import CollectResult, collect_volume
+from ..collect import CollectResult, collect_volume, preflight_serial_required
 from ..lockfile import DataRootLock, LockBusy
 from ..probe import enumerate_disk_volumes
 from ..tasks import TaskRunner, register_task_fn
@@ -106,6 +106,14 @@ def submit_collect(body: CollectBody, request: Request) -> dict:
     runner: TaskRunner = request.app.state.task_runner
     resolved = str(p.resolve())
     data_root = str(get_state(request).data_root)
+
+    # 手填序列号预检（硬盘盒/占位序列号）：不填直接 400 拒绝提交，
+    # detail 为人话提示（前端据此高亮"磁盘序列号"字段）。
+    # 批次（--all-partitions）是同一块盘的多个卷，probe 一次即可判定。
+    _msg = preflight_serial_required(resolved, manual_serial=body.serial,
+                                     smartctl=body.smartctl)
+    if _msg:
+        raise HTTPException(status_code=400, detail=_msg)
 
     if body.all_partitions:
         return _submit_collect_batch(body, runner, resolved, data_root)

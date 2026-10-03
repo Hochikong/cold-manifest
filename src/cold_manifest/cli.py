@@ -341,9 +341,16 @@ def _print_collect_result(result) -> None:
 
 def _cmd_collect_all_partitions(args: argparse.Namespace) -> int:
     """多分区批次采集（§4.2）：逐卷串行 collect_volume，打印每卷摘要与批次结果。"""
-    from .collect import CollectError, collect_volume
+    from .collect import CollectError, collect_volume, preflight_serial_required
     from .lockfile import DataRootLock, LockBusy
     from .probe import ProbeError, enumerate_disk_volumes
+
+    # 手填序列号预检：批次=同一块盘，一次判定；不满足直接拒绝整批（退出码 2）
+    _msg = preflight_serial_required(args.root, manual_serial=args.serial,
+                                     smartctl=not args.no_smartctl)
+    if _msg:
+        print(f"错误：{_msg}", file=sys.stderr)
+        return 2
 
     lock = DataRootLock(args.data_root)
     try:

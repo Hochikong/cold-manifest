@@ -122,7 +122,7 @@ def _collect(cli, data_root, scan_root, stamps, monkeypatch, capsys):
         disk_serial = "SER1"
         serial_source = "probe"
         bridge_model = ""
-        interface_type = "USB"
+        interface_type = "SATA"
         capacity_bytes = 2 * 10**10
         firmware = "fw"
         smart_status = "unavailable"

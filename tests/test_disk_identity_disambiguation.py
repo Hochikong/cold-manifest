@@ -28,7 +28,7 @@ def _make_probe(*, probe_serial: str, physical_serial: str,
     disk = DiskInfo(
         physical_model=model, physical_serial=physical_serial,
         disk_serial=probe_serial, serial_source="probe",
-        bridge_model="USB Bridge", interface_type="USB",
+        bridge_model="", interface_type="SATA",
         capacity_bytes=4_000_000_000, firmware="fw1",
         smart_status="unavailable",
     )

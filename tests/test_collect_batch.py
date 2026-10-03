@@ -11,6 +11,8 @@ from cold_manifest.collect import CollectResult
 from cold_manifest.probe import DiskInfo, ProbeError, VolumeInfo, VolumeTarget
 from cold_manifest.server import create_app
 
+from test_collect import _fake_probe
+
 # ---------------------------------------------------------------- probe 枚举（Linux 夹具）
 
 
@@ -331,6 +333,10 @@ def test_collect_batch_409_midway_cleans_up(client, tmp_path: Path, monkeypatch)
         _make_tree(v)
     paths = [str(v) for v in vols]
     targets = _targets_for(paths)
+    # 提交预检用非 USB 假 probe（同 test_cli_collect_all_partitions：本用例测的是
+    # 批次中途 409 清理，非 USB 序列号行为；真实 probe 会被严格版判 USB 要求手填）
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _fake_probe_per_path(paths))
     monkeypatch.setattr("cold_manifest.api.routes_collect.enumerate_disk_volumes",
                         lambda p: (targets, []))
 
@@ -412,6 +418,9 @@ def test_cli_collect_all_partitions(tmp_path: Path, monkeypatch, capsys) -> None
     for v in vols:
         _make_tree(v)
     targets = _targets_for([str(v) for v in vols])
+    # 提交预检用非 USB 假 probe（真实 probe 的 bridge_model 非空，会被严格版判为
+    # USB 盒要求手填序列号；本用例只测 CLI 批次 partial/done 汇总，非 USB 行为）
+    monkeypatch.setattr("cold_manifest.collect.probe_path", _fake_probe())
     monkeypatch.setattr(probe_mod, "enumerate_disk_volumes",
                         lambda p, smartctl=True: (targets, ["w1"]))
     seen: list[str] = []
