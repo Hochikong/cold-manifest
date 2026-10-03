@@ -90,6 +90,16 @@ def _migrate_catalog(conn: sqlite3.Connection) -> None:
         if name not in cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {decl}")
 
+    # 磁盘身份冲突检测（PR-A）：identity_verified / identity_conflict_json，幂等
+    dcols = {r[1] for r in conn.execute("PRAGMA table_info(disks)")}
+    if dcols:
+        for name, decl in (
+            ("identity_verified", "INTEGER"),
+            ("identity_conflict_json", "TEXT"),
+        ):
+            if name not in dcols:
+                conn.execute(f"ALTER TABLE disks ADD COLUMN {name} {decl}")
+
     # 昵称列（P1）：disks / volumes 各加 nickname TEXT，幂等
     for table in ("disks", "volumes"):
         tcols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}

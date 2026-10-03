@@ -81,6 +81,8 @@ CREATE TABLE IF NOT EXISTS disks (
   disk_id TEXT PRIMARY KEY,              -- 规范化 serial；无 serial 时 'NOSERIAL_' + 首卷 partition_uuid
   physical_model TEXT, physical_serial TEXT, bridge_model TEXT,
   capacity_bytes INTEGER, interface_type TEXT,
+  identity_verified INTEGER,           -- NULL=未知/旧数据，1=已验证，0=身份冲突
+  identity_conflict_json TEXT,         -- 冲突记录 JSON 数组（最多保留最近 20 条）
   first_seen TEXT, last_seen TEXT, notes TEXT,
   nickname TEXT
 );

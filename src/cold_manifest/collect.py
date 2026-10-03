@@ -374,12 +374,18 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
     disk_id = serial or f"NOSERIAL_{volume_id}"
     cat = connect_catalog(data_root)
     try:
-        ensure_disk(cat, disk_id,
-                    physical_model=disk.physical_model or None,
-                    physical_serial=disk.physical_serial or None,
-                    bridge_model=disk.bridge_model or None,
-                    capacity_bytes=disk.capacity_bytes,
-                    interface_type=disk.interface_type or None)
+        reg = ensure_disk(cat, disk_id,
+                          physical_model=disk.physical_model or None,
+                          physical_serial=disk.physical_serial or None,
+                          bridge_model=disk.bridge_model or None,
+                          capacity_bytes=disk.capacity_bytes,
+                          interface_type=disk.interface_type or None)
+        if reg["conflicts"]:
+            fields_seen = "、".join(c["field"] for c in reg["conflicts"])
+            warnings.append(
+                f"磁盘身份冲突：disk_id {disk_id} 已有记录与本次探测不一致"
+                f"（{fields_seen}）；两块盘可能报出相同序列号，"
+                f"建议为其中之一显式 --serial 区分")
         ensure_volume(cat, volume_id, disk_id,
                       partition_index=vol.partition_index,
                       partition_uuid=vol.partition_uuid or None,
@@ -437,22 +443,9 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
 
 
 def _usable_serial(serial: "str | None") -> bool:
-    """探测序列号是否可用。
-
-    视为不可用：空串、全 0 / 全占位符、清洗为 volume_id 字符集后不合法
-    （首字符非字母数字）的值——廉价 USB 桥常返回 "0"、"0000000" 甚至带
-    控制字节的残串（真盘 F: 实测 '\\x030'），这些值直接拼 volume_id 必然
-    被 validate_volume_id 拒绝，应走卷序列号回退或显式 --serial。
-    """
-    s = (serial or "").strip()
-    if not s:
-        return False
-    # 按 volume_id 的清洗口径检查（控制字符/空格等替换为 _ 后再判）：
-    # 首字符须为字母数字（validate_volume_id 同口径），且不能是全 0 占位
-    sanitized = re.sub(r"[^A-Za-z0-9_.\-]", "_", s)
-    if not re.match(r"[A-Za-z0-9]", sanitized):
-        return False
-    return any(c != "0" for c in sanitized)
+    """已上移为公共工具：见 catalog._usable_serial（保留别名供既有调用）。"""
+    from .catalog import _usable_serial as _fn
+    return _fn(serial)
 
 
 def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",

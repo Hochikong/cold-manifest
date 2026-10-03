@@ -38,16 +38,115 @@ def connect_catalog(data_root: "str | Path", check_same_thread: bool = True) -> 
     return conn
 
 
-def ensure_disk(conn: sqlite3.Connection, disk_id: str, **fields: Any) -> None:
-    """登记磁盘（幂等）：已存在则只刷新 last_seen，其余字段不动。"""
+def _usable_serial(serial: "str | None") -> bool:
+    """探测序列号是否可用（公共工具：collect 与身份冲突检测共用）。
+
+    视为不可用：空串、全 0 / 全占位符、清洗为 volume_id 字符集后不合法
+    （首字符非字母数字）的值——廉价 USB 桥常返回 "0"、"0000000" 甚至带
+    控制字节的残串（真盘 F: 实测 '\\x030'），这些值直接拼 volume_id 必然
+    被 validate_volume_id 拒绝，应走卷序列号回退或显式 --serial。
+    """
+    s = (serial or "").strip()
+    if not s:
+        return False
+    # 按 volume_id 的清洗口径检查（控制字符/空格等替换为 _ 后再判）：
+    # 首字符须为字母数字（validate_volume_id 同口径），且不能是全 0 占位
+    sanitized = re.sub(r"[^A-Za-z0-9_.\-]", "_", s)
+    if not re.match(r"[A-Za-z0-9]", sanitized):
+        return False
+    return any(c != "0" for c in sanitized)
+
+
+_IDENTITY_HISTORY_MAX = 20
+
+
+def _norm_model(model: "str | None") -> str:
+    """型号归一化：去空白、大写（用于同型号不同写法的比较）。"""
+    return re.sub(r"\s+", "", model or "").upper()
+
+
+def _detect_identity_conflicts(existing: Any, incoming: dict) -> "list[dict]":
+    """比对既有磁盘行与本次探测字段，逐条给出身份冲突（field/existing/incoming）。
+
+    判定口径：
+    ① 两侧 capacity_bytes 均非空且差 >20%；
+    ② 型号归一化（去空白、大写）后不同（physical_model 优先、回退 bridge_model）；
+    ③ 两侧"可用序列号"均非空且不同（physical_serial 优先、回退 disk_id——
+       disk_id 即规范化 serial）。
+    """
+    conflicts: "list[dict]" = []
+    ec = existing["capacity_bytes"]
+    ic = incoming.get("capacity_bytes")
+    if ec and ic and max(ec, ic) * 100 > min(ec, ic) * 120:
+        conflicts.append({"field": "capacity_bytes",
+                          "existing": ec, "incoming": ic})
+    em = _norm_model(existing["physical_model"] or existing["bridge_model"])
+    im = _norm_model(incoming.get("physical_model")
+                     or incoming.get("bridge_model"))
+    if em and im and em != im:
+        conflicts.append({"field": "physical_model",
+                          "existing": existing["physical_model"] or existing["bridge_model"],
+                          "incoming": incoming.get("physical_model")
+                          or incoming.get("bridge_model")})
+    es = existing["physical_serial"]
+    if not _usable_serial(es):
+        es = existing["disk_id"]  # disk_id 即登记时的 serial（可用时）
+    if not _usable_serial(es):
+        es = None
+    iser = incoming.get("physical_serial")
+    if not _usable_serial(iser):
+        iser = None
+    if es and iser and (es or "").strip() != (iser or "").strip():
+        conflicts.append({"field": "physical_serial",
+                          "existing": es, "incoming": iser})
+    return conflicts
+
+
+def ensure_disk(conn: sqlite3.Connection, disk_id: str, **fields: Any) -> dict:
+    """登记磁盘（幂等）：已存在则只刷新 last_seen，其余字段不动。
+
+    返回 {"inserted": bool, "conflicts": [...]}。conflicts 非空表示既有
+    记录与本次探测身份不一致（两块盘可能报出相同 disk_id）：此时**不覆盖
+    任何既有字段**，只刷 last_seen 并把冲突追加进 identity_conflict_json
+    （最多保留最近 20 条）、置 identity_verified=0。
+    identity_verified 由 caller 显式传入（若非 None）时，在无冲突路径上
+    写入/更新（含首次插入）。
+    """
     from datetime import datetime, timezone
+    import json
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    identity_verified = fields.pop("identity_verified", None)
+    cur = conn.execute("SELECT * FROM disks WHERE disk_id=?", (disk_id,))
+    row = cur.fetchone()
+    # 兼容无 row_factory 的连接（如 tests/test_hash.py 裸 sqlite3.connect）：
+    # 统一按列名取值（cursor.description 拼 dict）
+    existing = dict(zip((d[0] for d in cur.description), row)) if row is not None else None
+    conflicts = _detect_identity_conflicts(existing, fields) if existing else []
+    if conflicts:
+        # 冲突：不改既有字段，只追加冲突记录 + 刷 last_seen
+        old = existing.get("identity_conflict_json")
+        try:
+            history = json.loads(old) if old else []
+        except (TypeError, ValueError):
+            history = []
+        history.append({"at": now, "conflicts": conflicts})
+        history = history[-_IDENTITY_HISTORY_MAX:]
+        conn.execute(
+            "UPDATE disks SET last_seen=?, identity_verified=0,"
+            " identity_conflict_json=? WHERE disk_id=?",
+            (now, json.dumps(history, ensure_ascii=False), disk_id))
+        return {"inserted": False, "conflicts": conflicts}
+
     cols = {"disk_id": disk_id, "first_seen": now, "last_seen": now, **fields}
+    if identity_verified is not None:
+        cols["identity_verified"] = identity_verified
     keys = list(cols)
+    skip_updates = ("disk_id", "first_seen", "last_seen", "nickname",
+                    "identity_conflict_json")
     updates = ("last_seen=excluded.last_seen, " + ", ".join(
         f"{k}=COALESCE(excluded.{k}, {k})"
-        for k in keys if k not in ("disk_id", "first_seen", "last_seen", "nickname"))).rstrip(", ")
+        for k in keys if k not in skip_updates)).rstrip(", ")
     if not updates:
         # 只有 disk_id/first_seen/last_seen（无附加字段）：UPSERT 只刷 last_seen
         updates = "last_seen=excluded.last_seen"
@@ -56,6 +155,7 @@ def ensure_disk(conn: sqlite3.Connection, disk_id: str, **fields: Any) -> None:
         f"ON CONFLICT(disk_id) DO UPDATE SET {updates}",
         [cols[k] for k in keys],
     )
+    return {"inserted": existing is None, "conflicts": []}
 
 
 def ensure_volume(conn: sqlite3.Connection, volume_id: str, disk_id: str, **fields: Any) -> None:
