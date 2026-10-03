@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Alert, App, Button, Card, Collapse, Descriptions, Empty, Progress, Row, Col, Skeleton, Space, Table, Tag, Tooltip, Typography } from 'antd'
-import { CheckCircleOutlined, DeleteOutlined, ExclamationCircleOutlined, MedicineBoxOutlined, ThunderboltOutlined } from '@ant-design/icons'
-import { useDisk, useDiskSmartRead, useSetDiskNickname } from '../api/hooks'
+import { CheckCircleOutlined, DeleteOutlined, ExclamationCircleOutlined, MedicineBoxOutlined, ReloadOutlined, ThunderboltOutlined } from '@ant-design/icons'
+import { useDisk, useDiskSmartRead, usePatchDisk, useRecheckDiskIdentity, useSetDiskNickname } from '../api/hooks'
 import { useDeleteRegistry } from '../hooks/useDeleteRegistry'
 import ErrorAlert from './ErrorAlert'
 import IdentityStatusBadge from './IdentityStatusBadge'
@@ -10,7 +10,7 @@ import NicknameEditor from './NicknameEditor'
 import SmartTrendsChart from './SmartTrendsChart'
 import VolumeTrendsChart from './VolumeTrendsChart'
 import VolumeDetailDrawer from './VolumeDetailDrawer'
-import { apiErrorDetail, parseSmartIdentity, type AtaAttribute, type AtaExtras, type DiskDetail, type DiskVolume, type DiskSnapshot, type ParsedSmart, type SmartReadResult, type SsdMetrics } from '../api/client'
+import { apiErrorDetail, parseSmartIdentity, type AtaAttribute, type AtaExtras, type DiskDetail, type DiskVolume, type DiskSnapshot, type IdentityRecheckResult, type ParsedSmart, type SmartReadResult, type SsdMetrics } from '../api/client'
 import { formatDateTime, formatFileSize, formatNumber, middleEllipsis } from '../utils/format'
 import { deviceTypeLabel, formFactorLabel, interfaceTypeLabel, smartStatusLabel, whenFailedLabel, zonedLabel } from '../utils/smartLabels'
 
@@ -194,8 +194,12 @@ function SourceTag({ text }: { text: string }) {
 }
 
 function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge, ata }: { disk: DiskDetail; liveParsed: ParsedSmart | null; liveLabel: string | null; mediaBadge: { label: string; color: string } | null; ata: AtaExtras | null }) {
-  const { message } = App.useApp()
+  const { message, modal } = App.useApp()
   const setNickname = useSetDiskNickname()
+  const patch = usePatchDisk()
+  const recheck = useRecheckDiskIdentity()
+  const [recheckResult, setRecheckResult] = useState<IdentityRecheckResult | null>(null)
+  const [recheckError, setRecheckError] = useState<string | null>(null)
 
   const saveNickname = async (nickname: string) => {
     try {
@@ -206,6 +210,84 @@ function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge, ata }: { disk: 
       throw e
     }
   }
+
+  const savePhysicalSerial = async (serial: string) => {
+    try {
+      await patch.mutateAsync({ disk_id: disk.disk_id, body: { physical_serial: serial } })
+      message.success(serial ? '真盘序列号已保存' : '真盘序列号已清除')
+    } catch (e) {
+      message.error(apiErrorDetail(e) || '真盘序列号保存失败')
+      throw e
+    }
+  }
+
+  // 磁盘 ID（disk_serial 来源）：仅无快照的盘可改；有快照 → 后端 400，前端干脆不给入口
+  const canEditDiskId = disk.snapshots.length === 0
+  const saveDiskSerial = async (serial: string) => {
+    if (!serial) {
+      message.warning('磁盘 ID 不能为空')
+      throw new Error('empty')
+    }
+    try {
+      await patch.mutateAsync({ disk_id: disk.disk_id, body: { disk_serial: serial } })
+      message.success('磁盘 ID 已更新')
+    } catch (e) {
+      message.error(apiErrorDetail(e) || '磁盘 ID 修改失败')
+      throw e
+    }
+  }
+
+  const handleRecheck = async () => {
+    setRecheckResult(null)
+    setRecheckError(null)
+    try {
+      setRecheckResult(await recheck.mutateAsync(disk.disk_id))
+    } catch (e) {
+      setRecheckError(apiErrorDetail(e) || '重新校验失败')
+    }
+  }
+
+  const manualConfirm = () => {
+    modal.confirm({
+      title: '手动确认磁盘身份',
+      content: '确认后该盘身份将标记为「已验证」（来源：手动确认）。请确保你已亲自核对过这块盘的序列号。',
+      okText: '确认已验证',
+      onOk: async () => {
+        try {
+          await patch.mutateAsync({ disk_id: disk.disk_id, body: { identity_verified: true } })
+          message.success('已手动确认该盘身份')
+        } catch (e) {
+          message.error(apiErrorDetail(e) || '手动确认失败')
+          throw e
+        }
+      },
+    })
+  }
+
+  const revokeConfirm = () => {
+    modal.confirm({
+      title: '撤销身份确认',
+      content: '撤销后该盘身份将回到「未验证」。下次把盘接上后可用「重新校验」自动核对。',
+      okText: '撤销确认',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          await patch.mutateAsync({ disk_id: disk.disk_id, body: { identity_verified: false } })
+          message.success('已撤销身份确认')
+        } catch (e) {
+          message.error(apiErrorDetail(e) || '撤销失败')
+          throw e
+        }
+      },
+    })
+  }
+
+  // 身份验证来源与时间：auto=采集时自动核对 / manual=用户手动确认；缺省只显示状态
+  const verifiedFrom = disk.identity_verified_source ?? null
+  const verifiedAt = disk.identity_verified_at ?? null
+  const verifiedMeta = verifiedFrom
+    ? `${verifiedFrom === 'manual' ? '手动确认' : '自动校验'}${verifiedAt ? ` · ${formatDateTime(verifiedAt)}` : ''}`
+    : null
 
   // 真盘身份：优先现场读取，其次最近一次采集存的 smartctl 原始 JSON；都没有再回落系统探测 / USB 桥
   const smartIdentity = liveParsed
@@ -244,21 +326,79 @@ function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge, ata }: { disk: 
         <Descriptions.Item label="昵称">
           <NicknameEditor value={disk.nickname} onSave={saveNickname} />
         </Descriptions.Item>
-        {/* 身份状态：徽标 + 原因文字。这里是「要读清楚」的地方，原因完整换行展示（不用省略号）。 */}
+        {/* 身份状态：徽标 + 操作（重新校验 / 手动确认）+ 原因文字。这里是「要读清楚」的地方。 */}
         <Descriptions.Item label="身份">
-          <Space orientation="vertical" size={2} style={{ width: '100%' }}>
-            <IdentityStatusBadge status={disk.identity_status} reason={disk.identity_status_reason} />
+          <Space orientation="vertical" size={4} style={{ width: '100%' }}>
+            <Space size={8} wrap>
+              <IdentityStatusBadge status={disk.identity_status} reason={disk.identity_status_reason} />
+              <Tooltip title="把盘接上后现场重新核对身份（序列号 / 容量）">
+                <Button
+                  size="small"
+                  icon={<ReloadOutlined />}
+                  loading={recheck.isPending}
+                  onClick={() => void handleRecheck()}
+                >
+                  重新校验
+                </Button>
+              </Tooltip>
+              {disk.identity_verified_source === 'manual' ? (
+                <Button size="small" onClick={revokeConfirm} disabled={patch.isPending}>
+                  撤销确认
+                </Button>
+              ) : (
+                <Tooltip title="我已亲自核对过这块盘的序列号，标记为已验证">
+                  <Button size="small" onClick={manualConfirm} disabled={patch.isPending}>
+                    手动确认
+                  </Button>
+                </Tooltip>
+              )}
+            </Space>
+            {verifiedMeta && (
+              <Text type="secondary" style={{ fontSize: 12 }}>{verifiedMeta}</Text>
+            )}
             {disk.identity_status_reason && (
-              <Text type="secondary" style={{ whiteSpace: 'normal', wordBreak: 'break-word', fontSize: 12 }}>
+              <Text
+                type="secondary"
+                copyable={{ text: disk.identity_status_reason, tooltips: ['复制原因', '已复制'] }}
+                style={{ whiteSpace: 'normal', wordBreak: 'break-word', fontSize: 12 }}
+              >
                 {disk.identity_status_reason}
               </Text>
             )}
+            {recheckResult?.verdict === 'verified' && (
+              <Alert
+                type="success"
+                showIcon
+                title="重新校验通过：已验证"
+                description={`真盘序列号 ${recheckResult.identity_serial ?? '—'}${recheckResult.capacity_bytes != null ? ` · 容量 ${formatFileSize(recheckResult.capacity_bytes)}` : ''}`}
+              />
+            )}
+            {recheckResult?.verdict === 'unverified' && (
+              <Alert type="warning" showIcon title="重新校验：未验证" description={recheckResult.reason} />
+            )}
+            {recheckResult?.verdict === 'not_attached' && (
+              <Alert type="info" showIcon title="盘不在线，请插上后重试" description={recheckResult.reason} />
+            )}
+            {recheckError && <Alert type="error" showIcon title="重新校验失败" description={recheckError} />}
           </Space>
         </Descriptions.Item>
         <Descriptions.Item label="介质类型">
           {mediaBadge ? <Tag color={mediaBadge.color}>{mediaBadge.label}</Tag> : <Text type="secondary">未识别</Text>}
         </Descriptions.Item>
-        <Descriptions.Item label="磁盘 ID"><Text code>{disk.disk_id}</Text></Descriptions.Item>
+        <Descriptions.Item label="磁盘 ID">
+          {canEditDiskId ? (
+            <NicknameEditor
+              value={disk.disk_id}
+              onSave={saveDiskSerial}
+              ariaLabel="磁盘 ID"
+              placeholder="不能为空"
+            />
+          ) : (
+            <Tooltip title="已有快照的盘不能改磁盘 ID（会让卷 ID 与快照失联）；请用「重新校验 / 手动确认」，或删除快照后重采。">
+              <Text code>{disk.disk_id}</Text>
+            </Tooltip>
+          )}
+        </Descriptions.Item>
         <Descriptions.Item label="真盘型号">
           <Space size={0} wrap>
             <Text>{model || '-'}</Text>
@@ -266,8 +406,14 @@ function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge, ata }: { disk: 
           </Space>
         </Descriptions.Item>
         <Descriptions.Item label="真盘序列号">
-          <Space size={0} wrap>
-            {serial ? <Text code>{serial}</Text> : <Text>-</Text>}
+          <Space size={4} wrap>
+            <NicknameEditor
+              value={disk.physical_serial}
+              onSave={savePhysicalSerial}
+              ariaLabel="真盘序列号"
+              inputWidth={220}
+              placeholder="未记录"
+            />
             {serial && serialSource && <SourceTag text={serialSource} />}
           </Space>
         </Descriptions.Item>

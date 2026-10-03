@@ -444,6 +444,10 @@ export interface Disk {
   identity_status: 'verified' | 'unverified' | 'conflict' | 'unknown'
   /** 中文一句话原因；无原因时为 null/缺省 */
   identity_status_reason: string | null
+  /** 身份验证来源：auto=采集时自动核对 / manual=用户手动确认；旧后端缺省 */
+  identity_verified_source?: 'auto' | 'manual' | null
+  /** 身份验证时间（ISO 字符串）；旧后端缺省 */
+  identity_verified_at?: string | null
 }
 
 export interface DisksResponse {
@@ -498,6 +502,41 @@ export async function getDisk(disk_id: string): Promise<DiskDetail> {
 /** 设置/清除磁盘昵称（PATCH /disks/{id}）；空串 = 清除，≤64 字符，未知 id → 404。 */
 export async function patchDiskNickname(disk_id: string, nickname: string): Promise<{ disk_id: string; nickname: string | null }> {
   const { data } = await client.patch(`/disks/${encodeURIComponent(disk_id)}`, { nickname })
+  return data
+}
+
+/**
+ * PATCH /disks/{id} 扩展字段（后端逐项落地，旧后端可能返回 400/422，由调用方按 detail 提示）：
+ * - identity_verified：手动确认/撤销身份（后端记 identity_verified_source="manual" + 时间）；
+ * - physical_serial：真盘序列号直接修改；
+ * - disk_serial：磁盘 ID 来源，仅该盘没有快照时可改，有快照 → 400（detail 为人话说明）。
+ */
+export interface DiskPatchBody {
+  nickname?: string
+  identity_verified?: boolean
+  physical_serial?: string
+  disk_serial?: string
+}
+
+/** 通用磁盘字段更新（昵称 / 身份确认 / 序列号），返回更新后的完整详情。 */
+export async function patchDisk(disk_id: string, body: DiskPatchBody): Promise<DiskDetail> {
+  const { data } = await client.patch<DiskDetail>(`/disks/${encodeURIComponent(disk_id)}`, body)
+  return data
+}
+
+/** POST /disks/{id}/identity/recheck 返回：现场重新校验身份的结论。 */
+export interface IdentityRecheckResult {
+  ok: boolean
+  /** verified=现场核对通过 / unverified=核对未通过 / not_attached=盘当前不在线 */
+  verdict: 'verified' | 'unverified' | 'not_attached'
+  reason: string
+  identity_serial: string | null
+  capacity_bytes: number | null
+}
+
+/** 现场重新校验磁盘身份；盘不在线是 200 + not_attached（不抛错），未知盘才 404。 */
+export async function recheckDiskIdentity(disk_id: string): Promise<IdentityRecheckResult> {
+  const { data } = await client.post<IdentityRecheckResult>(`/disks/${encodeURIComponent(disk_id)}/identity/recheck`)
   return data
 }
 
@@ -653,6 +692,16 @@ export interface PreflightResponse {
   device_type_hint: string
   is_smart_capable: boolean
   warnings: string[]
+  /** USB 硬盘盒 → true：盒子上报的序列号不能作为磁盘身份，必须手填（后端缺失字段时按 false 处理，不拦） */
+  requires_manual_serial?: boolean
+  /** 需要手填序列号的人话原因 */
+  manual_serial_reason?: string | null
+  /** 盒子上报的序列号（不能作为身份依据，仅作对照展示） */
+  probe_serial?: string | null
+  /** USB 桥/盒子型号 */
+  bridge_model?: string | null
+  /** 接口类型（如 usb/jmicron bridge） */
+  interface_type?: string | null
 }
 
 export async function collectPreflight(body: PreflightBody): Promise<PreflightResponse> {

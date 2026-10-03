@@ -14,6 +14,7 @@ import {
   Form,
   Collapse,
   Divider,
+  Tooltip,
   App,
 } from 'antd'
 import {
@@ -227,8 +228,20 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
 
   const { data: preflight } = useCollectPreflight(path)
 
+  // USB 硬盘盒：盒子上报的序列号不能作为磁盘身份，必须手填盘体标签上的序列号。
+  // 字段缺失（旧后端）或 requires_manual_serial=false → 与现在完全一致，不拦。
+  const needsManualSerial = preflight?.requires_manual_serial === true
+  const serialFilled = serial.trim().length > 0
+  const serialBlocked = needsManualSerial && !serialFilled
+  const manualSerialReason =
+    preflight?.manual_serial_reason ||
+    '该盘经 USB 硬盘盒接入，盒子会挡住真盘的序列号，上报的编号不能作为磁盘身份依据。请在下方「磁盘序列号」中填写盘体标签上的序列号——手填一次，这块盘以后的身份就固定了。'
+
   const canStart =
-    !createCollectMutation.isPending && path.trim().length > 0 && preflight?.writable !== false
+    !createCollectMutation.isPending &&
+    path.trim().length > 0 &&
+    preflight?.writable !== false &&
+    !serialBlocked
 
   const singleTask = taskId ? task : null
   const isSingleActive = singleTask && (singleTask.status === 'pending' || singleTask.status === 'running')
@@ -272,16 +285,48 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
 
             <PreflightSection path={path} />
 
+            {needsManualSerial && (
+              <Alert
+                type="warning"
+                showIcon
+                title="此盘必须手填磁盘序列号"
+                description={
+                  <Space orientation="vertical" size={4} style={{ width: '100%' }}>
+                    <Text>{manualSerialReason}</Text>
+                    {preflight?.probe_serial && (
+                      <Text type="secondary">
+                        盒子报告：<Text code>{preflight.probe_serial}</Text>（不能作为身份依据）
+                      </Text>
+                    )}
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      序列号通常印在盘体标签上「S/N」「Serial No.」一栏；手填一次后，这块盘在系统里的身份就固定了，以后不用再填。
+                    </Text>
+                  </Space>
+                }
+              />
+            )}
+
             <Form.Item
-              label="磁盘序列号"
+              label={
+                <Space size={4}>
+                  <span>磁盘序列号</span>
+                  {needsManualSerial && <Text type="danger">*</Text>}
+                  {needsManualSerial && <Tag color="warning" style={{ marginInlineEnd: 0 }}>必填</Tag>}
+                </Space>
+              }
+              validateStatus={serialBlocked ? 'warning' : undefined}
+              help={serialBlocked ? '请填写盘体标签上的序列号后才能开始采集。' : undefined}
               extra={
                 pickedSerialHint
                   ? `枚举到该盘序列号为 ${pickedSerialHint}（仅供参考，未自动填入——请与盘体标签核对后再决定是否手填）`
-                  : 'USB 桥盘探测不到序列号时必须填写；普通 SATA 盘可留空'
+                  : needsManualSerial
+                    ? 'USB 硬盘盒接入的盘必须手填序列号；普通 SATA 盘可留空'
+                    : 'USB 桥盘探测不到序列号时必须填写；普通 SATA 盘可留空'
               }
             >
               <Input
-                placeholder="例如 DEMO01"
+                placeholder={needsManualSerial ? '必填：盘体标签上的序列号' : '例如 DEMO01'}
+                status={serialBlocked ? 'warning' : undefined}
                 value={serial}
                 onChange={(e) => setSerial(e.target.value)}
               />
@@ -370,17 +415,26 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
               },
             ]} />
 
-            <Button
-              type="primary"
-              icon={<PlayCircleOutlined />}
-              loading={createCollectMutation.isPending}
-              disabled={!canStart}
-              onClick={startCollect}
-              block
-              style={{ marginTop: 12 }}
-            >
-              {allPartitions ? '开始批次采集' : '开始采集'}
-            </Button>
+            <Tooltip title={serialBlocked ? manualSerialReason : undefined}>
+              <span style={{ display: 'block' }}>
+                <Button
+                  type="primary"
+                  icon={<PlayCircleOutlined />}
+                  loading={createCollectMutation.isPending}
+                  disabled={!canStart}
+                  onClick={startCollect}
+                  block
+                  style={{ marginTop: 12 }}
+                >
+                  {allPartitions ? '开始批次采集' : '开始采集'}
+                </Button>
+              </span>
+            </Tooltip>
+            {serialBlocked && (
+              <Text type="warning" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
+                <WarningOutlined /> 请先填写磁盘序列号：USB 硬盘盒会挡住真盘序列号，需要手填盘体标签上的序列号来确定盘的身份。
+              </Text>
+            )}
           </Form>
         )}
 

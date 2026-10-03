@@ -45,6 +45,8 @@ import {
   listDisks,
   getDisk,
   patchDiskNickname,
+  patchDisk,
+  recheckDiskIdentity,
   patchVolumeNickname,
   getDiskSmartHistory,
   readDiskSmartNow,
@@ -62,6 +64,7 @@ import {
   type ListTasksParams,
   type SkippedParams,
   type HashTaskBody,
+  type DiskPatchBody,
   type Task,
   type TaskStatus,
   type Batch,
@@ -204,6 +207,43 @@ export function useSetDiskNickname() {
     mutationFn: ({ disk_id, nickname }: { disk_id: string; nickname: string }) =>
       patchDiskNickname(disk_id, nickname),
     onSuccess: () => invalidateNicknameQueries(qc),
+  })
+}
+
+/**
+ * 磁盘字段更新（昵称 / 身份手动确认 / physical_serial / disk_serial）。
+ * 成功后写回详情缓存并刷新相关列表；字段失效/被拒（400）由调用方按 detail 提示。
+ */
+export function usePatchDisk() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: ({ disk_id, body }: { disk_id: string; body: DiskPatchBody }) =>
+      patchDisk(disk_id, body),
+    onSuccess: (detail, vars) => {
+      if (detail.disk_id !== vars.disk_id) {
+        // disk_serial 被修改 → 磁盘 ID 变了：移除旧键，让面板按新 ID 重新拉取
+        qc.removeQueries({ queryKey: ['disk', vars.disk_id] })
+        qc.invalidateQueries({ queryKey: ['disk'] })
+      } else {
+        qc.setQueryData(['disk', vars.disk_id], detail)
+      }
+      qc.invalidateQueries({ queryKey: ['disks'] })
+      qc.invalidateQueries({ queryKey: ['volumes'] })
+      qc.invalidateQueries({ queryKey: ['volume-detail'] })
+      qc.invalidateQueries({ queryKey: ['snapshots'] })
+    },
+  })
+}
+
+/** 现场重新校验磁盘身份；成功后失效磁盘缓存（身份状态可能变化）。 */
+export function useRecheckDiskIdentity() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (disk_id: string) => recheckDiskIdentity(disk_id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['disks'] })
+      qc.invalidateQueries({ queryKey: ['disk'] })
+    },
   })
 }
 

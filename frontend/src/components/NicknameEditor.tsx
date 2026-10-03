@@ -14,6 +14,8 @@ interface NicknameEditorProps {
   /** 编辑框宽度（表格内建议 200 左右） */
   inputWidth?: number
   maxLength?: number
+  /** 无障碍标签 / 编辑按钮 title（默认按昵称） */
+  ariaLabel?: string
 }
 
 /**
@@ -26,6 +28,7 @@ export default function NicknameEditor({
   placeholder = '未设置',
   inputWidth = 200,
   maxLength = 64,
+  ariaLabel = '昵称',
 }: NicknameEditorProps) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
@@ -70,7 +73,7 @@ export default function NicknameEditor({
         maxLength={maxLength}
         value={draft}
         placeholder="留空并回车清除"
-        aria-label="昵称"
+        aria-label={ariaLabel}
         disabled={saving}
         onChange={(e) => setDraft(e.target.value)}
         onPressEnter={() => void save()}
@@ -94,8 +97,8 @@ export default function NicknameEditor({
       <Button
         type="text"
         size="small"
-        aria-label="编辑昵称"
-        title="编辑昵称"
+        aria-label={`编辑${ariaLabel}`}
+        title={`编辑${ariaLabel}`}
         icon={<EditOutlined style={{ color: value ? undefined : '#bfbfbf' }} />}
         onClick={start}
       />
