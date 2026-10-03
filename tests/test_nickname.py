@@ -109,7 +109,7 @@ def client(tmp_path: Path, cat: sqlite3.Connection) -> TestClient:
 def test_patch_disk_nickname(client: TestClient) -> None:
     r = client.patch(f"/api/disks/{DISK}", json={"nickname": "移动硬盘A"})
     assert r.status_code == 200
-    assert r.json() == {"disk_id": DISK, "nickname": "移动硬盘A"}
+    assert r.json()["nickname"] == "移动硬盘A"
 
     # 更新
     r = client.patch(f"/api/disks/{DISK}", json={"nickname": "新名字"})

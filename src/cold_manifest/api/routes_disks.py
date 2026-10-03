@@ -118,6 +118,7 @@ def list_disks(request: Request) -> dict:
         """
         SELECT d.disk_id, d.physical_model, d.physical_serial, d.bridge_model,
                d.capacity_bytes, d.interface_type, d.first_seen, d.last_seen, d.nickname,
+               d.identity_verified, d.identity_verified_source, d.identity_verified_at,
                (SELECT COUNT(*) FROM volumes v WHERE v.disk_id = d.disk_id) AS volume_count,
                (SELECT COUNT(*) FROM snapshots s JOIN volumes v2 ON s.volume_id = v2.volume_id
                 WHERE v2.disk_id = d.disk_id) AS snapshot_count
@@ -663,6 +664,100 @@ def disk_smart_read(disk_id: str, request: Request,
     return out
 
 
+# ---------------------------------------------------------------- 身份现场重新校验
+
+
+@router.post("/disks/{disk_id}/identity/recheck")
+def disk_identity_recheck(disk_id: str, request: Request) -> dict:
+    """现场重新校验这块盘的身份（把插着的盘与登记身份对号）。
+
+    定位复用 /smart/read 的候选链逻辑（attached 枚举 → resolve_smart_device
+    身份定位 → read_smart_verbose）；判据与采集 probe 相同（resolve_smart_device
+    的 mapped_by：serial_match / unique_capacity_match 视为验证通过）。
+
+    - 盘不在线：200 + {"ok": false, "verdict": "not_attached", ...}（未知盘 404）；
+    - 验证通过：identity_verified=1、source='auto'、at=now，读到不同
+      physical_serial 时顺带更正记录值；
+    - 未通过：identity_verified=0（保留原因在响应里）。
+
+    本端点**绝不**改 disk_id / volume_id（会破坏快照关联）；只更正/确认
+    记录性身份字段。返回 {ok, verdict, reason, identity_serial, capacity_bytes}。
+    """
+    from datetime import datetime, timezone
+
+    state = get_state(request)
+    if state.catalog.execute(
+            "SELECT 1 FROM disks WHERE disk_id=?", (disk_id,)).fetchone() is None:
+        raise HTTPException(status_code=404, detail=f"盘不存在：{disk_id}")
+
+    def _body(ok: bool, verdict: str, reason: str,
+              identity_serial: "str | None", capacity_bytes: "int | None") -> dict:
+        return {"ok": ok, "verdict": verdict, "reason": reason,
+                "identity_serial": identity_serial,
+                "capacity_bytes": capacity_bytes}
+
+    try:
+        size_bytes, cands, loc = _locate_attached_candidates(disk_id, None)
+    except HTTPException as e:
+        # attached 枚举里没有这块盘（含枚举失败）→ 盘不在线，不是错误
+        return _body(False, "not_attached", str(e.detail), None, None)
+
+    size_bytes, _cap_status = _capacity_screen(cands, size_bytes)
+    if not cands:
+        return _body(False, "unverified", "盘在线但无法定位物理设备候选",
+                     None, size_bytes)
+
+    res = smart.read_smart_verbose(devices=cands)
+    if not res.get("ok"):
+        state.catalog.execute(
+            "UPDATE disks SET identity_verified=0, identity_verified_source='auto',"
+            " identity_verified_at=? WHERE disk_id=?",
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"), disk_id))
+        state.catalog.commit()
+        reason = res.get("message") or res.get("reason") or "SMART 读取失败"
+        return _body(False, "unverified", f"无法读取 SMART：{reason}",
+                     None, size_bytes)
+
+    parsed = smart.parse_smart(res["raw"], exit_status=res.get("exit_status"))
+    got = str(parsed.get("serial") or "").strip()
+    expected = str(loc.get("expected_serial") or "").strip() or disk_id
+    mapped_by = str((loc.get("scan_info") or {}).get("mapped_by") or "")
+    capacity = parsed.get("capacity_bytes") or size_bytes
+
+    # 与采集 probe 相同的判据：序列号一致，或身份解析走到
+    # unique_capacity_match（expected 是盒 ID、SMART 读到真盘序列号且容量吻合）
+    verified = bool(got) and (
+        got.upper() == expected.upper() or mapped_by == "unique_capacity_match")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if verified:
+        sets = ["identity_verified=1", "identity_verified_source='auto'",
+                "identity_verified_at=?"]
+        params: "list[object]" = [now]
+        if got and got.upper() != str(
+                state.catalog.execute(
+                    "SELECT physical_serial FROM disks WHERE disk_id=?",
+                    (disk_id,)).fetchone()[0] or "").strip().upper():
+            sets.append("physical_serial=?")
+            params.append(got)
+        params.append(disk_id)
+        state.catalog.execute(
+            f"UPDATE disks SET {', '.join(sets)} WHERE disk_id=?", params)
+        reason = ("现场读取 SMART：序列号一致" if got.upper() == expected.upper()
+                  else "现场读取 SMART：盒 ID + 容量/真盘序列号吻合（unique_capacity_match）")
+    else:
+        state.catalog.execute(
+            "UPDATE disks SET identity_verified=0, identity_verified_source='auto',"
+            " identity_verified_at=? WHERE disk_id=?", (now, disk_id))
+        if got:
+            reason = (f"现场读到序列号 {got}，与登记序列号 {expected} 不一致"
+                      "（可能插错盘或映射错位；请核对后重试）")
+        else:
+            reason = "现场未能读到序列号，无法确认身份"
+    state.catalog.commit()
+    return _body(verified, "verified" if verified else "unverified",
+                 reason, got or None, capacity)
+
+
 # ---------------------------------------------------------------- preflight
 
 
@@ -680,6 +775,11 @@ def collect_preflight(body: PreflightBody) -> dict:
         "smartctl_path": None,
         "device_type_hint": "",
         "is_smart_capable": False,
+        "requires_manual_serial": False,
+        "manual_serial_reason": "",
+        "probe_serial": None,
+        "bridge_model": None,
+        "interface_type": None,
         "warnings": [],
     }
     p = Path(body.path)
@@ -719,4 +819,29 @@ def collect_preflight(body: PreflightBody) -> dict:
     res["is_smart_capable"] = parsed.get("health") in ("passed", "failed", "warning")
     if not res["is_smart_capable"]:
         res["warnings"].append("该盘未返回可用的 SMART 状态")
+
+    # 硬盘盒（USB 桥）判定：探测接口/桥型号（不重复跑 SMART），复用采集引擎
+    # 同一判据（collect._is_usb_bridge）——硬盘盒必须手填序列号，提前告知前端。
+    from ..collect import _is_usb_bridge
+    from ..probe import ProbeError, probe_path
+
+    probe_serial = str(parsed.get("serial") or "").strip()
+    try:
+        _, disk = probe_path(body.path, smartctl=False)
+    except ProbeError:
+        disk = None  # 探测失败沿用现有错误路径，不新增报错
+    if disk is not None:
+        bridge = str(disk.bridge_model or "").strip()
+        iface = str(disk.interface_type or "").strip()
+        res["bridge_model"] = bridge or None
+        res["interface_type"] = iface or None
+        if _is_usb_bridge(disk):
+            res["requires_manual_serial"] = True
+            desc = bridge or iface or "USB"
+            parts = [f"该盘经 USB 硬盘盒接入（盒子：{desc}）"]
+            if probe_serial:
+                parts.append(f"盒子上报的序列号 {probe_serial} 不能作为磁盘身份依据")
+            parts.append("请在「磁盘序列号」中填写盘体标签上的序列号")
+            res["manual_serial_reason"] = "，".join(parts[:2]) + "；" + parts[-1]
+    res["probe_serial"] = probe_serial or None
     return res

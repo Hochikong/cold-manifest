@@ -96,6 +96,8 @@ def _migrate_catalog(conn: sqlite3.Connection) -> None:
         for name, decl in (
             ("identity_verified", "INTEGER"),
             ("identity_conflict_json", "TEXT"),
+            ("identity_verified_source", "TEXT"),
+            ("identity_verified_at", "TEXT"),
         ):
             if name not in dcols:
                 conn.execute(f"ALTER TABLE disks ADD COLUMN {name} {decl}")

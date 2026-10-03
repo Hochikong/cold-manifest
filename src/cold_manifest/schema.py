@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS disks (
   physical_model TEXT, physical_serial TEXT, bridge_model TEXT,
   capacity_bytes INTEGER, interface_type TEXT,
   identity_verified INTEGER,           -- NULL=未知/旧数据，1=已验证，0=身份冲突
+  identity_verified_source TEXT,       -- 验证来源：manual（Web 手动确认）/ auto（现场 recheck）
+  identity_verified_at TEXT,           -- 最近一次身份验证时间（UTC ISO）
   identity_conflict_json TEXT,         -- 冲突记录 JSON 数组（最多保留最近 20 条）
   first_seen TEXT, last_seen TEXT, notes TEXT,
   nickname TEXT

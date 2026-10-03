@@ -370,6 +370,126 @@ def test_preflight_sm_failures_degrade(client: TestClient, tmp_path: Path,
     assert any("SMART" in w for w in body["warnings"])
 
 
+# ---------------------------------------------------- preflight 硬盘盒手填序列号
+
+
+from cold_manifest.probe import DiskInfo, ProbeError  # noqa: E402
+
+
+def _patch_preflight_sm(monkeypatch, raw=SAMPLE) -> None:
+    monkeypatch.setattr(smart, "check_smartctl", lambda: "/usr/bin/smartctl")
+    monkeypatch.setattr(smart, "device_for_path", lambda p: "/dev/sdz")
+    monkeypatch.setattr(
+        smart, "read_smart_verbose",
+        lambda dev=None, *, devices=None, **kw: {
+            "ok": True, "raw": raw, "device": "/dev/sdz",
+            "device_type": "sat", "exit_status": 0, "reason": None,
+            "message": None, "raw_excerpt": "", "attempts": []})
+
+
+def test_preflight_usb_bridge_requires_manual_serial(
+        client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(monkeypatch)
+
+    disk = DiskInfo(bridge_model="JMicron Generic SCSI Device",
+                    interface_type="USB", disk_serial="9876ABC")
+    seen: dict = {}
+
+    def fake_probe(path, *, manual_serial=None, smartctl=True):
+        seen["path"] = path
+        seen["smartctl"] = smartctl
+        return (None, disk)
+
+    monkeypatch.setattr("cold_manifest.probe.probe_path", fake_probe)
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert seen["smartctl"] is False
+    assert body["requires_manual_serial"] is True
+    assert "JMicron Generic SCSI Device" in body["manual_serial_reason"]
+    assert "序列号" in body["manual_serial_reason"]
+    # probe_serial 带回（SMART 探测值，供对照）
+    assert body["probe_serial"] == "9876ABC"
+    assert body["bridge_model"] == "JMicron Generic SCSI Device"
+    assert body["interface_type"] == "USB"
+    # 既有键不受影响
+    assert body["is_smart_capable"] is True
+    assert body["writable"] is True
+
+
+def test_preflight_bridge_model_only_not_usb(client: TestClient, tmp_path: Path,
+                                             monkeypatch) -> None:
+    """bridge_model 非空但 interface_type 不含 USB → 不算硬盘盒（不误拦：
+    Linux probe 会把 lsblk 盘型号填进 bridge_model）。bridge_model 仅展示。"""
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(monkeypatch)
+    monkeypatch.setattr(
+        "cold_manifest.probe.probe_path",
+        lambda p, **kw: (None, DiskInfo(bridge_model="Sunplus", interface_type="")))
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert body["requires_manual_serial"] is False
+
+
+def test_preflight_interface_type_lowercase_usb(client: TestClient, tmp_path: Path,
+                                                monkeypatch) -> None:
+    """interface_type='usb'（小写）也判为硬盘盒（大小写不敏感）。"""
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(monkeypatch)
+    monkeypatch.setattr(
+        "cold_manifest.probe.probe_path",
+        lambda p, **kw: (None, DiskInfo(bridge_model="Sunplus",
+                                        interface_type="usb")))
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert body["requires_manual_serial"] is True
+    assert "Sunplus" in body["manual_serial_reason"]
+
+
+def test_preflight_sata_no_manual_serial(client: TestClient, tmp_path: Path,
+                                         monkeypatch) -> None:
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(monkeypatch)
+    monkeypatch.setattr(
+        "cold_manifest.probe.probe_path",
+        lambda p, **kw: (None, DiskInfo(bridge_model="", interface_type="SATA",
+                                        disk_serial="9876ABC")))
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert body["requires_manual_serial"] is False
+    assert body["manual_serial_reason"] == ""
+    assert body["probe_serial"] == "9876ABC"
+    assert body["bridge_model"] is None
+    assert body["interface_type"] == "SATA"
+
+
+def test_preflight_probe_failure_keeps_defaults(client: TestClient,
+                                                tmp_path: Path,
+                                                monkeypatch) -> None:
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(monkeypatch)
+
+    def boom(p, **kw):
+        raise ProbeError("找不到挂载点")
+
+    monkeypatch.setattr("cold_manifest.probe.probe_path", boom)
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert body["requires_manual_serial"] is False
+    assert body["manual_serial_reason"] == ""
+    assert body["bridge_model"] is None
+    assert body["interface_type"] is None
+    assert body["probe_serial"] == "9876ABC"  # SMART 仍带回
+    # 现有错误路径不变：不新增 500 / 新告警
+    assert body["is_smart_capable"] is True
+    assert body["warnings"] == []
+
+
 # ---------------------------------------------------------------- SSD 契约字段
 
 
