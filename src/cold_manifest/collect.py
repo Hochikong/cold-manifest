@@ -67,48 +67,98 @@ def _is_usb_bridge(disk: DiskInfo) -> bool:
     return "USB" in it
 
 
-def requires_manual_serial(disk: DiskInfo) -> bool:
+def _is_windows() -> bool:
+    """运行平台是否 Windows（可被测试 monkeypatch 以构造 Windows 判定夹具）。"""
+    return sys.platform == "win32" or sys.platform.startswith("win")
+
+
+def _smartctl_verified_serial(disk: DiskInfo) -> str:
+    """取"已验证的 smartctl 真序列号"：仅当 probe 判定 serial_source=smartctl
+    （设备身份已按序列号验证通过）时才返回该值，否则空串。
+
+    provenance 判据说明（Windows probe 现有字段，选最可靠的一种）：
+    - ``serial_source == "smartctl"``：smartctl 读到序列号**且**设备映射已验证，
+      这是唯一可信来源（用户真机证实 smartctl -i -j C: 与 /dev/sdX 一致）；
+    - ``serial_source == "smartctl_unverified"``：smartctl 读到了序列号但**未能
+      确认读到的是目标盘**——可能是另一块盘的序列号，宁严勿松，不放行；
+    - ``serial_source == "probe"``：系统枚举（Get-Disk / WMI）上报值，对 USB 盒
+      常是盒子 ID / 占位号（如 20260123004775F、0123456789ABCDEF），一律不采信。
+    """
+    if (getattr(disk, "serial_source", "") or "").strip() == "smartctl":
+        return (getattr(disk, "disk_serial", "") or "").strip()
+    return ""
+
+
+def requires_manual_serial(disk: DiskInfo, *, windows: "bool | None" = None) -> bool:
     """是否必须手填序列号（唯一判据，collect_volume 与 preflight 共用）：
 
-    只有当既拿不到可用的 ATA 直通真盘序列号（physical_serial）、也拿不到
-    可用的系统枚举序列号（disk_serial）时才强制手填；两者之一可用 → 放行，
-    身份按现有优先级（physical 优先，见 catalog.preferred_disk_serial）。
-    USB 硬盘盒不再单独强制手填；非 USB 盘同样适用本规则（读不到任何
-    序列号 → 也要手填）。
+    **Windows（2026-10 用户硬规则收紧）**：读不到 smartctl **已验证**的真序列号
+    （serial_source=smartctl）时，禁止用 Get-Disk/WMI 的系统枚举值充当磁盘身份
+    ——即使它看起来"可用"（如 16NDT0O1T）也必须手填；手填值（serial_source=
+    manual）放行，``--volume-id`` 不放行。系统枚举值仍可展示（preflight 的
+    probe_serial），但不参与任何判定。
+
+    **非 Windows（Linux/macOS）行为不变**：ATA 直通（physical_serial）或系统
+    枚举（disk_serial）之一可用即放行，仅两者皆不可用才强制手填。
     """
+    if (getattr(disk, "serial_source", "") or "").strip() == "manual":
+        return False  # 手填值始终满足要求（现状不变）
+    if windows is None:
+        windows = _is_windows()
+    if windows:
+        # Windows 新口径：只认已验证的 smartctl 真序列号
+        return not _usable_serial(_smartctl_verified_serial(disk))
+    # Linux/macOS：维持原判据（physical 优先，见 catalog.preferred_disk_serial）
     phys = (getattr(disk, "physical_serial", "") or "").strip()
     sys_serial = (getattr(disk, "disk_serial", "") or "").strip()
     return not (_usable_serial(phys) or _usable_serial(sys_serial))
 
 
 def serial_required_message(disk: DiskInfo, volume_serial_hex: "str | None",
-                            manual_serial: "str | None") -> "str | None":
+                            manual_serial: "str | None",
+                            *, windows: "bool | None" = None) -> "str | None":
     """判定是否必须手填序列号；是则返回人话提示，None=可继续采集。
 
-    规则：requires_manual_serial(disk) 为真（ATA 直通与系统枚举序列号
-    都不可用，且手填值也不可用）→ 返回提示。有 USB 盒信息时补充
-    "该盘经 USB 硬盘盒接入"的上下文说明，但 USB 与否不影响判定。
-    volume_serial_hex 形参保留兼容签名：VOL-{卷序列号hex} 回退命名仍在
-    collect_volume 里保留，但在本判定下实际不可达（两者都不可用一律先被拦）。
+    规则：requires_manual_serial(disk) 为真 → 返回提示（Windows 上新口径为
+    "读不到已验证的 smartctl 真序列号"；非 Windows 为"两个来源都不可用"）。
+    有 USB 盒信息时补充"该盘经 USB 硬盘盒接入"的上下文说明，但 USB 与否
+    不影响判定。volume_serial_hex 形参保留兼容签名：VOL-{卷序列号hex} 回退
+    命名仍在 collect_volume 里保留，但在本判定下实际不可达（都会先被拦）。
     """
     if manual_serial and _usable_serial(manual_serial):
         return None
-    if not requires_manual_serial(disk):
+    if windows is None:
+        windows = _is_windows()
+    if not requires_manual_serial(disk, windows=windows):
         return None
     phys = (getattr(disk, "physical_serial", "") or "").strip()
     probe_serial = (getattr(disk, "disk_serial", "") or "").strip()
-    parts: list[str] = ["该盘读不到可用的序列号"]
+    src = (getattr(disk, "serial_source", "") or "").strip()
+    parts: list[str] = []
+    if windows:
+        # Windows 新口径文案：系统枚举值不被采信为身份
+        parts.append("该盘读不到 smartctl 验证过的真序列号")
+        if src == "smartctl_unverified" and phys:
+            parts.append(f"smartctl 读到序列号 {phys!r} 但设备身份未验证"
+                         "（无法确认读到的是目标盘），不采信")
+        elif probe_serial:
+            parts.append(f"系统枚举（Get-Disk/WMI）上报的 {probe_serial!r} "
+                         "可能是盒子/桥的 ID，不允许充当磁盘身份")
+        else:
+            parts.append("未能读到任何序列号")
+    else:
+        parts.append("该盘读不到可用的序列号")
+        if phys:
+            parts.append(f"ATA 直通读到的序列号 {phys!r} 不可用（空串/全 0/占位）")
+        if probe_serial:
+            parts.append(f"系统枚举（Windows 枚举）上报的序列号 {probe_serial!r} 不可用"
+                         "（空串/全 0/占位，可能是盒子/桥的 ID）")
+        if not phys and not probe_serial:
+            parts.append("未能读到任何序列号")
     if _is_usb_bridge(disk):
         desc = ((getattr(disk, "bridge_model", "") or "").strip()
                 or (getattr(disk, "interface_type", "") or "").strip() or "USB")
         parts.append(f"该盘经 USB 硬盘盒接入（盒子：{desc}）")
-    if phys:
-        parts.append(f"ATA 直通读到的序列号 {phys!r} 不可用（空串/全 0/占位）")
-    if probe_serial:
-        parts.append(f"系统枚举（Windows 枚举）上报的序列号 {probe_serial!r} 不可用"
-                     "（空串/全 0/占位，可能是盒子/桥的 ID）")
-    if not phys and not probe_serial:
-        parts.append("未能读到任何序列号")
     parts.append("请在采集时手填盘体标签上的序列号"
                  "（CLI: `--serial`，Web: \"磁盘序列号\"输入框）")
     parts.append("显式 --volume-id 只固定本次卷命名，"

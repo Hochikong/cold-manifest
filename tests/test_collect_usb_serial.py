@@ -11,6 +11,7 @@ from cold_manifest.collect import (
     ManualSerialRequired,
     collect_volume,
     preflight_serial_required,
+    requires_manual_serial,
     serial_required_message,
 )
 from cold_manifest.probe import DiskInfo, VolumeInfo
@@ -19,17 +20,19 @@ from cold_manifest.server import create_app
 
 def _make_probe(*, interface_type="USB", bridge_model="JMicron Generic SCSI Device",
                 disk_serial="20260123004775F", volume_serial_hex="",
-                physical_serial=""):
+                physical_serial="", serial_source=None):
     vol = VolumeInfo(
         filesystem="ntfs", label="", volume_serial_hex=volume_serial_hex,
         partition_uuid="", partition_index=2, partition_table_type="MBR",
         capacity_bytes=1_000, free_bytes=500,
         mount_point="/mnt/fake", device_path="/dev/sdb1",
     )
+    if serial_source is None:
+        serial_source = "probe" if disk_serial else ""
     disk = DiskInfo(
         physical_model="TOSHIBA HDWG480" if physical_serial else "",
         physical_serial=physical_serial, disk_serial=disk_serial,
-        serial_source="probe" if disk_serial else "",
+        serial_source=serial_source,
         bridge_model=bridge_model, interface_type=interface_type,
         capacity_bytes=1_000, firmware="", smart_status="unavailable",
     )
@@ -41,6 +44,11 @@ def _make_probe(*, interface_type="USB", bridge_model="JMicron Generic SCSI Devi
         return vol, disk
 
     return probe
+
+
+def _win(monkeypatch) -> None:
+    """让判定走 Windows 口径（测试跑在 Linux 上，monkeypatch 平台探测）。"""
+    monkeypatch.setattr("cold_manifest.collect._is_windows", lambda: True)
 
 
 def _make_tree(root: Path) -> None:
@@ -74,6 +82,144 @@ def test_usb_bridge_message_no_serial_at_all():
     assert "JMicron" in msg  # USB 盒上下文仍写入文案
     assert "--serial" in msg
 
+
+# ------------------------------------------------- Windows 口径（用户硬规则）
+
+def test_windows_enum_serial_only_blocks(monkeypatch):
+    """Windows：只有系统枚举值（Get-Disk/WMI，serial_source=probe）→ 拦，
+    即使它看起来"可用"（如 16NDT0O1T）——虚假值不许充当磁盘身份。"""
+    _win(monkeypatch)
+    disk = DiskInfo(physical_serial="", disk_serial="16NDT0O1T",
+                    serial_source="probe",
+                    bridge_model="JMicron Generic SCSI Device",
+                    interface_type="USB")
+    assert requires_manual_serial(disk) is True
+    msg = serial_required_message(disk, "", None)
+    assert msg is not None
+    assert "--serial" in msg
+    assert "16NDT0O1T" in msg          # 枚举值仍展示供对照
+    assert "盒子/桥的 ID" in msg
+    assert "volume-id" in msg          # --volume-id 不放行
+
+
+def test_windows_box_id_only_blocks(monkeypatch):
+    """Windows：真机形态 20260123004775F（盒 ID）→ 拦（Linux 上同夹具放行）。"""
+    _win(monkeypatch)
+    disk = DiskInfo(disk_serial="20260123004775F", serial_source="probe",
+                    bridge_model="JMicron Generic SCSI Device",
+                    interface_type="USB")
+    assert requires_manual_serial(disk) is True
+
+
+def test_windows_smartctl_serial_passes(monkeypatch):
+    """Windows：serial_source=smartctl（已验证真序列号）→ 放行。"""
+    _win(monkeypatch)
+    disk = DiskInfo(physical_model="TOSHIBA HDWG480",
+                    physical_serial="16NDT0O1T", disk_serial="16NDT0O1T",
+                    serial_source="smartctl",
+                    bridge_model="Toshiba USB Bridge", interface_type="USB")
+    assert requires_manual_serial(disk) is False
+    assert serial_required_message(disk, "", None) is None
+
+
+def test_windows_smartctl_unverified_blocks(monkeypatch):
+    """Windows：smartctl 读到序列号但身份未验证（smartctl_unverified）→ 拦，
+    可能读到的是别的盘的序列号，宁严勿松。"""
+    _win(monkeypatch)
+    disk = DiskInfo(physical_serial="SOMEONESERIAL", disk_serial="SOMEONESERIAL",
+                    serial_source="smartctl_unverified", interface_type="USB")
+    assert requires_manual_serial(disk) is True
+
+
+def test_windows_manual_serial_passes(monkeypatch):
+    """Windows：手填值（serial_source=manual）→ 放行。"""
+    _win(monkeypatch)
+    disk = DiskInfo(disk_serial="MYDISK123", serial_source="manual",
+                    interface_type="USB")
+    assert requires_manual_serial(disk) is False
+    assert serial_required_message(disk, "", "MYDISK123") is None
+
+
+def test_windows_volume_id_does_not_bypass(tmp_path, monkeypatch):
+    """Windows：--volume-id 只固定卷命名，不替代序列号身份 → 仍拦。"""
+    _win(monkeypatch)
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _make_probe(disk_serial="16NDT0O1T"))
+    scan_root = tmp_path / "vol"
+    _make_tree(scan_root)
+    with pytest.raises(ManualSerialRequired):
+        collect_volume(scan_root, data_root=tmp_path / "data",
+                       volume_id="MYVOL_P2",
+                       on_disk_copy=False, smartctl=False,
+                       progress_cb=lambda ph, d, t: None)
+
+
+def test_windows_collect_enum_serial_only_raises(tmp_path, monkeypatch):
+    """Windows：collect_volume 对仅系统枚举值抛 ManualSerialRequired（rc=2/API 400 同源）。"""
+    _win(monkeypatch)
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _make_probe(disk_serial="16NDT0O1T"))
+    scan_root = tmp_path / "vol"
+    _make_tree(scan_root)
+    with pytest.raises(ManualSerialRequired) as ei:
+        collect_volume(scan_root, data_root=tmp_path / "data",
+                       on_disk_copy=False, smartctl=False,
+                       progress_cb=lambda ph, d, t: None)
+    assert "16NDT0O1T" in str(ei.value)
+    assert "--serial" in str(ei.value)
+
+
+def test_windows_collect_smartctl_serial_proceeds(tmp_path, monkeypatch):
+    """Windows：smartctl 验证过的真序列号 → 采集放行，volume_id 用真序列号。"""
+    _win(monkeypatch)
+    monkeypatch.setattr(
+        "cold_manifest.collect.probe_path",
+        _make_probe(disk_serial="16NDT0O1T", physical_serial="16NDT0O1T",
+                    serial_source="smartctl"))
+    scan_root = tmp_path / "vol"
+    _make_tree(scan_root)
+    result = collect_volume(scan_root, data_root=tmp_path / "data",
+                            on_disk_copy=False, smartctl=False,
+                            progress_cb=lambda ph, d, t: None)
+    assert result.volume_id == "16NDT0O1T_P2"
+
+
+def test_windows_collect_manual_serial_proceeds(tmp_path, monkeypatch):
+    """Windows：手填序列号 → 采集放行，meta serial_source=manual。"""
+    _win(monkeypatch)
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _make_probe(disk_serial="16NDT0O1T"))
+    scan_root = tmp_path / "vol"
+    _make_tree(scan_root)
+    result = collect_volume(scan_root, data_root=tmp_path / "data",
+                            manual_serial="MYDISK123",
+                            on_disk_copy=False, smartctl=False,
+                            progress_cb=lambda ph, d, t: None)
+    assert result.volume_id == "MYDISK123_P2"
+    conn = sqlite3.connect(str(result.db_path))
+    try:
+        assert conn.execute(
+            "SELECT value FROM meta WHERE key='serial_source'").fetchone()[0] == "manual"
+    finally:
+        conn.close()
+
+
+def test_windows_preflight_matches_collect(monkeypatch):
+    """不变量（Windows 口径）：preflight_serial_required 与 collect 同一谓词——
+    三条夹具对照：仅系统枚举值=拦 / smartctl=放行 / 手填=放行。"""
+    _win(monkeypatch)
+    monkeypatch.setattr("cold_manifest.collect.probe_path",
+                        _make_probe(disk_serial="16NDT0O1T"))
+    msg = preflight_serial_required("/mnt/fake", manual_serial=None, smartctl=False)
+    assert msg is not None          # 仅系统枚举值 → 拦
+    monkeypatch.setattr(
+        "cold_manifest.collect.probe_path",
+        _make_probe(disk_serial="16NDT0O1T", physical_serial="16NDT0O1T",
+                    serial_source="smartctl"))
+    assert preflight_serial_required("/mnt/fake", manual_serial=None,
+                                     smartctl=False) is None  # smartctl → 放行
+    assert preflight_serial_required("/mnt/fake", manual_serial="MYDISK123",
+                                     smartctl=False) is None  # 手填 → 放行
 
 def test_usb_bridge_without_serial_raises(tmp_path, monkeypatch):
     monkeypatch.setattr("cold_manifest.collect.probe_path",
