@@ -3,6 +3,7 @@ import { CheckCircleOutlined, DeleteOutlined, ExclamationCircleOutlined } from '
 import { useDisks, useSetDiskNickname } from '../api/hooks'
 import ErrorAlert from '../components/ErrorAlert'
 import EllipsisText from '../components/EllipsisText'
+import IdentityStatusBadge from '../components/IdentityStatusBadge'
 import NicknameEditor from '../components/NicknameEditor'
 import DiskDetailPanel from '../components/DiskDetailPanel'
 import ResizableTable from '../components/ResizableTable'
@@ -64,6 +65,14 @@ export default function DisksPage() {
       ellipsis: true,
       render: (v: string | null) => (
         <EllipsisText value={truncateMiddle(v ?? '-', 20)} code />
+      ),
+    },
+    {
+      title: '身份',
+      key: 'identity_status',
+      width: 96,
+      render: (_: unknown, record: Disk) => (
+        <IdentityStatusBadge status={record.identity_status} reason={record.identity_status_reason} />
       ),
     },
     {

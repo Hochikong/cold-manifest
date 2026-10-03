@@ -5,6 +5,7 @@ import { CheckCircleOutlined, DeleteOutlined, ExclamationCircleOutlined, Medicin
 import { useDisk, useDiskSmartRead, useSetDiskNickname } from '../api/hooks'
 import { useDeleteRegistry } from '../hooks/useDeleteRegistry'
 import ErrorAlert from './ErrorAlert'
+import IdentityStatusBadge from './IdentityStatusBadge'
 import NicknameEditor from './NicknameEditor'
 import SmartTrendsChart from './SmartTrendsChart'
 import VolumeTrendsChart from './VolumeTrendsChart'
@@ -241,6 +242,17 @@ function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge, ata }: { disk: 
       >
         <Descriptions.Item label="昵称">
           <NicknameEditor value={disk.nickname} onSave={saveNickname} />
+        </Descriptions.Item>
+        {/* 身份状态：徽标 + 原因文字。这里是「要读清楚」的地方，原因完整换行展示（不用省略号）。 */}
+        <Descriptions.Item label="身份">
+          <Space orientation="vertical" size={2} style={{ width: '100%' }}>
+            <IdentityStatusBadge status={disk.identity_status} reason={disk.identity_status_reason} />
+            {disk.identity_status_reason && (
+              <Text type="secondary" style={{ whiteSpace: 'normal', wordBreak: 'break-word', fontSize: 12 }}>
+                {disk.identity_status_reason}
+              </Text>
+            )}
+          </Space>
         </Descriptions.Item>
         <Descriptions.Item label="介质类型">
           {mediaBadge ? <Tag color={mediaBadge.color}>{mediaBadge.label}</Tag> : <Text type="secondary">未识别</Text>}
@@ -612,6 +624,27 @@ function HealthCard({
             <AtaKeyMetrics d={readResult.parsed} />
             <RawOutputBlock text={readResult.raw_excerpt} title="原始输出" />
           </>
+        )}
+
+        {/* 读到别的盘（identity_mismatch）：后端 message 是最关键的人话结论，醒目展示 + 可复制 + 给出固定身份的办法 */}
+        {readResult && !readResult.ok && readResult.reason === 'identity_mismatch' && (
+          <Alert
+            type="error"
+            showIcon
+            title="读取到的不是这块盘！"
+            description={
+              <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+                <Text strong copyable={{ text: readResult.message ?? '', tooltips: ['复制原因说明', '已复制'] }} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                  {readResult.message || '读取到的设备序列号与目标盘期望的序列号不一致。'}
+                </Text>
+                <Text>
+                  当前插着的大概率是另一块同型号盘（或 smartctl 把设备映射到了别的盘）。
+                  采集时可加 <Text code>--serial &lt;序列号&gt;</Text> 固定期望的盘身份，避免读写到同型号的另一块盘；
+                  也可以先拔掉另一块同型号盘，只保留目标盘再重试。
+                </Text>
+              </Space>
+            }
+          />
         )}
 
         {readResult && !readResult.ok && (

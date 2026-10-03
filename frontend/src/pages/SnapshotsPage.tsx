@@ -71,6 +71,7 @@ import DuplicateReport from '../components/DuplicateReport'
 import HashPanel from '../components/HashPanel'
 import SkippedPanel from '../components/SkippedPanel'
 import OnDiskCopyBadge from '../components/OnDiskCopyBadge'
+import IdentityStatusBadge from '../components/IdentityStatusBadge'
 import { VerifyCopyButton, VerifyCopyResultCard } from '../components/VerifyCopyCard'
 import { useRowContextMenu, type RowContextTarget } from '../hooks/useRowContextMenu'
 import { useCursorPaging } from '../hooks/useCursorPaging'
@@ -675,6 +676,13 @@ function SnapshotOverview({ snapshotId, onDelete }: { snapshotId: string; onDele
           <Text>卷 ID：<Text code>{snapshot?.volume_id}</Text></Text>
           {snapshot?.volume_nickname && <Text>卷昵称：{snapshot.volume_nickname}</Text>}
           {snapshot?.disk_nickname && <Text>磁盘昵称：{snapshot.disk_nickname}</Text>}
+          {/* 磁盘身份：unknown 不显示（历史快照大多 unknown，避免噪声）；verified/unverified/conflict 显示 + Tooltip 原因 */}
+          {snapshot?.identity_status && snapshot.identity_status !== 'unknown' && (
+            <div>
+              <Text style={{ marginRight: 8 }}>磁盘身份：</Text>
+              <IdentityStatusBadge status={snapshot.identity_status} reason={snapshot.identity_status_reason} />
+            </div>
+          )}
           <Text>采集时间：{formatDateTime(snapshot?.collected_at)}</Text>
           <Text>哈希策略：{snapshot?.hash_policy}</Text>
           <Text>跳过项：{formatNumber(snapshot?.skipped_count)}</Text>

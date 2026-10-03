@@ -41,6 +41,9 @@ export interface Snapshot {
   physical_model: string
   physical_serial: string | null
   disk_capacity_bytes: number
+  /** 关联磁盘的身份状态（无关联磁盘 → unknown；旧后端可能缺省） */
+  identity_status?: 'verified' | 'unverified' | 'conflict' | 'unknown'
+  identity_status_reason?: string | null
 }
 
 export interface SnapshotsResponse {
@@ -433,6 +436,10 @@ export interface Disk {
   volume_count: number
   snapshot_count: number
   latest_smart: LatestSmart | null
+  /** 磁盘身份状态（序列号核对结论：verified/unverified/conflict/unknown） */
+  identity_status: 'verified' | 'unverified' | 'conflict' | 'unknown'
+  /** 中文一句话原因；无原因时为 null/缺省 */
+  identity_status_reason: string | null
 }
 
 export interface DisksResponse {
