@@ -236,73 +236,101 @@ def probe_path_linux(
     lsblk_model = (disk_node.get("model") or "").strip()
     disk_size = disk_node.get("size")
 
-    physical_model = physical_serial = firmware = ""
-    interface = ""
-    smart_status = "unavailable"
-    smart_serial = ""
-    smart_raw: str | None = None
-    smart_device_type = ""
-    smart_error: str | None = None
-    smart_error_raw: str | None = None
-    if smartctl:
-        disk_dev = disk_node.get("path") or os.path.basename(source_dev)
-        # smart.py：CLDM_SMARTCTL 可配置 + CLDM_SMARTCTL_ARGS 透传 + -d sat 自动重试；
-        # 拿不到 SMART（权限/不支持/超时）→ smart_error 记人话原因：不阻断采集
-        from ..smart import read_smart_verbose
-
-        res = read_smart_verbose(disk_dev)
-        if res["ok"]:
-            smart_raw = res["raw"]
-            smart_device_type = res["device_type"]
-            try:
-                sj = parse_smartctl(smart_raw)
-            except ProbeError:
-                sj = {}
-            physical_model = sj.get("model_name") or sj.get("device_model") or ""
-            smart_serial = (sj.get("serial_number") or "").strip()
-            firmware = sj.get("firmware_version") or ""
-            interface = (sj.get("device") or {}).get("type") or ""
-            passed = (sj.get("smart_status") or {}).get("passed")
-            if passed is True:
-                smart_status = "passed"
-            elif passed is False:
-                smart_status = "failed"
-            else:
-                # 无 smart_status 字段时按 exit_status 位掩码推断健康
-                bits = smart_exit_status or 0
-                if bits & 8:
-                    smart_status = "failed"
-                elif bits & (16 | 32 | 64 | 128):
-                    smart_status = "warning"
-                else:
-                    smart_status = "unavailable"
-        else:
-            smart_error = res["message"]
-            smart_error_raw = res["raw_excerpt"]
-
-    if manual_serial:
-        disk_serial, serial_source = manual_serial.strip(), "manual"
-    elif smart_serial:
-        disk_serial, serial_source = smart_serial, "smartctl"
-    elif lsblk_serial:
-        disk_serial, serial_source = lsblk_serial, "probe"
-    else:
-        disk_serial, serial_source = "", ""
-
     disk_info = DiskInfo(
-        physical_model=physical_model,
-        physical_serial=smart_serial,
-        disk_serial=disk_serial,
-        serial_source=serial_source,
+        physical_model="",
+        physical_serial="",
+        disk_serial=lsblk_serial,
+        serial_source="probe" if lsblk_serial else "",
         # Linux 无 USB 桥伪装问题时 lsblk model 即真盘；字段名沿用统一模型
         bridge_model=lsblk_model,
-        interface_type=interface,
+        interface_type="",
         capacity_bytes=disk_size,
-        firmware=firmware,
-        smart_status=smart_status,
-        smart_raw=smart_raw,
-        smart_device_type=smart_device_type,
-        smart_error=smart_error,
-        smart_error_raw=smart_error_raw,
+        firmware="",
+        smart_status="unavailable",
     )
+
+    # smartctl 可选增强：设备定位走身份解析（PR-B，与 Windows 同口径）——
+    # 按探测到的序列号/容量/型号在 smartctl 扫描表里校验身份，序列号覆盖
+    # 改为有条件：已验证才覆盖；未验证只补全，否则保留 probe 值防错盘
+    if smartctl:
+        try:
+            from ..smart import (parse_smart, read_smart_verbose,
+                                 resolve_smart_device)
+
+            probe_serial = disk_info.disk_serial
+            cands, si = resolve_smart_device(
+                expected_serial=probe_serial or None,
+                expected_capacity_bytes=disk_info.capacity_bytes,
+                expected_model=lsblk_model or None)
+            amb = si.get("identity_ambiguity")
+            mapped_by = si.get("mapped_by")
+            verified = mapped_by in ("serial_match", "env_override") and not amb
+            disk_info.identity_ambiguity = amb
+            disk_info.identity_verified = verified
+            disk_info.identity_risk = str(si.get("identity_risk")
+                                          or (cands[0].get("risk") if cands else "")
+                                          or "")
+            warnings: list[str] = []
+            if amb:
+                warnings.append(f"设备身份歧义：{amb}")
+            res = read_smart_verbose(devices=cands)
+            disk_info.smart_attempts = res.get("attempts") or None
+            rsi = dict(res.get("scan_info") or {})
+            for k in ("mapped_by", "identity_risk", "identity_ambiguity"):
+                if si.get(k) is not None:
+                    rsi[k] = si[k]
+            if warnings:
+                rsi["identity_warnings"] = warnings
+            disk_info.smart_scan_info = rsi
+            if res["ok"]:
+                disk_info.smart_raw = res["raw"]
+                disk_info.smart_device_type = res["device_type"]
+                parsed = parse_smart(res["raw"],
+                                     exit_status=res.get("exit_status"))
+                disk_info.physical_model = parsed.get("model") or ""
+                smart_serial = parsed.get("serial") or ""
+                if verified:
+                    # 身份已验证（序列号精确匹配/环境覆盖且无歧义）：允许覆盖
+                    if smart_serial:
+                        disk_info.physical_serial = smart_serial
+                        if probe_serial and smart_serial.strip().upper() \
+                                != probe_serial.strip().upper():
+                            warnings.append(
+                                f"SMART 序列号 {smart_serial} 与探测值"
+                                f" {probe_serial} 不一致，已按验证结果覆盖")
+                        disk_info.disk_serial = smart_serial
+                        disk_info.serial_source = "smartctl"
+                elif smart_serial:
+                    # 未验证：只允许"补全"，否则保留 probe 值防错盘
+                    disk_info.physical_serial = smart_serial
+                    if not probe_serial:
+                        disk_info.disk_serial = smart_serial
+                        disk_info.serial_source = "smartctl_unverified"
+                        warnings.append(
+                            "探测序列号为空，采用未经验证的 smartctl 序列号"
+                            "（serial_source=smartctl_unverified）")
+                    else:
+                        warnings.append(
+                            "设备身份未验证（smartctl 读到的设备未能按序列号"
+                            f"确认为目标盘，读到序列号 {smart_serial}），"
+                            "为防错盘已保留探测值")
+                disk_info.firmware = disk_info.firmware or (parsed.get("firmware") or "")
+                if disk_info.capacity_bytes is None and parsed.get("capacity_bytes"):
+                    disk_info.capacity_bytes = parsed["capacity_bytes"]
+                disk_info.smart_status = parsed.get("health") or "unavailable"
+                disk_info.smart_exit_status = res.get("exit_status")
+                disk_info.interface_type = (parsed.get("device_type") or "") \
+                    if parsed.get("device_type") else disk_info.interface_type
+            else:
+                # 拿不到不阻断，但留下可诊断原因
+                disk_info.smart_error = res["message"]
+                disk_info.smart_error_raw = res["raw_excerpt"]
+            if warnings:
+                disk_info.identity_warnings = list(warnings)
+        except Exception:  # noqa: BLE001 — SMART 拿不到绝不阻断采集
+            pass
+
+    if manual_serial:
+        disk_info.disk_serial = manual_serial.strip()
+        disk_info.serial_source = "manual"
     return volume, disk_info

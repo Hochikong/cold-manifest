@@ -356,12 +356,15 @@ def _locate_attached_candidates(disk_id: str, path: "str | None"
     现场读取必须走候选链，单设备曾导致 USB 桥盘
     永远打不开（PhysicalDrive 形态在桥上常 Invalid argument）。有 path：
     Windows 优先在 attached 枚举里反查盘号走全链，反查不到退回
-    smart.device_candidates_for_path；Linux 直接 /proc/mounts 定位。
+    smart.device_candidates_for_path；Linux 同样先在 attached 枚举里
+    反查（带序列号/容量走 resolve_smart_device 身份定位），反查不到
+    退回 smart.device_candidates_for_path（/proc/mounts 定位）。
     无 path：按序列号在 attached 里找。定位不到抛 HTTPException 404。
     """
     loc: dict = {}
     attached: "dict | None" = None
-    need_attached = path is None or sys.platform == "win32"
+    need_attached = path is None or sys.platform == "win32" \
+        or sys.platform.startswith("linux")
     if need_attached:
         if sys.platform.startswith("linux"):
             try:
