@@ -1000,6 +1000,8 @@ export interface AttachedDisk {
   model: string
   serial: string
   size_bytes: number | null
+  /** fix-96：枚举序列号是否已与盘体核对；缺失（undefined）= 后端未提供该字段 */
+  serial_verified?: boolean
   volumes: AttachedVolume[]
 }
 

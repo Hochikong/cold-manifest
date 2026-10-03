@@ -37,7 +37,6 @@ import { formatFileSize, formatNumber } from '../utils/format'
 const { Text } = Typography
 const { TextArea } = Input
 
-const LAST_COLLECT_PATH_KEY = 'cldm-collect-last-path'
 const DEFAULT_PATH = ''
 
 type Mode = 'form' | 'progress' | 'done'
@@ -60,8 +59,13 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [cancelRequested, setCancelRequested] = useState(false)
 
-  const [path, setPath] = useState(() => localStorage.getItem(LAST_COLLECT_PATH_KEY) || DEFAULT_PATH)
+  // 不再记住上次路径：真机实测里对话框仍指向上次那块盘，会出现"以为在采 A、实际采了 B"
+  // （第九轮）；路径永远从默认值开始，由用户显式选择或输入。
+  const [path, setPath] = useState(DEFAULT_PATH)
   const [serial, setSerial] = useState('')
+  // “本机盘快选”枚举到的序列号：**只作提示、不自动填入**（枚举可能与实际盘不符，
+  // 自动填入会以最高优先级决定盘/卷身份，风险太大——见第八轮实测）
+  const [pickedSerialHint, setPickedSerialHint] = useState('')
   const [volumeId, setVolumeId] = useState('')
   const [nickname, setNickname] = useState('')
   const [excludeGlobsText, setExcludeGlobsText] = useState('')
@@ -172,7 +176,6 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
     const trimmedPath = path.trim()
     if (!trimmedPath) return
     setSubmitError(null)
-    localStorage.setItem(LAST_COLLECT_PATH_KEY, trimmedPath)
 
     try {
       const res = await createCollectMutation.mutateAsync({
@@ -253,7 +256,7 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
             <AttachedDiskQuickPick
               onPick={(pickedPath, pickedSerial) => {
                 setPath(pickedPath)
-                if (pickedSerial && !serial.trim()) setSerial(pickedSerial)
+                setPickedSerialHint(pickedSerial || '')
               }}
             />
 
@@ -271,7 +274,11 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
 
             <Form.Item
               label="磁盘序列号"
-              extra="USB 桥盘探测不到序列号时必须填写；普通 SATA 盘可留空"
+              extra={
+                pickedSerialHint
+                  ? `枚举到该盘序列号为 ${pickedSerialHint}（仅供参考，未自动填入——请与盘体标签核对后再决定是否手填）`
+                  : 'USB 桥盘探测不到序列号时必须填写；普通 SATA 盘可留空'
+              }
             >
               <Input
                 placeholder="例如 DEMO01"
@@ -803,9 +810,12 @@ function isTerminal(status: Task['status']): boolean {
 
 /**
  * 本机盘/卷快选（GET /api/disks/attached）：
- * - 枚举成功且有已挂载卷 → 下拉选择，选中自动填采集路径（并回填序列号）；
+ * - 枚举成功且有已挂载卷 → 下拉选择，选中自动填采集路径（序列号仅作提示、不自动填入）；
  * - 枚举成功但无挂载卷 → 列出磁盘（禁用项）并提示手输路径；
  * - 枚举失败（available=false）→ 保持手输，展示原因。
+ *
+ * 视觉层次：每块盘一个组头（粗体型号 + 容量 Tag 右对齐 + \\.\PhysicalDriveN 小字），
+ * 卷行以加粗盘符开头，组间靠分组结构自然分隔——不靠缩进区分盘与卷。
  */
 function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: string) => void }) {
   const { data, isLoading } = useAttachedDisks(true)
@@ -832,18 +842,72 @@ function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: str
     )
   }
 
+  /** 序列号身份提示：serial_verified=false → 占位号；无 serial → 无序列号；其余仅在后端明确核对过时显示 */
+  const serialHint = (disk: AttachedDisk): string | null => {
+    if (disk.serial_verified === false) return '盒子占位序列号'
+    if (!disk.serial) return '无序列号'
+    if (disk.serial_verified === true) return '序列号已核对'
+    return null
+  }
+
+  // 搜索文本拼进每个卷选项：盘符、卷标、文件系统、型号、容量、设备名都能命中
+  const diskSearchText = (disk: AttachedDisk): string =>
+    [
+      disk.device,
+      disk.model,
+      disk.serial,
+      disk.size_bytes != null ? formatFileSize(disk.size_bytes) : '',
+      ...disk.volumes.flatMap((v) => [v.path, v.label, v.filesystem]),
+    ]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase()
+
   // 盘 → 已挂载卷的级联选项；整盘无挂载点的以禁用项呈现
-  const options = data.items.map((disk: AttachedDisk) => ({
-    label: `${disk.device} · ${disk.model || '未知型号'} · ${formatFileSize(disk.size_bytes)}`,
-    title: disk.serial || undefined,
-    options:
-      disk.volumes.length > 0
-        ? disk.volumes.map((v) => ({
-            value: `${disk.device}\u0000${v.path}`,
-            label: `${v.path}（${v.filesystem || '未知文件系统'}${v.label ? ` · ${v.label}` : ''}）`,
-          }))
-        : [{ value: `${disk.device}\u0000__none__`, label: '（无已挂载分区）', disabled: true }],
-  }))
+  const options = data.items.map((disk: AttachedDisk) => {
+    const hint = serialHint(disk)
+    return {
+      // 组头：不可选，仅作分组展示
+      label: (
+        <div style={{ padding: '4px 0 2px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+            <Text strong ellipsis style={{ flex: 1, minWidth: 0 }}>
+              {disk.model || '未知型号'}
+            </Text>
+            {hint && (
+              <Text type="secondary" style={{ fontSize: 12, flexShrink: 0 }}>
+                {hint}
+              </Text>
+            )}
+            {disk.size_bytes != null && (
+              <Tag style={{ marginInlineEnd: 0, flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
+                {formatFileSize(disk.size_bytes)}
+              </Tag>
+            )}
+          </div>
+          <Text type="secondary" style={{ fontSize: 12 }} ellipsis>
+            {disk.device}
+            {disk.serial ? ` · ${disk.serial}` : ''}
+          </Text>
+        </div>
+      ),
+      title: disk.serial || undefined,
+      options:
+        disk.volumes.length > 0
+          ? disk.volumes.map((v) => ({
+              value: `${disk.device}\u0000${v.path}`,
+              search: diskSearchText(disk),
+              label: (
+                <span style={{ display: 'inline-flex', alignItems: 'baseline', gap: 8, minWidth: 0 }}>
+                  <Text strong>{v.path}</Text>
+                  {v.label && <Tag color="blue" style={{ marginInlineEnd: 0 }}>{v.label}</Tag>}
+                  <Text type="secondary" style={{ fontSize: 12 }}>{v.filesystem || '未知文件系统'}</Text>
+                </span>
+              ),
+            }))
+          : [{ value: `${disk.device}\u0000__none__`, search: diskSearchText(disk), label: '（无已挂载分区）', disabled: true }],
+    }
+  })
   const mountedCount = data.items.reduce((n, d) => n + d.volumes.length, 0)
 
   return (
@@ -860,7 +924,10 @@ function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: str
         style={{ width: '100%' }}
         allowClear
         showSearch
-        optionFilterProp="label"
+        optionFilterProp="search"
+        filterOption={(input, option) =>
+          ((option as { search?: string } | undefined)?.search ?? '').includes(input.toLowerCase())
+        }
         options={options}
         value={undefined}
         onChange={(value: unknown) => {
