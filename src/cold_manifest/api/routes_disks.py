@@ -666,9 +666,102 @@ def _disk_index_of(item: dict) -> "int | None":
     return int(m.group(1)) if m else None
 
 
-def _locate_attached_candidates(disk_id: str, path: "str | None"
+def _verify_target(attached: dict, expected_serial: str,
+                   path: "str | None") -> "tuple[str, dict | None, str]":
+    """读取前核验目标盘：返回 (status, 命中项, 当前序列号)。
+
+    status ∈ ok / not_attached / identity_mismatch / serial_unverified。
+    在本机全量枚举结果（复用 /api/disks/attached 同一链路，Windows 侧含
+    smartctl ATA 真序列号增强）里找目标盘：
+
+    - 有 path：按卷路径定位（挂载点唯一，不依赖序列号）；
+    - 无 path：按期望序列号（catalog physical_serial，缺省 disk_id）定位；
+    - 定位不到 → not_attached（盘不在线）；
+    - 定位到但真序列号不可得（serial_verified 显式 False，或序列号为空）
+      → serial_unverified（宁可不读，也不冒险把别的盘当目标盘）；
+    - 有 path 时定位到的盘真序列号与期望不一致 → identity_mismatch
+      （同盒换盘 / 插成同型号另一块）。无 path 时按序列号定位命中即一致。
+
+    注：serial_verified 缺省（Linux lsblk 枚举）视为已取得真序列号——
+    lsblk SERIAL 是盘体硬件序列号；Windows 枚举恒带该键。
+    """
+    items = attached.get("items") or []
+    want = str(path or "").rstrip("\\/").lower()
+    item = None
+    if want:
+        item = next(
+            (i for i in items if any(
+                str(v.get("path") or "").rstrip("\\/").lower() == want
+                for v in i.get("volumes") or [])),
+            None,
+        )
+    else:
+        exp = expected_serial.strip().upper()
+        item = next(
+            (i for i in items
+             if str(i.get("serial") or "").strip().upper() == exp),
+            None)
+    if item is None:
+        return "not_attached", None, ""
+    cur = str(item.get("serial") or "").strip()
+    if not cur or item.get("serial_verified") is False:
+        return "serial_unverified", item, cur
+    if want and cur.strip().upper() != expected_serial.strip().upper():
+        return "identity_mismatch", item, cur
+    return "ok", item, cur
+
+
+_VERIFY_MESSAGES = {
+    "not_attached":
+        "目标盘当前不在线（本机未枚举到序列号为 {expected} 的磁盘），"
+        "未读取 SMART。请插上该盘后重试。",
+    "identity_mismatch":
+        "读取被拒绝：当前定位到的盘序列号为 {current}，与记录的期望序列号 "
+        "{expected} 不一致（可能同盒换了盘，或插成了同型号的另一块盘），"
+        "未读取 SMART。请核对磁盘后重试。",
+    "serial_unverified":
+        "目标盘在线但无法取得可信的真序列号（当前枚举值：{current}），"
+        "为避免读错盘未读取 SMART。请手动核对盘序列号后重试。",
+    "enumeration_failed":
+        "本机磁盘枚举失败，无法核验目标盘是否在线，未读取 SMART。"
+        "请检查系统磁盘枚举后重试。",
+}
+
+
+def _verify_denied(disk_id: str, reason: str, expected_serial: str,
+                   current_serial: str, extra: str = "") -> dict:
+    """核验拒绝的统一响应体（200 + ok=false + 人话原因 + 期望/当前序列号）。"""
+    msg = _VERIFY_MESSAGES[reason].format(
+        expected=expected_serial or "（空）",
+        current=current_serial or "（空）") + extra
+    return {
+        "disk_id": disk_id,
+        "device": None,
+        "device_candidates": None,
+        "scan_info": None,
+        "ok": False,
+        "device_type": "",
+        "reason": reason,
+        "message": msg,
+        "raw_excerpt": "",
+        "attempts": [],
+        "exit_status": None,
+        "parsed": None,
+        "ssd": None,
+        "expected_serial": expected_serial or None,
+        "current_serial": current_serial or None,
+    }
+
+
+def _locate_attached_candidates(disk_id: str, path: "str | None",
+                                attached: "dict | None" = None,
+                                serial_hint: "str | None" = None
                                 ) -> "tuple[Any, list[dict], dict]":
     """定位当前插着的盘的**候选链**：返回 (attached 容量或 None, 候选列表, 定位信息)。
+
+    attached：调用方已枚举好的本机盘列表（如 smart/read 读取前的核验步骤），
+    传入则不再重复枚举。serial_hint：期望序列号（catalog physical_serial），
+    无 path 定位时优先于 disk_id 参与匹配。
 
     定位信息 loc = {expected_serial?, scan_info?}：能拿到目标盘序列号时走
     resolve_smart_device 按身份（序列号优先）定位，scan_info 透传给调用方
@@ -683,27 +776,28 @@ def _locate_attached_candidates(disk_id: str, path: "str | None"
     无 path：按序列号在 attached 里找。定位不到抛 HTTPException 404。
     """
     loc: dict = {}
-    attached: "dict | None" = None
-    need_attached = path is None or sys.platform == "win32" \
-        or sys.platform.startswith("linux")
-    if need_attached:
-        if sys.platform.startswith("linux"):
-            try:
-                attached = _attached_linux()
-            except Exception as e:  # noqa: BLE001
-                if path is None:
-                    raise HTTPException(status_code=404,
-                                        detail=f"本机盘枚举失败：{e}")
-        elif sys.platform == "win32":
-            try:
-                attached = _attached_win()
-            except Exception as e:  # noqa: BLE001
-                if path is None:
-                    raise HTTPException(status_code=404,
-                                        detail=f"本机盘枚举失败：{e}")
-        elif path is None:
-            raise HTTPException(status_code=404,
-                                detail=f"不支持的平台：{sys.platform}")
+    attached = attached if attached is not None else None
+    if attached is None:
+        need_attached = path is None or sys.platform == "win32" \
+            or sys.platform.startswith("linux")
+        if need_attached:
+            if sys.platform.startswith("linux"):
+                try:
+                    attached = _attached_linux()
+                except Exception as e:  # noqa: BLE001
+                    if path is None:
+                        raise HTTPException(status_code=404,
+                                            detail=f"本机盘枚举失败：{e}")
+            elif sys.platform == "win32":
+                try:
+                    attached = _attached_win()
+                except Exception as e:  # noqa: BLE001
+                    if path is None:
+                        raise HTTPException(status_code=404,
+                                            detail=f"本机盘枚举失败：{e}")
+            elif path is None:
+                raise HTTPException(status_code=404,
+                                    detail=f"不支持的平台：{sys.platform}")
 
     if path:
         want = str(path).rstrip("\\/").lower()
@@ -734,7 +828,7 @@ def _locate_attached_candidates(disk_id: str, path: "str | None"
                                 detail=f"无法定位 {path} 所在物理盘")
         return None, cands, loc
 
-    want = (disk_id or "").strip()
+    want = (serial_hint or disk_id or "").strip()
     item = next(
         (i for i in (attached or {}).get("items") or []
          if str(i.get("serial") or "").strip() == want),
@@ -797,11 +891,52 @@ def disk_smart_read(disk_id: str, request: Request,
                     body: "SmartReadBody | None" = None) -> dict:
     """对当前插着的盘现场读一次 SMART（不写库）。
 
-    盘不在（404 之外）的读取失败一律 200 + ok=false + 人话原因，绝不 500。
+    **读取前先核验目标盘**：先枚举本机全部磁盘（复用 /api/disks/attached
+    同一链路，Windows 侧含 smartctl ATA 真序列号增强），确认目标盘已插上
+    且真序列号与记录一致（catalog physical_serial，缺省 disk_id），才执行
+    读取；否则一律不读，返回 200 + ok=false + 人话原因，绝不 500。
+
+    reason 取值（供前端展示）：
+    - None：核验通过并完成读取（读取本身失败时为 smart.read_verbose 的原因）；
+    - not_attached：本机未枚举到该盘（不在线）；
+    - identity_mismatch：定位到的盘真序列号与记录不一致（列出记录/当前）；
+    - serial_unverified：目标盘在线但拿不到可信真序列号（宁可不读）；
+    - enumeration_failed：本机磁盘枚举失败，无法核验；
+    - 其余（permission_denied / device_open / timeout / …）：核验通过后的
+      读取阶段失败，沿用 smart.read_verbose 的原因集。
+
+    响应体额外带 expected_serial / current_serial（期望与核验时的当前序列号），
+    便于前端展示与排障。
     """
-    get_state(request)  # 仅确认服务已挂 data_root
+    state = get_state(request)
+    path = body.path if body else None
+    row = state.catalog.execute(
+        "SELECT physical_serial FROM disks WHERE disk_id=?", (disk_id,)).fetchone()
+    expected_serial = (str(row[0]).strip() if row and row[0] else "") or disk_id
+
+    # ① 枚举本机全部磁盘（与快选同一链路）
+    try:
+        if sys.platform.startswith("linux"):
+            attached = _attached_linux()
+        elif sys.platform == "win32":
+            attached = _attached_win()
+        else:
+            attached = None
+    except Exception as e:  # noqa: BLE001 — 枚举失败绝不静默读取
+        attached = {"available": False, "reason": str(e), "items": []}
+    if not attached or not attached.get("available"):
+        detail = str((attached or {}).get("reason") or "枚举不可用")
+        return _verify_denied(disk_id, "enumeration_failed",
+                              expected_serial, "", extra=f"（{detail}）")
+
+    # ② 核验目标盘在线 + 身份一致
+    status, _item, cur = _verify_target(attached, expected_serial, path)
+    if status != "ok":
+        return _verify_denied(disk_id, status, expected_serial, cur)
+
+    # ③ 核验通过 → 既有读取逻辑（候选链）
     size_bytes, cands, loc = _locate_attached_candidates(
-        disk_id, body.path if body else None)
+        disk_id, path, attached=attached, serial_hint=expected_serial)
     size_bytes, cap_status = _capacity_screen(cands, size_bytes)
     if not cands:
         raise HTTPException(status_code=404, detail="无法定位该盘的物理设备候选")
@@ -850,6 +985,8 @@ def disk_smart_read(disk_id: str, request: Request,
         "exit_status": res.get("exit_status"),
         "parsed": parsed,
         "ssd": _ssd_fields(parsed) if parsed else None,
+        "expected_serial": expected_serial or None,
+        "current_serial": cur or None,
     }
     return out
 

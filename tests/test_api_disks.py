@@ -203,12 +203,94 @@ def test_smart_read_live_failure_readable(client: TestClient, monkeypatch) -> No
     assert body["raw_excerpt"] == "Access is denied"
 
 
-def test_smart_read_live_disk_absent_404(client: TestClient, monkeypatch) -> None:
+def test_smart_read_live_disk_absent_not_attached(client: TestClient,
+                                                  monkeypatch) -> None:
+    """目标盘不在线 → 不读，200 + ok=false + reason=not_attached。"""
     monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
         "available": True, "items": [], "count": 0})
+
+    def no_read(dev=None, *, devices=None, **kw):  # spy：绝不应被调用
+        raise AssertionError("不应读取 SMART")
+
+    monkeypatch.setattr(smart, "read_smart_verbose", no_read)
     r = client.post("/api/disks/NOPE/smart/read")
-    assert r.status_code == 404
-    assert "不在线" in r.json()["detail"]
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["reason"] == "not_attached"
+    assert "请插上该盘后重试" in body["message"]
+    assert body["expected_serial"] == "NOPE"
+    assert body["parsed"] is None
+
+
+def test_smart_read_verify_identity_mismatch(client: TestClient,
+                                             monkeypatch) -> None:
+    """path 定位到的盘真序列号与记录不一致（同型号另一块）→ 拒读并列出两个序列号。"""
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True,
+        "items": [{"device": "/dev/sdb", "model": "M", "serial": "OTHERSERIAL",
+                   "size_bytes": 100,
+                   "volumes": [{"path": "/mnt/x"}]}],
+        "count": 1,
+    })
+
+    def no_read(dev=None, *, devices=None, **kw):
+        raise AssertionError("不应读取 SMART")
+
+    monkeypatch.setattr(smart, "read_smart_verbose", no_read)
+    r = client.post("/api/disks/D1/smart/read", json={"path": "/mnt/x"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["reason"] == "identity_mismatch"
+    assert "D1" in body["message"] and "OTHERSERIAL" in body["message"]
+    assert body["expected_serial"] == "D1"
+    assert body["current_serial"] == "OTHERSERIAL"
+
+
+def test_smart_read_verify_serial_unverified(client: TestClient,
+                                             monkeypatch) -> None:
+    """盘在线但真序列号不可得（serial_verified=False）→ 宁可不读。"""
+    monkeypatch.setattr(routes_disks, "_attached_linux", lambda: {
+        "available": True,
+        "items": [{"device": "/dev/sdb", "model": "M", "serial": "D1",
+                   "serial_verified": False,
+                   "size_bytes": 100, "volumes": []}],
+        "count": 1,
+    })
+
+    def no_read(dev=None, *, devices=None, **kw):
+        raise AssertionError("不应读取 SMART")
+
+    monkeypatch.setattr(smart, "read_smart_verbose", no_read)
+    r = client.post("/api/disks/D1/smart/read")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["reason"] == "serial_unverified"
+    assert "核对" in body["message"]
+    assert body["current_serial"] == "D1"
+
+
+def test_smart_read_verify_enumeration_failed(client: TestClient,
+                                              monkeypatch) -> None:
+    """本机枚举失败 → enumeration_failed + 警告文案，不静默读取。"""
+    def boom():
+        raise RuntimeError("PowerShell 枚举失败")
+
+    monkeypatch.setattr(routes_disks, "_attached_linux", boom)
+
+    def no_read(dev=None, *, devices=None, **kw):
+        raise AssertionError("不应读取 SMART")
+
+    monkeypatch.setattr(smart, "read_smart_verbose", no_read)
+    r = client.post("/api/disks/D1/smart/read")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["reason"] == "enumeration_failed"
+    assert "枚举失败" in body["message"]
+    assert body["expected_serial"] == "D1"
 
 
 def test_smart_read_live_uses_candidate_chain(client: TestClient,
