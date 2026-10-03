@@ -73,8 +73,9 @@ def test_identity_audit_endpoint(client: TestClient) -> None:
     r = client.get("/api/identity-audit")
     assert r.status_code == 200
     body = r.json()
-    assert set(body) >= {"alerts", "affected_disk_ids", "summary", "warnings"}
-    assert set(body["summary"]) == {"high", "medium"}
+    assert set(body["summary"]) == {"high", "medium", "low"}
+    assert set(body) >= {"alerts", "affected_disk_ids", "summary", "warnings",
+                         "notes"}
     assert isinstance(body["alerts"], list)
 
 

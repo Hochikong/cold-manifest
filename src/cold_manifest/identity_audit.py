@@ -8,11 +8,19 @@
 - ``meta.smart_raw_json``（smartctl 报告里的 serial_number）
 - ``meta.smart_scan_info_json``（扫描映射结论：candidates / mapped_from_scan）
 
-三类告警：
-- intra_snapshot_serial_drift（high）：同一快照内不同来源的序列号不一致；
+告警分级：
+- intra_snapshot_serial_drift（high）：同一快照内 smart 侧证据自相矛盾
+  （physical_serial vs smart_raw 不一致；或 serial_source=smartctl 时
+  disk_serial 与 smart_raw 不一致；或 disk_serial 与 physical_serial 不一致
+  且无法用"USB 桥上报值 vs 真盘序列号"解释）；
 - inter_snapshot_serial_volatility（high）：同一 volume_id 的多次快照之间
-  可用序列号发生变化；
-- high_fallback_ratio（medium）：某盘过半快照走了未验证回退。
+  **同一字段**的真盘序列号证据发生变化（逐字段比较，不混字段）；
+- high_fallback_ratio（medium）：某盘过半快照走了未验证回退；
+- fallback_minority（low）：有快照走未验证回退但未过半（信息性提示）。
+
+USB 桥正常形态不告警：disk_serial 是桥/外壳上报的 ID，而
+physical_serial == smart_raw.serial_number（smartctl 读到的真盘序列号）
+自洽——这只说明 disk_serial 来自桥而非盘体，写入 notes 不计告警。
 
 容错：快照库缺失/损坏/未封库、meta 缺键、JSON 坏一律计入 warnings，不抛异常。
 """
@@ -183,7 +191,8 @@ def audit_identities(data_root: "str | Path") -> dict:
     """对数据根下全部快照做身份体检（只读）。返回：
 
     ``{"alerts": [...], "affected_disk_ids": [...],
-       "summary": {"high": n, "medium": n}, "warnings": [...]}``
+       "summary": {"high": n, "medium": n, "low": n},
+       "warnings": [...], "notes": [...]}``
     """
     data_root = Path(data_root)
     cat_path = data_root / "catalog.db"
@@ -196,13 +205,14 @@ def audit_identities(data_root: "str | Path") -> dict:
 
     alerts: "list[dict]" = []
     warnings: "list[dict]" = []
+    notes: "list[dict]" = []
     try:
         disks = [r["disk_id"] for r in catalog.execute(
             "SELECT disk_id FROM disks ORDER BY disk_id")]
         for disk_id in disks:
             snaps = _iter_snapshot_meta(catalog, data_root, disk_id,
                                         warnings)
-            _audit_disk(disk_id, snaps, alerts)
+            _audit_disk(disk_id, snaps, alerts, notes)
     finally:
         catalog.close()
 
@@ -210,89 +220,146 @@ def audit_identities(data_root: "str | Path") -> dict:
     summary = {
         "high": sum(1 for a in alerts if a.get("severity") == "high"),
         "medium": sum(1 for a in alerts if a.get("severity") == "medium"),
+        "low": sum(1 for a in alerts if a.get("severity") == "low"),
     }
     return {"alerts": alerts, "affected_disk_ids": affected,
-            "summary": summary, "warnings": warnings}
+            "summary": summary, "warnings": warnings, "notes": notes}
+
+
+def _snapshot_serials(meta: dict) -> "dict[str, str]":
+    """提取单快照逐字段序列号证据：disk_serial / physical_serial / smart_raw。"""
+    raw_serial = _raw_serial_from_smart(meta.get("smart_raw_json") or "")
+    return {k: v for k, v in (
+        ("disk_serial", _norm_serial(meta.get("disk_serial"))),
+        ("physical_serial", _norm_serial(meta.get("physical_serial"))),
+        ("smart_raw", raw_serial),
+    ) if v}
+
+
+def _intra_drift_alert(disk_id: str, sid: str, vid: str, meta: dict,
+                       serials: "dict[str, str]") -> "dict | None":
+    """同快照内序列号证据自相矛盾 → high；USB 桥正常形态 → None。"""
+    disk = serials.get("disk_serial", "")
+    phys = serials.get("physical_serial", "")
+    raw = serials.get("smart_raw", "")
+    source = (meta.get("serial_source") or "").strip()
+    reasons: "list[str]" = []
+    if phys and raw and phys != raw:
+        reasons.append(f"physical_serial({phys}) 与 smart_raw({raw}) 不一致")
+    if source == "smartctl" and disk and raw and disk != raw:
+        reasons.append(f"serial_source=smartctl 但 disk_serial({disk}) "
+                       f"与 smart_raw({raw}) 不一致")
+    if (source == "smartctl" and disk and raw and disk != raw
+            and not (phys and phys == raw)):
+        reasons.append(f"serial_source=smartctl 但 disk_serial({disk}) "
+                       f"与 smart_raw({raw}) 不一致")
+    if disk and raw and disk != raw and not phys:
+        # 无 physical_serial 佐证"桥上报值"解释 → disk_serial 与 smartctl
+        # 读到的序列号矛盾无法排除串盘
+        reasons.append(f"disk_serial({disk}) 与 smart_raw({raw}) 不一致，"
+                       "且无 physical_serial 佐证桥上报值解释")
+    if disk and phys and disk != phys and not (phys and raw and phys == raw):
+        reasons.append(f"disk_serial({disk}) 与 physical_serial({phys}) 不一致"
+                       "，且无法用 USB 桥形态解释")
+    if not reasons:
+        return None
+    return {
+        "type": "intra_snapshot_serial_drift",
+        "severity": "high",
+        "disk_id": disk_id,
+        "snapshot_id": sid,
+        "volume_id": vid,
+        "serials": serials,
+        "reasons": reasons,
+        "suggestion": (
+            f"快照 {sid} 内序列号证据自相矛盾（{'；'.join(reasons)}）；"
+            "该盘可能是同型号双盘串盘，建议重新插拔并核对盘贴序列号后重采该快照"),
+    }
 
 
 def _audit_disk(disk_id: str,
                 snaps: "list[tuple[str, str, dict | None]]",
-                alerts: "list[dict]") -> None:
-    # ① intra_snapshot_serial_drift：同快照内多来源序列号互相矛盾
+                alerts: "list[dict]",
+                notes: "list[dict]") -> None:
+    # ① intra_snapshot_serial_drift：同快照内 smart 侧证据自相矛盾
+    intra_sids: "set[str]" = set()
     for sid, vid, meta in snaps:
         if not meta:
             continue
-        serials: "dict[str, str]" = {}
-        for source, key in (("meta.disk_serial", "disk_serial"),
-                            ("meta.physical_serial", "physical_serial")):
-            if _norm_serial(meta.get(key)):
-                serials[source] = _norm_serial(meta[key])
-        raw_serial = _raw_serial_from_smart(meta.get("smart_raw_json") or "")
-        if raw_serial:
-            serials["smart_raw.serial_number"] = raw_serial
-        distinct = sorted(set(serials.values()))
-        if len(distinct) > 1:
-            alerts.append({
-                "type": "intra_snapshot_serial_drift",
-                "severity": "high",
-                "disk_id": disk_id,
-                "snapshot_id": sid,
-                "volume_id": vid,
-                "serials": serials,
-                "suggestion": (
-                    f"快照 {sid} 内不同来源的序列号互相矛盾（{distinct[0]} vs {distinct[1]}）；"
-                    "该盘可能是同型号双盘串盘，建议重新插拔并核对盘贴序列号后重采该快照"),
+        serials = _snapshot_serials(meta)
+        # USB 桥正常形态：disk_serial 是桥上报值，physical_serial 与
+        # smart_raw 一致（真盘序列号读取自洽）→ 信息性 notes，不告警
+        if ("disk_serial" in serials and "physical_serial" in serials
+                and serials["physical_serial"] == serials.get("smart_raw")
+                and len(set(serials.values())) > 1):
+            notes.append({
+                "snapshot_id": sid, "volume_id": vid, "disk_id": disk_id,
+                "issue": "usb_bridge_serial_form",
+                "detail": (
+                    f"disk_serial({serials['disk_serial']}) 为 USB 桥/外壳上报 ID，"
+                    f"真盘序列号 {serials['physical_serial']} 读取自洽，属正常形态"),
             })
+            continue
+        alert = _intra_drift_alert(disk_id, sid, vid, meta, serials)
+        if alert:
+            alerts.append(alert)
+            intra_sids.add(sid)
 
-    # ② inter_snapshot_serial_volatility：同一卷的多次快照之间序列号变了
+    # ② inter_snapshot_serial_volatility：同一卷的快照之间**同一字段**变化
     by_volume: "dict[str, list[tuple[str, dict]]]" = {}
     for sid, vid, meta in snaps:
         if not meta:
             continue
-        serials = set()
-        for key in ("disk_serial", "physical_serial"):
-            if _norm_serial(meta.get(key)):
-                serials.add(_norm_serial(meta[key]))
-        raw_serial = _raw_serial_from_smart(meta.get("smart_raw_json") or "")
-        if raw_serial:
-            serials.add(raw_serial)
+        serials = _snapshot_serials(meta)
         if serials:
-            by_volume.setdefault(vid, []).append(
-                (sid, {k: v for k, v in (("disk_serial", _norm_serial(meta.get("disk_serial"))),
-                                         ("physical_serial", _norm_serial(meta.get("physical_serial"))),
-                                         ("smart_raw", raw_serial)) if v}))
+            by_volume.setdefault(vid, []).append((sid, serials))
     for vid, items in sorted(by_volume.items()):
-        all_serials = sorted({s for _, m in items
-                              for s in set(str(v).upper() for v in m.values())})
-        if len(all_serials) > 1:
+        # 逐字段比较：同一字段在不同快照间取值不同才告警（≥2 个可比较快照）
+        for field in ("disk_serial", "physical_serial", "smart_raw"):
+            values: "dict[str, list[str]]" = {}
+            for sid, serials in items:
+                v = serials.get(field)
+                if v:
+                    values.setdefault(v, []).append(sid)
+            if len(values) < 2:
+                continue
+            involved = sorted({s for sids in values.values() for s in sids})
+            # 去重：差异完全来自已有 intra 告警的快照 → 只报更具体的 intra
+            if involved and all(s in intra_sids for s in involved):
+                continue
             alerts.append({
                 "type": "inter_snapshot_serial_volatility",
                 "severity": "high",
                 "disk_id": disk_id,
                 "volume_id": vid,
-                "snapshot_ids": [sid for sid, _ in items],
-                "serials": {sid: m for sid, m in items},
+                "field": field,
+                "snapshot_ids": involved,
+                "serials": {field: {v: sids for v, sids in values.items()}},
                 "suggestion": (
-                    f"同一卷 {vid} 的多次快照出现了不同序列号（{'/'.join(all_serials)}）；"
+                    f"同一卷 {vid} 的多次快照在 {field} 上出现了不同取值"
+                    f"（{'/'.join(sorted(values))}）；"
                     "大概率是不同物理盘先后挂成了同一 volume_id，"
                     "建议按盘贴序列号拆分 volume_id 并重采"),
             })
 
-    # ③ high_fallback_ratio：过半快照走了未验证回退
+    # ③ high_fallback_ratio / fallback_minority：走未验证回退的快照占比
     considered = [(sid, meta) for sid, _v, meta in snaps if meta]
-    if considered:
-        fallback = [(sid, meta) for sid, meta in considered
-                    if _snapshot_fallback_flags(meta)]
-        if len(fallback) * 2 > len(considered):
-            alerts.append({
-                "type": "high_fallback_ratio",
-                "severity": "medium",
-                "disk_id": disk_id,
-                "snapshot_count": len(considered),
-                "fallback_count": len(fallback),
-                "snapshot_ids": [sid for sid, _ in fallback],
-                "suggestion": (
-                    f"盘 {disk_id} 的 {len(fallback)}/{len(considered)} 个快照走了"
-                    "未验证回退（fallback-sd 候选 / 扫描映射未命中 / 卷序列号兜底）；"
-                    "设备定位可能错位，建议插单盘重采或开启身份校验后复核"),
-            })
+    fallback = [(sid, meta) for sid, meta in considered
+                if _snapshot_fallback_flags(meta)]
+    if fallback:
+        over_half = len(fallback) * 2 > len(considered)
+        alerts.append({
+            "type": "high_fallback_ratio" if over_half else "fallback_minority",
+            "severity": "medium" if over_half else "low",
+            "disk_id": disk_id,
+            "snapshot_count": len(considered),
+            "fallback_count": len(fallback),
+            "snapshot_ids": [sid for sid, _ in fallback],
+            "suggestion": (
+                f"盘 {disk_id} 的 {len(fallback)}/{len(considered)} 个快照走了"
+                "未验证回退（fallback-sd 候选 / 扫描映射未命中 / 卷序列号兜底）；"
+                + ("设备定位可能错位，建议插单盘重采或开启身份校验后复核"
+                   if over_half else
+                   "占比未过半，属信息性提示：设备定位可能未经扫描映射核实，"
+                   "建议下次采集开启身份校验")),
+        })
