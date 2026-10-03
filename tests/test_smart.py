@@ -1402,3 +1402,135 @@ def test_snapshot_report_ata_metrics(tmp_path: Path) -> None:
     assert "Raw_Read_Error_Rate" in html
     assert "其余 10 项见页面" in html
     conn.close()
+
+
+# ---- 中文名（name_zh / when_failed_zh）与 HTML 报告中文渲染 ----
+
+
+def test_ata_attr_names_covers_required_ids() -> None:
+    for i in (1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 22, 177, 183, 184,
+              187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198,
+              199, 200, 202, 206, 231, 233, 240, 241, 242):
+        assert smart.ATA_ATTR_NAMES.get(i), f"缺属性 {i} 的中文名"
+    assert smart.ATA_ATTR_NAMES[5] == "重分配扇区计数"
+    assert smart.ATA_ATTR_NAMES[9] == "通电小时数"
+    assert smart.ATA_ATTR_NAMES[12] == "通电次数"
+    assert smart.ATA_ATTR_NAMES[190] == "气流温度"
+    assert smart.ATA_ATTR_NAMES[194] == "温度"
+    assert smart.ATA_ATTR_NAMES[197] == "当前待映射扇区数"
+    assert smart.ATA_ATTR_NAMES[198] == "离线不可修正扇区数"
+    assert smart.ATA_ATTR_NAMES[199] == "UDMA CRC 错误"
+    assert smart.ATA_ATTR_NAMES[240] == "磁头飞行小时"
+    assert smart.ATA_ATTR_NAMES[241] == "累计写入量"
+    assert smart.ATA_ATTR_NAMES[242] == "累计读取量"
+
+
+def test_ata_attributes_name_zh() -> None:
+    p = smart.parse_smart(ATA_FULL)
+    by_id = {a["id"]: a for a in p["ata_attributes"]}
+    assert by_id[5]["name_zh"] == smart.ATA_ATTR_NAMES[5]
+    assert by_id[5]["name"] == "Reallocated_Sector_Ct"  # 原英文不丢
+    assert by_id[194]["name_zh"] == "温度"
+    assert by_id[199]["name_zh"] == "UDMA CRC 错误"
+    assert by_id[240]["name_zh"] == "磁头飞行小时"
+
+
+def test_ata_attributes_unknown_id_name_zh_empty() -> None:
+    raw = json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 99, "name": "Free_Fall_Sensor", "value": 100,
+         "worst": 100, "thresh": 0, "raw": {"value": 0, "string": "0"},
+         "when_failed": ""},
+    ]}})
+    attrs = smart.parse_smart(raw)["ata_attributes"]
+    assert attrs[0]["id"] == 99
+    assert attrs[0]["name"] == "Free_Fall_Sensor"
+    assert attrs[0]["name_zh"] == ""
+
+
+def test_when_failed_zh_mapping() -> None:
+    raw = json.dumps({"ata_smart_attributes": {"table": [
+        {"id": 5, "name": "Reallocated_Sector_Ct", "value": 100,
+         "worst": 100, "thresh": 50, "raw": {"value": 0, "string": "0"},
+         "when_failed": "FAILING_NOW"},
+        {"id": 197, "name": "Current_Pending_Sector", "value": 100,
+         "worst": 100, "thresh": 0, "raw": {"value": 0, "string": "0"},
+         "when_failed": "In_the_past"},
+        {"id": 199, "name": "UDMA_CRC_Error_Count", "value": 200,
+         "worst": 200, "thresh": 0, "raw": {"value": 0, "string": "0"},
+         "when_failed": ""},
+        {"id": 250, "name": "Odd", "value": 100, "worst": 100,
+         "thresh": 0, "raw": {"value": 0, "string": "0"},
+         "when_failed": "Weird_Value"},
+    ]}})
+    by_id = {a["id"]: a for a in smart.parse_smart(raw)["ata_attributes"]}
+    assert by_id[5]["when_failed"] == "FAILING_NOW"
+    assert by_id[5]["when_failed_zh"] == "现在失败"
+    assert by_id[197]["when_failed_zh"] == "曾经失败"
+    assert by_id[199]["when_failed_zh"] == ""
+    # 大小写不敏感
+    assert smart._when_failed_zh("in_the_past") == "曾经失败"
+    # 未知枚举原样返回；缺失 → None
+    assert by_id[250]["when_failed_zh"] == "Weird_Value"
+    assert smart._when_failed_zh(None) is None
+
+
+def test_ata_contract_passes_name_zh() -> None:
+    p = smart.parse_smart(ATA_FULL)
+    c = smart.ata_contract(p)
+    by_id = {a["id"]: a for a in c["ata_attributes"]}
+    assert by_id[5]["name_zh"] == smart.ATA_ATTR_NAMES[5]
+    assert by_id[5]["when_failed_zh"] == ""
+    # 历史行（ata_json）→ 契约同样透出新键
+    cat = connect_catalog(":memory:")
+    smart.record_smart(cat, "D1", "v/s", p)
+    r = smart.list_smart(cat, "D1")[0]
+    c2 = smart.ata_contract(r)
+    by_id2 = {a["id"]: a for a in c2["ata_attributes"]}
+    assert by_id2[5]["name_zh"] == smart.ATA_ATTR_NAMES[5]
+    cat.close()
+
+
+def test_report_attr_table_zh_names() -> None:
+    """HTML 报告属性表：名字列 '中文 (English)'，状态列中文优先。"""
+    import io
+
+    from cold_manifest.db import init_snapshot
+    from cold_manifest.report import generate_snapshot_report
+
+    conn = sqlite3.connect(":memory:")
+    init_snapshot(conn)
+    conn.execute("INSERT INTO meta(key, value) VALUES('status','sealed')")
+    conn.commit()
+    p = smart.parse_smart(ATA_FULL)
+    attrs = json.loads(json.dumps(p["ata_attributes"]))
+    attrs[0]["when_failed"] = "FAILING_NOW"
+    attrs[0]["when_failed_zh"] = "现在失败"
+    sm = dict(p)
+    sm["ata_json"] = json.dumps(attrs, ensure_ascii=False)
+    buf = io.StringIO()
+    generate_snapshot_report(conn, buf, snapshot_id="v/s", smart_row=sm)
+    html = buf.getvalue()
+    assert "重分配扇区计数 (Reallocated_Sector_Ct)" in html
+    assert "温度 (Temperature_Celsius)" in html
+    assert "现在失败" in html
+    conn.close()
+
+
+def test_ata_contract_enriches_historical_rows():
+    """历史行补齐：旧版采集的 ata_json 没有 name_zh/when_failed_zh，契约层按 ID
+    现查中文（已有快照不重采也能显示中文），且**不修改**调用方传入的对象。"""
+    from cold_manifest import smart
+
+    old = [{"id": 5, "name": "Reallocated_Sector_Ct", "value": 100, "worst": 100,
+            "thresh": 10, "raw_value": 0, "raw_string": "0", "when_failed": "FAILING_NOW"}]
+    out = smart.ata_contract({"ata_json": json.dumps(old, ensure_ascii=False)})
+    a = out["ata_attributes"][0]
+    assert a["name_zh"] == smart.ATA_ATTR_NAMES[5] == "重分配扇区计数"
+    assert a["when_failed_zh"] == "现在失败"
+    assert "name_zh" not in old[0]  # 原对象未被修改
+
+    unknown_id = next(i for i in range(200, 400) if i not in smart.ATA_ATTR_NAMES)
+    out2 = smart.ata_contract({"ata_json": json.dumps(
+        [{"id": unknown_id, "name": "Vendor_Specific"}], ensure_ascii=False)})
+    assert out2["ata_attributes"][0]["name_zh"] == ""          # 未知 ID 回退英文
+    assert out2["ata_attributes"][0]["name"] == "Vendor_Specific"

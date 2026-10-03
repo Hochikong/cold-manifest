@@ -12,6 +12,7 @@ import VolumeTrendsChart from './VolumeTrendsChart'
 import VolumeDetailDrawer from './VolumeDetailDrawer'
 import { apiErrorDetail, parseSmartIdentity, type AtaAttribute, type AtaExtras, type DiskDetail, type DiskVolume, type DiskSnapshot, type ParsedSmart, type SmartReadResult, type SsdMetrics } from '../api/client'
 import { formatDateTime, formatFileSize, formatNumber, middleEllipsis } from '../utils/format'
+import { deviceTypeLabel, formFactorLabel, interfaceTypeLabel, smartStatusLabel, whenFailedLabel, zonedLabel } from '../utils/smartLabels'
 
 const { Text } = Typography
 
@@ -278,7 +279,7 @@ function IdentityCard({ disk, liveParsed, liveLabel, mediaBadge, ata }: { disk: 
           </Space>
         </Descriptions.Item>
         <Descriptions.Item label="USB 桥 / 控制器">{disk.bridge_model || '-'}</Descriptions.Item>
-        <Descriptions.Item label="接口类型">{disk.interface_type || '-'}</Descriptions.Item>
+        <Descriptions.Item label="接口类型">{interfaceTypeLabel(disk.interface_type)}</Descriptions.Item>
         <Descriptions.Item label="卷 / 快照数">{formatNumber(disk.volumes.length)} / {formatNumber(disk.snapshots.length)}</Descriptions.Item>
         <Descriptions.Item label="首次发现">{formatDateTime(disk.first_seen)}</Descriptions.Item>
         <Descriptions.Item label="最近发现">{formatDateTime(disk.last_seen)}</Descriptions.Item>
@@ -320,7 +321,7 @@ function AtaTechInfo({ ata }: { ata: AtaExtras | null }) {
       </div>
       <Descriptions size="small" column={2} bordered styles={{ label: { width: 120 }, content: { wordBreak: 'break-all' } }}>
         <Descriptions.Item label="转速">{formatRotation(ata.rotation_rate ?? null)}</Descriptions.Item>
-        <Descriptions.Item label="尺寸规格">{ata.form_factor || '—'}</Descriptions.Item>
+        <Descriptions.Item label="尺寸规格">{formFactorLabel(ata.form_factor)}</Descriptions.Item>
         <Descriptions.Item label="接口速率" span={2}>
           {formatIfSpeed(ata.interface_speed_current, ata.interface_speed_max)}
         </Descriptions.Item>
@@ -329,7 +330,7 @@ function AtaTechInfo({ ata }: { ata: AtaExtras | null }) {
         <Descriptions.Item label="TRIM">
           {ata.trim == null ? '—' : ata.trim ? '支持' : '不支持'}
         </Descriptions.Item>
-        <Descriptions.Item label="Zoned">{ata.zoned || '—'}</Descriptions.Item>
+        <Descriptions.Item label="Zoned">{zonedLabel(ata.zoned)}</Descriptions.Item>
         <Descriptions.Item label="型号族" span={2}>{ata.model_family || '—'}</Descriptions.Item>
       </Descriptions>
     </>
@@ -398,7 +399,8 @@ function AtaAttributesCard({ attrs }: { attrs: AtaAttribute[] | null | undefined
   // 异常判定（保守）：曾报告失败，或阈值 >0 且当前值 ≤ 阈值
   const abnormalReason = (a: AtaAttribute): string | null => {
     if (a.when_failed != null && a.when_failed !== '') {
-      return `该属性曾报告失败（when_failed = ${a.when_failed}）`
+      const zh = a.when_failed_zh?.trim() || whenFailedLabel(a.when_failed)
+      return `该属性曾报告失败（${zh}）`
     }
     if (a.thresh > 0 && a.value <= a.thresh) {
       return `当前值 ${a.value} 已 ≤ 阈值 ${a.thresh}`
@@ -415,6 +417,9 @@ function AtaAttributesCard({ attrs }: { attrs: AtaAttribute[] | null | undefined
       ellipsis: true,
       render: (v: string, record: AtaAttribute) => {
         const reason = abnormalReason(record)
+        // 中文名主显（后端 name_zh，可为空）；英文原名小号灰字第二行；都没有问题就回退英文
+        const zh = record.name_zh?.trim() || ''
+        const fullTitle = zh ? `${zh}（${v}）` : v
         return (
           <Space size={4}>
             {reason && (
@@ -422,8 +427,18 @@ function AtaAttributesCard({ attrs }: { attrs: AtaAttribute[] | null | undefined
                 <ExclamationCircleOutlined style={{ color: '#cf1322', fontSize: 12 }} />
               </Tooltip>
             )}
-            <Tooltip title={v} placement="topLeft" mouseEnterDelay={0.3}>
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{v}</span>
+            <Tooltip title={fullTitle} placement="topLeft" mouseEnterDelay={0.3}>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>
+                {zh ? (
+                  <>
+                    {zh}
+                    <br />
+                    <span style={{ fontSize: 11, color: '#8c8c8c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{v}</span>
+                  </>
+                ) : (
+                  v
+                )}
+              </span>
             </Tooltip>
           </Space>
         )
@@ -532,9 +547,12 @@ function HealthCard({
   const smart = disk.latest_smart
 
   const healthTag = (health: string | null | undefined) => {
-    if (health === 'passed') return <Tag color="success" icon={<CheckCircleOutlined />}>PASSED</Tag>
-    if (health === 'failed') return <Tag color="error" icon={<ExclamationCircleOutlined />}>FAILED</Tag>
-    return <Tag color="warning">未采集到</Tag>
+    // passed→正常 / warning→警告 / failed→异常 / 无值或 unavailable→无数据
+    const zh = smartStatusLabel(health)
+    if (health === 'passed') return <Tag color="success" icon={<CheckCircleOutlined />}>{zh}</Tag>
+    if (health === 'failed') return <Tag color="error" icon={<ExclamationCircleOutlined />}>{zh}</Tag>
+    if (health === 'warning') return <Tag color="warning" icon={<ExclamationCircleOutlined />}>{zh}</Tag>
+    return <Tag color="default">{zh}</Tag>
   }
 
   // 健康卡主体只剩状态与设备类型；13 项关键指标统一走 AtaKeyMetrics 瓦片组
@@ -545,7 +563,7 @@ function HealthCard({
     <Descriptions size="small" column={2} bordered>
       <Descriptions.Item label="健康状态">{healthTag(s.health)}</Descriptions.Item>
       {s.device_type != null && (
-        <Descriptions.Item label="设备类型">{s.device_type || '-'}</Descriptions.Item>
+        <Descriptions.Item label="设备类型">{deviceTypeLabel(s.device_type)}</Descriptions.Item>
       )}
     </Descriptions>
   )
@@ -618,7 +636,7 @@ function HealthCard({
               type="success"
               showIcon
               title="已读取（未写入快照 / 历史）"
-              description={`设备 ${readResult.device}${readResult.device_type ? ` · 类型 ${readResult.device_type}` : ''}`}
+              description={`设备 ${readResult.device}${readResult.device_type ? ` · 类型 ${deviceTypeLabel(readResult.device_type)}` : ''}`}
             />
             {fieldsOf(readResult.parsed)}
             <AtaKeyMetrics d={readResult.parsed} />

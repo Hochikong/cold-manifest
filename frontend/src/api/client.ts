@@ -362,6 +362,10 @@ export interface AtaAttribute {
   raw_value: string
   raw_string: string | null
   when_failed: string | null
+  /** 中文名（后端逐步落地；旧后端缺字段 / 无翻译 → undefined 或空串，前端回退 name） */
+  name_zh?: string | null
+  /** when_failed 的中文（可选，兜底用 when_failed 原值映射） */
+  when_failed_zh?: string | null
 }
 
 /**

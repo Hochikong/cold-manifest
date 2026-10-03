@@ -9,6 +9,7 @@ import DiskDetailPanel from '../components/DiskDetailPanel'
 import ResizableTable from '../components/ResizableTable'
 import { useDeleteRegistry } from '../hooks/useDeleteRegistry'
 import { formatFileSize, formatNumber, truncateMiddle } from '../utils/format'
+import { interfaceTypeLabel } from '../utils/smartLabels'
 import { apiErrorDetail, type Disk } from '../api/client'
 
 const { Title } = Typography
@@ -88,7 +89,7 @@ export default function DisksPage() {
       dataIndex: 'interface_type',
       key: 'interface_type',
       width: 90,
-      render: (v: string | null) => v || '-',
+      render: (v: string | null) => interfaceTypeLabel(v),
     },
     { title: '容量', dataIndex: 'capacity_bytes', key: 'capacity_bytes', width: 100, align: 'right' as const, render: (v: number) => formatFileSize(v) },
     {

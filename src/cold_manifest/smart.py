@@ -62,6 +62,101 @@ SSD_CONTRACT_KEYS = (
     "source",                # 'nvme' | 'ata'
 )
 
+# ATA 属性 ID → 中文名（属性表显示用）。未知 ID 回退英文原名。
+# 用词以"一眼看懂"为准；未列出的少见属性显示 smartctl 原始英文名。
+ATA_ATTR_NAMES: dict = {
+    1: "原始读取错误率",
+    2: "吞吐性能",
+    3: "主轴电机起转时间",
+    4: "启停次数",
+    5: "重分配扇区计数",
+    7: "寻道错误率",
+    8: "寻道时间性能",
+    9: "通电小时数",
+    10: "主轴电机重试次数",
+    11: "电机校准重试次数",
+    12: "通电次数",
+    13: "软读取错误率",
+    22: "当前磁头飞行高度",      # 仅部分厂商
+    170: "可用保留块数",         # 常见于 SSD
+    171: "程序失败块数",
+    172: "擦除失败块数",
+    173: "平均擦除次数",
+    174: "意外断电次数",
+    177: "磁头加载周期数",
+    179: "已用备用磁头数",
+    180: "预留磁头数",
+    181: "程序失败块数",
+    182: "擦除失败块数",
+    183: "运行时坏块数",
+    184: "端到端错误",
+    187: "无法修正的 ECC 错误",
+    188: "指令超时次数",
+    189: "磁头飞行高度异常",     # 仅部分厂商
+    190: "气流温度",
+    191: "G 敏感错误率",
+    192: "断电收回磁头次数",
+    193: "磁头加载/卸载周期",
+    194: "温度",
+    195: "硬件 ECC 修正计数",
+    196: "重分配事件计数",
+    197: "当前待映射扇区数",
+    198: "离线不可修正扇区数",
+    199: "UDMA CRC 错误",
+    200: "写入错误率",
+    201: "软读取错误率",
+    202: "内部数据校验错误",
+    203: "运行时坏块跳过次数",
+    204: "软 ECC 修正计数",
+    205: "热抖动错误率",
+    206: "写入错误率（虚拟）",
+    207: "读取错误率（虚拟）",
+    208: "校验错误率（虚拟）",
+    209: "虚拟校验错误率",
+    210: "成功验证的写入扇区数",
+    211: "飞行抖动错误",
+    212: "共振抖动错误",
+    220: "盘片偏移错误",
+    221: "G 敏感偏移错误",
+    222: "磁头加载时间",
+    223: "磁头卸载时间",
+    224: "负载均衡磨损",
+    225: "主机写入次数",
+    226: "累计工作载荷时间",
+    227: "扭矩放大次数",
+    228: "断电收回周期",
+    230: "磁头振幅",
+    231: "剩余寿命（SSD）",
+    232: "预留块剩余数",
+    233: "磨损均衡计数",
+    234: "预留块磨损",
+    235: "上电磨损",
+    240: "磁头飞行小时",
+    241: "累计写入量",
+    242: "累计读取量",
+    243: "累计写入量（低 32 位）",
+    244: "累计读取量（低 32 位）",
+    250: "读取错误重试率",
+    251: "最小磨损",
+    252: "最大磨损",
+    254: "剩余寿命（自由落体）",
+}
+
+# when_failed 英文枚举 → 中文（大小写不敏感匹配；其他值原样返回）
+_WHEN_FAILED_ZH = {
+    "failing_now": "现在失败",
+    "in_the_past": "曾经失败",
+    "": "",
+}
+
+
+def _when_failed_zh(v: "str | None") -> "str | None":
+    if not isinstance(v, str):
+        return None
+    z = _WHEN_FAILED_ZH.get(v.strip().lower())
+    return z if z is not None else v
+
+
 # 关键 HDD 指标 + 身份细节的 API 契约键（冻结；缺项 null/false）
 ATA_CONTRACT_KEYS = (
     # 关键 HDD 指标（ATA 属性 ID 见 _ATA_METRIC_ATTRS）
@@ -318,6 +413,29 @@ def ata_contract(item: "dict | None") -> dict:
             except (json.JSONDecodeError, TypeError, ValueError):
                 attrs = None
     out["ata_attributes"] = attrs if isinstance(attrs, list) else []
+    # 历史行补齐（旧版采集的 ata_json 没有 name_zh/when_failed_zh）：按属性 ID
+    # 现查中文名，让已有快照**不重采**也能显示中文（磁盘页与 HTML 报告均受益）。
+    # 复制字典再改，绝不修改调用方传入的对象。
+    enriched: list = []
+    for a in out["ata_attributes"]:
+        if not isinstance(a, dict):
+            enriched.append(a)
+            continue
+        need_name = not str(a.get("name_zh") or "").strip()
+        need_failed = not str(a.get("when_failed_zh") or "").strip()
+        if not (need_name or need_failed):
+            enriched.append(a)
+            continue
+        row = dict(a)
+        if need_name:
+            try:
+                row["name_zh"] = ATA_ATTR_NAMES.get(int(row.get("id"))) or ""
+            except (TypeError, ValueError):
+                row["name_zh"] = ""
+        if need_failed:
+            row["when_failed_zh"] = _when_failed_zh(row.get("when_failed"))
+        enriched.append(row)
+    out["ata_attributes"] = enriched
     return out
 
 
@@ -342,17 +460,20 @@ def _parse_ata_attributes(sj: dict) -> list:
                 else None
             if raw_value is None:
                 raw_value = _int_or_none(raw.get("value"))
+            wf = e.get("when_failed")
             out.append({
                 "id": _int_or_none(e.get("id")),
                 "name": e.get("name") or None,
+                # 中文名：命中 ATA_ATTR_NAMES 给中文，未命中给 ""（不丢英文原名）
+                "name_zh": ATA_ATTR_NAMES.get(_int_or_none(e.get("id")), ""),
                 "value": _int_or_none(e.get("value")),
                 "worst": _int_or_none(e.get("worst")),
                 "thresh": _int_or_none(e.get("thresh")),
                 "raw_value": raw_value,
                 "raw_string": str(raw_string) if raw_string is not None else None,
                 # smartctl 用 "" 表示"从未失败"，保留原文；仅缺失才置 None
-                "when_failed": e.get("when_failed")
-                if isinstance(e.get("when_failed"), str) else None,
+                "when_failed": wf if isinstance(wf, str) else None,
+                "when_failed_zh": _when_failed_zh(wf),
             })
         return out
     except Exception:  # noqa: BLE001 — 诊断路径绝不抛

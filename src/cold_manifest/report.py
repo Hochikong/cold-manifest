@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import IO, Any
 
 from .db import file_uri
+from . import smart
 
 # 报告合法段落名（API report 端点 sections 参数校验用）
 REPORT_SECTIONS = ("overview", "extensions", "sizes", "depth", "topdirs", "skipped")
@@ -542,10 +543,24 @@ def generate_snapshot_report(conn: sqlite3.Connection,
             def _cell(v: Any) -> str:
                 return "—" if v is None else _esc(v if not isinstance(v, int)
                                                   else f"{v:,}")
-            rows = [[_cell(a.get("id")), _esc(a.get("name") or "—"),
+
+            def _attr_label(a: dict) -> str:
+                en = a.get("name") or ""
+                zh = a.get("name_zh") or smart.ATA_ATTR_NAMES.get(a.get("id"), "")
+                if zh and en and zh != en:
+                    return f"{zh} ({en})"
+                return zh or en or "—"
+
+            def _wf_label(a: dict) -> str:
+                wf = a.get("when_failed")
+                if not wf:
+                    return "—"
+                return smart._when_failed_zh(wf) or wf
+
+            rows = [[_cell(a.get("id")), _esc(_attr_label(a)),
                      _cell(a.get("value")), _cell(a.get("worst")),
                      _cell(a.get("thresh")), _cell(a.get("raw_value")),
-                     _esc(a.get("when_failed") or "—")]
+                     _esc(_wf_label(a))]
                     for a in shown if isinstance(a, dict)]
             h += _table(["ID", "属性", "当前", "最差", "阈值",
                          "原始值", "状态"], rows)
