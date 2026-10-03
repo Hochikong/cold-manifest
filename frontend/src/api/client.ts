@@ -692,11 +692,15 @@ export interface PreflightResponse {
   device_type_hint: string
   is_smart_capable: boolean
   warnings: string[]
-  /** USB 硬盘盒 → true：盒子上报的序列号不能作为磁盘身份，必须手填（后端缺失字段时按 false 处理，不拦） */
+  /** 仅当"ATA 直通读不到真盘序列号、也拿不到可用的系统序列号"时才为 true（后端缺失字段时按 false 处理，不拦） */
   requires_manual_serial?: boolean
   /** 需要手填序列号的人话原因 */
   manual_serial_reason?: string | null
-  /** 盒子上报的序列号（不能作为身份依据，仅作对照展示） */
+  /** ATA 直通读到的真盘序列号（可作为身份依据） */
+  smart_serial?: string | null
+  /** 是否拿到了可用的序列号（真盘序列号或系统序列号） */
+  serial_usable?: boolean
+  /** 系统枚举层（Get-Disk/WMI）上报的 ID：可能是盒子 ID，不能单独作身份依据，仅作对照展示 */
   probe_serial?: string | null
   /** USB 桥/盒子型号 */
   bridge_model?: string | null

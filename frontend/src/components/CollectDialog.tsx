@@ -228,14 +228,15 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
 
   const { data: preflight } = useCollectPreflight(path)
 
-  // USB 硬盘盒：盒子上报的序列号不能作为磁盘身份，必须手填盘体标签上的序列号。
-  // 字段缺失（旧后端）或 requires_manual_serial=false → 与现在完全一致，不拦。
+  // 序列号闸门：只有"ATA 直通读不到真盘序列号、也拿不到可用的系统序列号"时才要求手填。
+  // 字段缺失（旧后端）或 requires_manual_serial=false → 不拦，与现在完全一致。
   const needsManualSerial = preflight?.requires_manual_serial === true
   const serialFilled = serial.trim().length > 0
   const serialBlocked = needsManualSerial && !serialFilled
   const manualSerialReason =
     preflight?.manual_serial_reason ||
-    '该盘经 USB 硬盘盒接入，盒子会挡住真盘的序列号，上报的编号不能作为磁盘身份依据。请在下方「磁盘序列号」中填写盘体标签上的序列号——手填一次，这块盘以后的身份就固定了。'
+    '这块盘读不到可用的真盘序列号（ATA 直通读不到，系统枚举层也没有可用序列号），因此需要你手填盘体标签上的序列号——手填一次，这块盘以后的身份就固定了。'
+  const smartSerial = preflight?.smart_serial ?? null
 
   const canStart =
     !createCollectMutation.isPending &&
@@ -289,13 +290,13 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
               <Alert
                 type="warning"
                 showIcon
-                title="此盘必须手填磁盘序列号"
+                title="此盘读不到可用的真盘序列号，需要手填"
                 description={
                   <Space orientation="vertical" size={4} style={{ width: '100%' }}>
                     <Text>{manualSerialReason}</Text>
                     {preflight?.probe_serial && (
                       <Text type="secondary">
-                        盒子报告：<Text code>{preflight.probe_serial}</Text>（不能作为身份依据）
+                        系统枚举到的 ID：<Text code>{preflight.probe_serial}</Text>（可能是盒子 ID，不能单独作身份依据）
                       </Text>
                     )}
                     <Text type="secondary" style={{ fontSize: 12 }}>
@@ -319,9 +320,11 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
               extra={
                 pickedSerialHint
                   ? `枚举到该盘序列号为 ${pickedSerialHint}（仅供参考，未自动填入——请与盘体标签核对后再决定是否手填）`
-                  : needsManualSerial
-                    ? 'USB 硬盘盒接入的盘必须手填序列号；普通 SATA 盘可留空'
-                    : 'USB 桥盘探测不到序列号时必须填写；普通 SATA 盘可留空'
+                  : smartSerial
+                    ? `已通过 ATA 直通读到真盘序列号 ${smartSerial}（与盘体标签一致，可直接采集）`
+                    : needsManualSerial
+                      ? '这块盘读不到可用的真盘序列号，需要手填盘体标签上的序列号；普通 SATA 盘可留空'
+                      : '普通 SATA 盘可留空；探测不到序列号时会提示填写'
               }
             >
               <Input
@@ -432,7 +435,7 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
             </Tooltip>
             {serialBlocked && (
               <Text type="warning" style={{ display: 'block', marginTop: 8, fontSize: 12 }}>
-                <WarningOutlined /> 请先填写磁盘序列号：USB 硬盘盒会挡住真盘序列号，需要手填盘体标签上的序列号来确定盘的身份。
+                <WarningOutlined /> 请先填写磁盘序列号：这块盘读不到可用的真盘序列号，需要手填盘体标签上的序列号来确定盘的身份。
               </Text>
             )}
           </Form>
