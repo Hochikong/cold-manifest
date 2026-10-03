@@ -489,9 +489,47 @@ function metricText(v: number | null | undefined, suffix = ''): string {
   return `${formatNumber(v)}${suffix}`
 }
 
+/** 瓦片渲染结果：主值 + 可选 tooltip（原始串）+ 可选小字注（如「厂商私有编码」）。 */
+interface AtaTile {
+  value: string
+  tooltip?: string
+  note?: string
+}
+
+/**
+ * 语义展示值取瓦片：按属性 id 从 ata_attributes 找 display_kind。
+ * - composite → 显示 display_value（+单位），tooltip 附 display_text 原始串；
+ * - vendor_encoded（厂商私有编码，如希捷 raw 错误率）→ 不显示巨大 raw 数，
+ *   改显归一化健康值 "当前 / 最差"，小字提示，tooltip 给原始串；
+ * - plain / 缺字段 / 旧后端 → 回退 fallback()（现状行为）。
+ */
+function ataDisplayTile(
+  d: AtaExtras | null,
+  attrId: number,
+  fallback: () => string,
+  unit = '',
+): AtaTile {
+  const a = d?.ata_attributes?.find((x) => x.id === attrId)
+  if (a && a.display_kind === 'composite' && a.display_value != null && !Number.isNaN(a.display_value)) {
+    return {
+      value: `${formatNumber(a.display_value)}${unit}`,
+      tooltip: a.display_text ? `原始：${a.display_text}` : undefined,
+    }
+  }
+  if (a && a.display_kind === 'vendor_encoded') {
+    return {
+      value: `${formatNumber(a.value)} / 最差 ${formatNumber(a.worst)}`,
+      note: '厂商私有编码，显示归一化值',
+      tooltip: a.display_text ? `原始：${a.display_text}` : undefined,
+    }
+  }
+  return { value: fallback() }
+}
+
 /**
  * 健康卡内的 ATA 关键指标瓦片组（13 项）。缺项显示 —；
  * liveParsed 与 disk.latest_smart（扩展字段可选）都符合此结构。
+ * 有新后端 display_kind 的属性按语义展示值显示（飞行小时等 composite / 错误率等 vendor_encoded）。
  */
 function AtaKeyMetrics({ d }: { d: {
   temperature_c: number | null
@@ -501,20 +539,20 @@ function AtaKeyMetrics({ d }: { d: {
   start_stop_ct?: number | null
 } & AtaExtras | null }) {
   if (!d) return null
-  const tiles: { label: string; value: string }[] = [
-    { label: '温度', value: d.temperature_c != null ? `${d.temperature_c} ℃` : '—' },
-    { label: '通电小时', value: metricText(d.power_on_hours, ' h') },
-    { label: '通电次数', value: metricText(d.power_cycle_count) },
-    { label: '启停次数', value: metricText(d.start_stop_ct) },
-    { label: '重分配扇区', value: metricText(d.reallocated_ct) },
-    { label: '待映射扇区', value: metricText(d.pending_ct) },
-    { label: 'UDMA CRC', value: metricText(d.udma_crc_errors) },
-    { label: '读错误率', value: metricText(d.raw_read_error_rate) },
-    { label: '寻道错误率', value: metricText(d.seek_error_rate) },
-    { label: '退避重试', value: metricText(d.spin_retry_count) },
-    { label: '断电回收', value: metricText(d.power_off_retract_count) },
-    { label: '负载循环', value: metricText(d.load_cycle_count) },
-    { label: '飞行小时', value: metricText(d.head_flying_hours, ' h') },
+  const tiles: { label: string; tile: AtaTile }[] = [
+    { label: '温度', tile: { value: d.temperature_c != null ? `${d.temperature_c} ℃` : '—' } },
+    { label: '通电小时', tile: { value: metricText(d.power_on_hours, ' h') } },
+    { label: '通电次数', tile: { value: metricText(d.power_cycle_count) } },
+    { label: '启停次数', tile: { value: metricText(d.start_stop_ct) } },
+    { label: '重分配扇区', tile: { value: metricText(d.reallocated_ct) } },
+    { label: '待映射扇区', tile: { value: metricText(d.pending_ct) } },
+    { label: 'UDMA CRC', tile: { value: metricText(d.udma_crc_errors) } },
+    { label: '读错误率', tile: ataDisplayTile(d, 1, () => metricText(d.raw_read_error_rate)) },
+    { label: '寻道错误率', tile: ataDisplayTile(d, 7, () => metricText(d.seek_error_rate)) },
+    { label: '退避重试', tile: { value: metricText(d.spin_retry_count) } },
+    { label: '断电回收', tile: { value: metricText(d.power_off_retract_count) } },
+    { label: '负载循环', tile: { value: metricText(d.load_cycle_count) } },
+    { label: '飞行小时', tile: ataDisplayTile(d, 240, () => metricText(d.head_flying_hours, ' h'), ' h') },
   ]
   return (
     <div style={{ border: '1px solid #f0f0f0', borderRadius: 6, padding: '10px 12px' }}>
@@ -530,7 +568,12 @@ function AtaKeyMetrics({ d }: { d: {
         {tiles.map((t) => (
           <div key={t.label} style={{ background: '#fafafa', borderRadius: 6, padding: '6px 8px', minWidth: 0 }}>
             <div style={{ fontSize: 11, color: '#8c8c8c', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.label}</div>
-            <div style={{ fontSize: 14, fontWeight: 600, overflowWrap: 'anywhere' }}>{t.value}</div>
+            <Tooltip title={t.tile.tooltip} mouseEnterDelay={0.3}>
+              <div style={{ fontSize: 14, fontWeight: 600, overflowWrap: 'anywhere' }}>{t.tile.value}</div>
+            </Tooltip>
+            {t.tile.note && (
+              <div style={{ fontSize: 10, color: '#8c8c8c', lineHeight: 1.3, marginTop: 1 }}>{t.tile.note}</div>
+            )}
           </div>
         ))}
       </div>
@@ -606,10 +649,17 @@ function AtaAttributesCard({ attrs }: { attrs: AtaAttribute[] | null | undefined
       key: 'raw',
       ellipsis: true,
       render: (_: unknown, record: AtaAttribute) => {
-        const t = record.raw_string ?? record.raw_value ?? ''
+        // vendor_encoded：不直显巨大私有数，主显 display_text 原始串 + 小注；旧后端/其余维持现状
+        const vendor = record.display_kind === 'vendor_encoded'
+        const t = vendor && record.display_text ? record.display_text : (record.raw_string ?? record.raw_value ?? '')
         return (
-          <Tooltip title={t} placement="topLeft" mouseEnterDelay={0.3}>
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>{t}</span>
+          <Tooltip title={record.raw_string ?? record.raw_value ?? t} placement="topLeft" mouseEnterDelay={0.3}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }}>
+              {t}
+              {vendor && (
+                <span style={{ fontSize: 10, color: '#8c8c8c', whiteSpace: 'nowrap' }}>（厂商私有编码）</span>
+              )}
+            </span>
           </Tooltip>
         )
       },

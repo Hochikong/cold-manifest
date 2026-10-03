@@ -366,6 +366,12 @@ export interface AtaAttribute {
   name_zh?: string | null
   /** when_failed 的中文（可选，兜底用 when_failed 原值映射） */
   when_failed_zh?: string | null
+  /** 语义展示值（新后端；旧后端缺失 → 前端回退 raw_string/raw_value）：人话原始串，如 "3 (138 89 0)" */
+  display_text?: string | null
+  /** 语义数值（composite → 换算后的量；vendor_encoded → null；plain → raw 数值） */
+  display_value?: number | null
+  /** 展示类别：plain=普通数值；composite=语义换算值；vendor_encoded=厂商私有编码（不直显 raw） */
+  display_kind?: 'plain' | 'composite' | 'vendor_encoded' | null
 }
 
 /**
