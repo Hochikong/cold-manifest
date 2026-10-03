@@ -302,15 +302,23 @@ def probe_path_win(
                 letter=letter)
             amb = si.get("identity_ambiguity")
             mapped_by = si.get("mapped_by")
-            verified = mapped_by in ("serial_match", "env_override") and not amb
+            # 身份已验证的三种口径：序列号精确匹配 / 环境覆盖 / 按容量唯一
+            # 匹配（expected 是盒 ID、SMART 唯一读到真盘序列号且容量吻合）
+            verified = mapped_by in ("serial_match", "env_override",
+                                     "unique_capacity_match") and not amb
             info.identity_ambiguity = amb
             info.identity_verified = verified
+            if si.get("identity_reason"):
+                info.identity_reason = str(si["identity_reason"])
             info.identity_risk = str(si.get("identity_risk")
                                      or (cands[0].get("risk") if cands else "")
                                      or "")
             warnings: list[str] = []
             if amb:
                 warnings.append(f"设备身份歧义：{amb}")
+            if si.get("identity_reason"):
+                # 人话解释（盒 ID 场景/未验证原因）进可展示通道，页面可见
+                warnings.append(str(si["identity_reason"]))
             if si.get("identity_risk") == "target_not_found":
                 # 已证明扫描表里没有目标盘：跳过 SMART 读取（宁可没有也不
                 # 读错盘），保留 probe 序列号，原因落到 DiskInfo/scan_info
@@ -325,7 +333,8 @@ def probe_path_win(
                 res = read_smart_verbose(devices=cands)
                 info.smart_attempts = res.get("attempts") or None
                 rsi = dict(res.get("scan_info") or {})
-                for k in ("mapped_by", "identity_risk", "identity_ambiguity"):
+                for k in ("mapped_by", "identity_risk", "identity_ambiguity",
+                          "identity_reason"):
                     if si.get(k) is not None:
                         rsi[k] = si[k]
                 if warnings:

@@ -758,33 +758,69 @@ def read_device_identity(device: str, suggested_type: "str | None" = None
     return None
 
 
+def _fmt_capacity(n: "int | None") -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "未知容量"
+    for unit, div in (("TB", 10**12), ("GB", 10**9), ("MB", 10**6)):
+        if n >= div:
+            return f"{n / div:.1f}{unit}"
+    return f"{n}B"
+
+
 def _score_identity_match(ident: "dict | None",
                           expected_serial: "str | None",
                           expected_capacity_bytes: "int | None",
                           expected_model: "str | None") -> int:
-    """身份匹配打分：serial 精确(忽略大小写) 100；serial 缺/占位且容量≤5%
-    且型号匹配 80；容量≤20% 且型号匹配 50；仅容量≤20% 20；否则 0。
+    """身份匹配打分。
 
-    双方都有序列号但不一致 → 0（证明是另一块盘）。
+    - serial 精确(忽略大小写) 100；
+    - serial 不一致：expected 常是 USB 硬盘盒上报的 ID（盒 ID），而 SMART
+      读到的是真盘序列号——序列号不同**不**单独判"另一块盘"，还要看容量
+      和型号：容量≤5% 且型号一致 → 90；容量≤5% 但型号明确不一致 → 70
+      （盒型号与真盘型号常见不同，型号不致死但用于同容量时区分）；容量
+      ≤5% 型号不可比（任一方缺失）→ 20（弱匹配）；容量≤20% 且型号一致
+      50；仅容量≤20% 20；容量差 >20% 或容量不可比 → 0（容量也对不上才是
+      另一块盘）；
+    - serial 缺失/占位：容量≤5% 且型号匹配 80；容量≤5% 型号明确不一致
+      70；容量≤5% 型号不可比 20；容量≤20% 且型号匹配 50；仅容量≤20% 20；
+      否则 0。
     """
     if not ident:
         return 0
     serial = (ident.get("serial") or "").strip()
-    if expected_serial:
-        exp = expected_serial.strip()
-        if serial:
-            return 100 if serial.upper() == exp.upper() else 0
-        # serial 缺失/占位（桥常报全 0 / 乱占位）：只能靠容量+型号弱匹配
     cap = ident.get("capacity_bytes")
     exp_cap = expected_capacity_bytes
     cap5 = bool(cap and exp_cap and abs(cap - exp_cap) <= 0.05 * max(cap, exp_cap))
     cap20 = bool(cap and exp_cap and abs(cap - exp_cap) <= 0.20 * max(cap, exp_cap))
-    model_match = bool(
-        expected_model and ident.get("model")
-        and str(ident["model"]).strip().upper()
-        == str(expected_model).strip().upper())
-    if cap5 and model_match:
-        return 80
+    ident_model = str(ident.get("model") or "").strip()
+    exp_model = str(expected_model or "").strip()
+    model_match = bool(exp_model and ident_model
+                       and ident_model.upper() == exp_model.upper())
+    model_mismatch = bool(exp_model and ident_model
+                          and ident_model.upper() != exp_model.upper())
+    if expected_serial and serial:
+        if serial.upper() == expected_serial.strip().upper():
+            return 100
+        # 序列号不一致：容量也明显对不上才判"另一块盘"并剔除
+        if cap5:
+            if model_match:
+                return 90
+            if model_mismatch:
+                return 70
+            return 20  # 型号不可比，只能弱匹配
+        if cap20 and model_match:
+            return 50
+        if cap20:
+            return 20
+        return 0
+    if cap5:
+        if model_match:
+            return 80
+        if model_mismatch:
+            return 70
+        return 20
     if cap20 and model_match:
         return 50
     if cap20:
@@ -803,12 +839,21 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
     - CLDM_SMARTCTL_DEVICE 环境覆盖优先（mapped_by="env_override"）；
     - 枚举 scan_devices() 全部条目，逐台 read_device_identity（同一次调用
       内按 device 缓存）并 _score_identity_match 打分，按分数降序排候选；
-      有 expected_serial 时，读到不同序列号的条目（证明是另一块盘）剔除；
+      有 expected_serial 时，读到不同序列号**且容量差 >20%**（或容量不可
+      比）的条目（证明是另一块盘）剔除——序列号不同但容量吻合的保留
+      （expected 是盒 ID 的正常场景，SMART 读到的是真盘序列号）；
     - 末尾追加 /dev/sd{disk_index} 回退候选（risk="unverified_index_mapping"）
       与盘符候选；
-    - scan_info["mapped_by"] ∈ serial_match | weak_match | env_override |
-      fallback；scan_info["identity_ambiguity"] 非空表示多台设备无法区分
-      （多台同序列号 / 多台弱匹配且都读不到序列号），附中文原因与建议。
+    - scan_info["mapped_by"] ∈ serial_match | unique_capacity_match |
+      capacity_match | weak_match | env_override | fallback；
+      unique_capacity_match = top 分数唯一（≥70 容量吻合档）且明显高于第
+      二名（至少低一档）→ 身份已验证（盒 ID 场景 / 读不到序列号靠容量+
+      型号唯一定位均适用）；capacity_match = 达到容量吻合档但多台并列或
+      领先不明显 → 不验证；
+      scan_info["identity_ambiguity"] 非空表示多台设备无法区分
+      （多台同序列号 / 多台容量型号并列 / 多台弱匹配且都读不到序列号），
+      附中文原因与建议；scan_info["identity_reason"] 给出人话解释
+      （盒 ID 场景说明 / 未验证原因）。
     """
     env = os.environ.get("CLDM_SMARTCTL_DEVICE")
     if env and env.strip():
@@ -834,8 +879,9 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
         score = _score_identity_match(ident, expected_serial,
                                       expected_capacity_bytes,
                                       expected_model)
-        # 读到**不同**序列号：证明是另一块盘，不进候选链；
-        # 读不到序列号（-i 失败/桥占位）保留候选，走弱匹配+歧义检测
+        # 读到**不同**序列号且容量也明显对不上（score==0）：证明是另一块
+        # 盘，不进候选链；容量吻合（score≥20，含 90 盒 ID 场景）或读不到
+        # 序列号（-i 失败/桥占位）保留候选，走弱匹配+歧义检测
         if expected_serial and ident and (ident.get("serial") or "").strip() \
                 and score == 0:
             excluded += 1
@@ -861,6 +907,16 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
 
     cands = [e for _s, e in scored]
 
+    # 唯一匹配判定：top 分数唯一且明显高于第二名（至少低一档 ≥10 分），
+    # 且 top 达到容量吻合档（≥70，含 90 读到真盘序列号 / 80 容量+型号 /
+    # 70 容量吻合型号不符）。不硬性要求读到序列号——有的盒子连真盘序列号
+    # 都读不出，只能靠容量+型号唯一定位。多台并列（同容量同型号）不验证。
+    top_s = scored[0][0] if scored else 0
+    top_count = sum(1 for s, _e in scored if s == top_s)
+    second_s = next((s for s, _e in scored if s < top_s), None)
+    unique_match = bool(scored) and top_s >= 70 and top_count == 1 \
+        and (second_s is None or second_s <= top_s - 10)
+
     # "已证明没有目标盘"：扫描表非空但每一条都因序列号不符被剔除。
     # 与"扫描表为空"（无法证明）不同——此时绝不再追加未验证的 sd/letter
     # 回退候选，否则可能对一块已证明不是目标盘的设备发起读取。
@@ -868,6 +924,12 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
 
     # 歧义检测（多台无法区分）
     ambiguity: "str | None" = None
+    if ambiguity is None and top_s >= 70 and top_count > 1:
+        ties = [e for s, e in scored if s == top_s]
+        ambiguity = (
+            f"多台设备（{'、'.join(e['device'] for e in ties)}）"
+            "容量/型号均与目标一致，无法确定哪块是目标盘；"
+            "建议拔掉其中一块再采，或用 --serial 显式区分")
     if expected_serial:
         hits = [e for _s, e in scored
                 if str(e.get("identity_serial") or "").strip().upper()
@@ -909,6 +971,9 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
         sc = cands[0].get("identity_score")
         if sc == 100:
             mapped_by = "serial_match"
+        elif isinstance(sc, int) and sc >= 70:
+            mapped_by = ("unique_capacity_match" if unique_match
+                         else "capacity_match")
         elif sc:
             mapped_by = "weak_match"
     top_risk = cands[0].get("risk") if cands else None
@@ -932,6 +997,27 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
         scan_info["identity_reason"] = (
             "扫描到的设备序列号均与目标盘不符（目标盘可能未接入或未换回"
             "原盒）；已跳过 SMART 读取，以免把别的盘参数记到本卷")
+    elif unique_match and expected_serial:
+        top_ident = ident_cache.get(cands[0]["device"]) or {}
+        tser = (top_ident.get("serial") or "").strip()
+        if tser:
+            scan_info["identity_reason"] = (
+                f"探针读到的是硬盘盒上报的 ID（{expected_serial}），SMART 已按"
+                f"容量 {_fmt_capacity(top_ident.get('capacity_bytes'))} 唯一定位"
+                f"并读到真盘序列号 {tser}")
+        else:
+            scan_info["identity_reason"] = (
+                f"探针读到的是硬盘盒上报的 ID（{expected_serial}），SMART 未能"
+                f"读到设备序列号，已按容量 {_fmt_capacity(top_ident.get('capacity_bytes'))}"
+                f"+型号（{top_ident.get('model')}）唯一定位")
+    elif not entries:
+        scan_info["identity_reason"] = (
+            "smartctl 扫描表为空，无法按序列号/容量定位设备；已回退到盘号"
+            "映射，身份未验证")
+    elif mapped_by == "weak_match" and not cands[0].get("identity_serial"):
+        scan_info["identity_reason"] = (
+            "SMART 未能读到设备序列号，无法按序列号确认身份；已按容量/型号"
+            "弱匹配定位（未验证）")
     if ambiguity:
         scan_info["identity_ambiguity"] = ambiguity
     return cands, scan_info

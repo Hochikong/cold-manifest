@@ -149,6 +149,62 @@ def _iter_snapshot_meta(catalog: sqlite3.Connection, data_root: Path,
     return out
 
 
+def _latest_snapshot_identity_reason(catalog: sqlite3.Connection,
+                                     data_root: Path, disk_id: str) -> str:
+    """该盘**最近一个快照**的身份校验失败原因（identity_reason /
+    identity_warnings 首条）；读取失败或无记录返回 ''。
+
+    只做一次"最新快照"查询（按 collected_at 倒序 LIMIT 1），供磁盘列表
+    逐行调用的 disk_identity_status 使用；只读连接，任何异常吞掉返回 ''。
+    """
+    try:
+        r = catalog.execute(
+            """
+            SELECT s.snapshot_id FROM snapshots s
+            JOIN volumes v ON v.volume_id = s.volume_id
+            WHERE v.disk_id = ?
+            ORDER BY s.collected_at DESC, s.snapshot_id DESC LIMIT 1
+            """,
+            (disk_id,),
+        ).fetchone()
+        if r is None:
+            return ""
+        sid = r["snapshot_id"]
+        db_path = data_root / sid.split("/")[0] / sid.split("/")[1] / "snapshot.db"
+        if not db_path.is_file():
+            return ""
+        conn = _connect_ro(db_path)
+        try:
+            meta = {row["key"]: row["value"]
+                    for row in conn.execute("SELECT key, value FROM meta")}
+        finally:
+            conn.close()
+        return _reason_from_meta(meta)
+    except (sqlite3.Error, OSError):
+        return ""
+
+
+def _reason_from_meta(meta: dict) -> str:
+    """从快照 meta 提取身份校验失败原因：identity_reason，或
+    identity_warnings(_json) 的首条；无则 ''。"""
+    reason = (meta.get("identity_reason") or "").strip()
+    if reason:
+        return reason
+    warns = meta.get("identity_warnings")
+    if warns is None:
+        warns = meta.get("identity_warnings_json")
+    if isinstance(warns, str):
+        try:
+            warns = json.loads(warns)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            warns = None
+    if isinstance(warns, list):
+        for w in warns:
+            if isinstance(w, str) and w.strip():
+                return w.strip()
+    return ""
+
+
 # ---------------------------------------------------------------- 身份状态派生
 
 
@@ -174,17 +230,27 @@ def disk_identity_status(catalog: sqlite3.Connection, data_root: Path,
     if has_verified:
         verified = row["identity_verified"]
         if verified == 0:
+            reason = _latest_snapshot_identity_reason(
+                catalog, data_root, disk_id)
+            if reason:
+                return "conflict", f"最近一次身份校验未通过：{reason}"
             return "conflict", "最近一次身份校验未通过（identity_verified=0）"
         if verified == 1:
             return "verified", "最近一次身份校验通过（identity_verified=1）"
     warnings: "list[dict]" = []
+    fallback_reason = ""
     for _sid, _vid, meta in _iter_snapshot_meta(
             catalog, data_root, disk_id, warnings):
         if meta and _snapshot_fallback_flags(meta):
+            fallback_reason = _reason_from_meta(meta)
+            if fallback_reason:
+                return ("unverified",
+                        "存在走未验证回退（fallback 候选/扫描未命中/卷序列号兜底）"
+                        f"的快照，设备映射未经核实：{fallback_reason}")
             return ("unverified",
                     "存在走未验证回退（fallback 候选/扫描未命中/卷序列号兜底）的快照，"
                     "设备映射未经核实")
-    return "unknown", "无足够证据判定该盘身份（建议重新采集时开启身份校验）"
+    return "unknown", "无足够证据判定该盘身份（重新采集时程序会自动核对设备身份）"
 
 
 # ---------------------------------------------------------------- 审计主入口

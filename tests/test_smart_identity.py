@@ -38,13 +38,20 @@ def _fake_idents(monkeypatch, by_device: dict) -> None:
 
 def test_score_serial_exact_and_mismatch() -> None:
     assert smart._score_identity_match(_ident(EXP), EXP, 1000, "M") == 100
-    # 双方都有序列号但不一致 → 0（另一块盘）
-    assert smart._score_identity_match(_ident(OTHER), EXP, 1000, "M") == 0
-    # serial 缺失：容量≤5% + 型号 → 80
+    # 双方都有序列号但不一致、容量吻合 ≤5% → 90（expected 常是盒 ID 场景）
+    assert smart._score_identity_match(_ident(OTHER), EXP, 1000, "M") == 90
+    # 序列号不一致 **且** 容量差 >20% → 0（才判定是另一块盘）
+    assert smart._score_identity_match(_ident(OTHER, cap=2000), EXP, 1000, "M") == 0
+    # 序列号不一致、容量差 ≤20% 但 >5%、型号一致 → 50
+    assert smart._score_identity_match(_ident(OTHER, cap=1100), EXP, 1000, "M") == 50
+    # 容量吻合但型号明确不一致（盒型号 vs 真盘型号）→ 70（不致死，用于同容量区分）
+    assert smart._score_identity_match(_ident(OTHER, model="N"), EXP, 1000, "M") == 70
+    # serial 缺失：容量≤5% + 型号 → 80；型号明确不一致 → 70；型号不可比 → 20
     assert smart._score_identity_match(_ident(None), EXP, 1000, "M") == 80
+    assert smart._score_identity_match(_ident(None, model="N"), EXP, 1000, "M") == 70
+    assert smart._score_identity_match(_ident(None, model=None), EXP, 1000, None) == 20
     # 容量≤20% + 型号 → 50；仅容量 → 20；全无 → 0
     assert smart._score_identity_match(_ident(None, cap=1100), EXP, 1000, "M") == 50
-    assert smart._score_identity_match(_ident(None, model=None), EXP, 1000, None) == 20
     assert smart._score_identity_match(None, EXP, 1000, "M") == 0
 
 
@@ -100,7 +107,7 @@ def test_no_serial_weak_matches_report_ambiguity(monkeypatch) -> None:
     cands, si = smart.resolve_smart_device(
         expected_serial=EXP, expected_capacity_bytes=1000, expected_model="M")
     assert si["identity_ambiguity"]
-    assert si["mapped_by"] == "weak_match"
+    assert si["mapped_by"] == "capacity_match"  # 容量吻合档并列 → 不验证
 
 
 def test_empty_scan_falls_back_with_risk(monkeypatch) -> None:
@@ -321,3 +328,166 @@ def test_probe_unverified_fills_empty_probe_serial(monkeypatch) -> None:
     assert info.disk_serial == "B"
     assert info.serial_source == "smartctl_unverified"
     assert info.identity_verified is False
+
+
+# ---------------------------------------------------------------- 盒 ID 场景（真机缺陷修复）
+
+BOX_ID = "20260123004775F"   # USB 盒上报的 ID（探针序列号）
+REAL_4T = "16NDT0O1T"        # 4T 真盘序列号
+REAL_2T = "2T-TRUE-SER"      # 2T 真盘序列号
+CAP_4T = 4000787030016
+CAP_2T = 2000398934016
+
+
+def test_box_id_capacity_unique_match_verified(monkeypatch) -> None:
+    """用户场景：expected=盒 ID，scan=[4T 真盘、2T 真盘] → 2T 容量不符被
+    剔除，4T 保留并判已验证（unique_capacity_match），identity_reason 提及
+    盒 ID 与真盘序列号。"""
+    _set_scan(monkeypatch, [{"device": "/dev/sda", "type": "sat"},
+                            {"device": "/dev/sdb", "type": "sat"}])
+    _fake_idents(monkeypatch, {
+        "/dev/sda": _ident(REAL_4T, model="TOSHIBA MG09", cap=CAP_4T),
+        "/dev/sdb": _ident(REAL_2T, model="OTHER", cap=CAP_2T)})
+    cands, si = smart.resolve_smart_device(
+        expected_serial=BOX_ID, expected_capacity_bytes=CAP_4T,
+        expected_model="TOSHIBA EXTERNAL_USB")
+    assert [c["device"] for c in cands if c["source"] == "scan"] == ["/dev/sda"]
+    assert si["mapped_by"] == "unique_capacity_match"
+    assert si.get("identity_ambiguity") is None
+    reason = si.get("identity_reason") or ""
+    assert BOX_ID in reason and REAL_4T in reason
+    assert "3.6TB" in reason or "4.0TB" in reason
+
+
+def test_p300_two_capacity_hits_not_verified(monkeypatch) -> None:
+    """P300 场景：两台候选容量/型号全同（各读到真序列号）→ 不得验证，
+    identity_ambiguity 非空。"""
+    _set_scan(monkeypatch, [{"device": "/dev/sda", "type": "sat"},
+                            {"device": "/dev/sdb", "type": "sat"}])
+    _fake_idents(monkeypatch, {
+        "/dev/sda": _ident("P300-A", model="P300", cap=1000),
+        "/dev/sdb": _ident("P300-B", model="P300", cap=1000)})
+    cands, si = smart.resolve_smart_device(
+        expected_serial=BOX_ID, expected_capacity_bytes=1000,
+        expected_model="P300")
+    assert si["mapped_by"] == "capacity_match"
+    assert si["identity_ambiguity"]
+    assert "无法确定" in si["identity_ambiguity"]
+
+
+def test_scan_empty_unverified_reason(monkeypatch) -> None:
+    """scan 为空 → 未验证 + 理由文案。"""
+    _set_scan(monkeypatch, [])
+    _cands, si = smart.resolve_smart_device(
+        expected_serial=BOX_ID, expected_capacity_bytes=CAP_4T)
+    assert si["mapped_by"] == "fallback"
+    assert "扫描表为空" in (si.get("identity_reason") or "")
+
+
+def test_no_serial_read_unverified_reason(monkeypatch) -> None:
+    """唯一候选但读不到序列号（盒型号匹配 → 80）：单台唯一高分 → 判已验证
+    （unique_capacity_match），identity_reason 说明"未读到序列号、按容量+型号
+    唯一定位"。"""
+    _set_scan(monkeypatch, [{"device": "/dev/sda", "type": "sat"}])
+    _fake_idents(monkeypatch, {"/dev/sda": _ident(None, model="M", cap=1000)})
+    _cands, si = smart.resolve_smart_device(
+        expected_serial=BOX_ID, expected_capacity_bytes=1000,
+        expected_model="M")
+    assert si["mapped_by"] == "unique_capacity_match"
+    reason = si.get("identity_reason") or ""
+    assert BOX_ID in reason and "唯一定位" in reason
+
+
+def test_no_serial_weak_multi_not_verified_reason(monkeypatch) -> None:
+    """读不到序列号且多台并列 → 不验证 + 歧义/理由文案。"""
+    _set_scan(monkeypatch, [{"device": "/dev/sda", "type": "sat"},
+                            {"device": "/dev/sdb", "type": "sat"}])
+    _fake_idents(monkeypatch, {"/dev/sda": _ident(None, model="M", cap=1000),
+                               "/dev/sdb": _ident(None, model="M", cap=1000)})
+    _cands, si = smart.resolve_smart_device(
+        expected_serial=BOX_ID, expected_capacity_bytes=1000,
+        expected_model="M")
+    assert si["mapped_by"] == "capacity_match"
+    assert si["identity_ambiguity"]
+
+
+def test_same_capacity_diff_model_model_wins_verified(monkeypatch) -> None:
+    """JMicron 2T USB（读不到序列号，盒型号匹配 → 80）vs 内置 WD SN570
+    （真盘序列号不同 + 同容量但型号不符 → 70）：top 唯一且领先一档 →
+    靠型号唯一胜出判已验证。"""
+    _set_scan(monkeypatch, [{"device": "/dev/sda", "type": "sat"},
+                            {"device": "/dev/sdb", "type": "sat"}])
+    _fake_idents(monkeypatch, {
+        "/dev/sda": _ident(None, model="JMicron Generic USB", cap=2000398934016),
+        "/dev/sdb": _ident("WD-SN570-SER", model="WD Blue SN570",
+                           cap=2000398934016)})
+    cands, si = smart.resolve_smart_device(
+        expected_serial="0123456789ABCDEF", expected_capacity_bytes=2000398934016,
+        expected_model="JMicron Generic USB")
+    assert cands[0]["device"] == "/dev/sda"
+    assert si["mapped_by"] == "unique_capacity_match"
+    assert si.get("identity_ambiguity") is None
+    assert "唯一定位" in (si.get("identity_reason") or "")
+
+
+def test_single_usb_disk_verified(monkeypatch) -> None:
+    """只插一块 USB 盘：候选唯一即 top 唯一（无第二名）→ 验证通过。"""
+    _set_scan(monkeypatch, [{"device": "/dev/sda", "type": "sat"}])
+    _fake_idents(monkeypatch, {
+        "/dev/sda": _ident(REAL_4T, model="TOSHIBA MG09", cap=CAP_4T)})
+    cands, si = smart.resolve_smart_device(
+        expected_serial=BOX_ID, expected_capacity_bytes=CAP_4T,
+        expected_model="TOSHIBA EXTERNAL_USB")
+    assert si["mapped_by"] == "unique_capacity_match"
+    assert REAL_4T in (si.get("identity_reason") or "")
+
+
+# ---------------------------------------------------------------- 端到端（假 scan / 假 smartctl）
+
+def test_e2e_probe_box_id_verified(monkeypatch) -> None:
+    """端到端复刻用户场景：probe_path_win（盒 ID 探针序列号 + 4T 容量）
+    → identity_verified=True、真盘序列号被采纳。"""
+
+    class _FakePath(str):
+        def exists(self):
+            return True
+
+        def resolve(self):
+            return self
+
+    ps = json.loads(_PS_JSON)
+    ps["disk"]["serial"] = BOX_ID
+    ps["disk"]["model"] = "TOSHIBA EXTERNAL_USB"
+    ps["disk"]["size"] = CAP_4T
+    ps["volume"]["size"] = CAP_4T
+    monkeypatch.setattr(pw, "Path", _FakePath)
+    monkeypatch.setattr(pw, "run_powershell",
+                        lambda script, timeout=60: json.dumps(ps))
+    _set_scan(monkeypatch, [{"device": "/dev/sda", "type": "sat"},
+                            {"device": "/dev/sdb", "type": "sat"}])
+    _fake_idents(monkeypatch, {
+        "/dev/sda": _ident(REAL_4T, model="TOSHIBA MG09", cap=CAP_4T),
+        "/dev/sdb": _ident(REAL_2T, model="WD RED", cap=CAP_2T)})
+    raw = json.dumps({"serial_number": REAL_4T,
+                      "model_name": "TOSHIBA MG09",
+                      "user_capacity": {"bytes": CAP_4T}})
+    monkeypatch.setattr(smart, "read_smart_verbose",
+                        lambda dev=None, *, devices=None, **kw: {
+                            "ok": True, "raw": raw, "device": devices[0]["device"],
+                            "device_type": "sat", "exit_status": 0,
+                            "reason": None, "message": None,
+                            "raw_excerpt": raw, "attempts": [],
+                            "device_candidates": [devices[0]["device"]],
+                            "scan_info": {}})
+    _volume, info = pw.probe_path_win("E:\\", smartctl=True)
+    assert info.identity_verified is True
+    assert info.disk_serial == REAL_4T          # 真序列号被采纳
+    assert info.serial_source == "smartctl"
+    assert info.physical_serial == REAL_4T
+    rsi = info.smart_scan_info or {}
+    assert rsi["mapped_by"] == "unique_capacity_match"
+    assert BOX_ID in (rsi.get("identity_reason") or "")
+    assert REAL_4T in (rsi.get("identity_reason") or "")
+    assert info.identity_reason and BOX_ID in info.identity_reason
+    assert any(BOX_ID in w and REAL_4T in w
+               for w in (info.identity_warnings or []))

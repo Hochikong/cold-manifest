@@ -372,3 +372,81 @@ def test_cli_json_output(tmp_path: Path, capsys) -> None:
     body = json.loads(capsys.readouterr().out)
     assert body["summary"] == {"high": 1, "medium": 0, "low": 0}
     assert body["alerts"][0]["type"] == "intra_snapshot_serial_drift"
+
+
+# ------------------------------------------ disk_identity_status 原因透出
+
+from cold_manifest.identity_audit import disk_identity_status  # noqa: E402
+
+
+def _disk_with_verified(tmp_path: Path, verified: int,
+                        snaps: "dict[str, dict]",
+                        name: str = "datav") -> "tuple[Path, sqlite3.Connection]":
+    root = _make_root(tmp_path, {D1: [V1]}, snaps, name=name)
+    conn = sqlite3.connect(catalog_path(root))
+    conn.row_factory = sqlite3.Row
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(disks)")}
+    if "identity_verified" not in cols:
+        conn.execute("ALTER TABLE disks ADD COLUMN identity_verified INTEGER")
+    conn.execute("UPDATE disks SET identity_verified=?", (verified,))
+    conn.commit()
+    return root, conn
+
+
+def test_status_conflict_reason_from_latest_meta(tmp_path: Path) -> None:
+    reason = ("探针读到的是硬盘盒上报的 ID（X）；SMART 已按容量唯一定位并读到"
+              "真盘序列号 Y")
+    root, conn = _disk_with_verified(tmp_path, 0, {
+        SID_A1: {"disk_serial": D1, "identity_reason": "旧的原因"},
+        SID_A2: {"disk_serial": D1, "identity_reason": reason},
+    })
+    try:
+        status, why = disk_identity_status(conn, root, D1)
+        assert status == "conflict"
+        assert reason in why
+        assert why.startswith("最近一次身份校验未通过：")
+    finally:
+        conn.close()
+
+
+def test_status_conflict_generic_without_meta_reason(tmp_path: Path) -> None:
+    root, conn = _disk_with_verified(tmp_path, 0, {SID_A1: {"disk_serial": D1}})
+    try:
+        status, why = disk_identity_status(conn, root, D1)
+        assert status == "conflict"
+        assert "未通过" in why and "identity_verified=0" in why
+    finally:
+        conn.close()
+
+
+def test_status_unverified_reason_from_warnings(tmp_path: Path) -> None:
+    scan_info = json.dumps({
+        "candidates": [{"device": "/dev/sdb", "type": "",
+                        "source": "fallback-sd"}],
+        "device_used": "/dev/sdb", "mapped_from_scan": False,
+    })
+    root = _make_root(tmp_path, {D1: [V1]}, {
+        SID_A1: {"disk_serial": D1, "smart_scan_info_json": scan_info,
+                 "identity_warnings_json": json.dumps(["…原因A…"])},
+    })
+    conn = sqlite3.connect(catalog_path(root))
+    conn.row_factory = sqlite3.Row
+    try:
+        status, why = disk_identity_status(conn, root, D1)
+        assert status == "unverified"
+        assert "原因A" in why
+    finally:
+        conn.close()
+
+
+def test_status_unknown_new_wording(tmp_path: Path) -> None:
+    root = _make_root(tmp_path, {D1: [V1]}, {SID_A1: {"disk_serial": D1}})
+    conn = sqlite3.connect(catalog_path(root))
+    conn.row_factory = sqlite3.Row
+    try:
+        status, why = disk_identity_status(conn, root, D1)
+        assert status == "unknown"
+        assert "开启身份校验" not in why
+        assert "自动核对" in why
+    finally:
+        conn.close()
