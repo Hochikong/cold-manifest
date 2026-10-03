@@ -310,6 +310,7 @@ def test_read_smart_verbose_success_has_scan_info(monkeypatch) -> None:
     monkeypatch.setattr(smart, "_run_cmd_ex", fake)
     monkeypatch.setattr(smart, "_SCAN_CACHE", [
         {"device": "/dev/sdb", "type": "sat"}])
+    monkeypatch.setattr(smart, "_SCAN_TS", 0.0)  # 外部注入哨兵：视为新鲜
     res = smart.read_smart_verbose("/dev/sdb", suggested_type="sat")
     assert res["ok"] is True
     assert res["device"] == "/dev/sdb"
@@ -449,6 +450,7 @@ def test_fake_smartctl_auto_jmb39x_then_sat(tmp_path: Path,
         {"device": "/dev/sdb", "type": "nvme"},
         {"device": "/dev/sdc", "type": "sat"},
     ])
+    monkeypatch.setattr(smart, "_SCAN_TS", 0.0)  # 外部注入哨兵：视为新鲜
     cands = smart.smart_device_candidates(2)
     # 场景③/④：扫描给出 sat 类型且同盘去重后只有一条候选
     assert len(cands) == 1
@@ -628,6 +630,7 @@ def test_smart_device_scan_mapping(monkeypatch) -> None:
         {"device": "/dev/sdb", "type": "scsi"},
         {"device": "/dev/sdc", "type": "sat"},
     ])
+    monkeypatch.setattr(smart, "_SCAN_TS", 0.0)  # 外部注入哨兵：视为新鲜
     assert smart.smart_device(2) == ("/dev/sdc", "sat")
     assert smart.smart_device(0) == ("/dev/sda", "ata")
     # 超出 scan 范围 → 候选链回退（首选 /dev/sdN 形态）

@@ -21,6 +21,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -621,14 +622,21 @@ def _usable(proc: "subprocess.CompletedProcess | None") -> bool:
 # --scan 的映射（scan 输出顺序与 disk_index 一致），拿不到再回退 PhysicalDrive。
 
 _SCAN_CACHE: "list[dict] | None" = None
+_SCAN_TS: float = 0.0          # _SCAN_CACHE 写入时刻（monotonic）
+# 短 TTL：smartctl --scan 的设备表只是"当场线索"——USB 盒插拔换盘后旧表
+# 立即失真（盘符/盘号可能已指向另一块盘），绝不能进程内永久绑定。非空
+# 结果最多缓存 15 秒，过期即重扫；重扫为空（smartctl 瞬时失败）时旧缓存
+# 保留但已过期，下次调用会再试。
+_SCAN_TTL = 15.0
 
 _SCAN_LINE_PAT = re.compile(r"^(\S+)\s+-d\s+([^\s,#+]+)")
 
 
 def reset_scan_cache() -> None:
     """清空 --scan 结果缓存（测试/设备热插拔后用）。"""
-    global _SCAN_CACHE
+    global _SCAN_CACHE, _SCAN_TS
     _SCAN_CACHE = None
+    _SCAN_TS = 0.0
 
 
 def _scan_entries_from_json(text: str) -> "list[dict] | None":
@@ -683,18 +691,22 @@ def parse_scan_output(text: str) -> "list[dict]":
 
 
 def scan_devices() -> "list[dict]":
-    """smartctl 扫描结果（进程内缓存）：优先 ``--scan-open -j``，回退
-    ``--scan -j``、文本 ``--scan``。
+    """smartctl 扫描结果（进程内短 TTL 缓存）：优先 ``--scan-open -j``，
+    回退 ``--scan -j``、文本 ``--scan``。
 
     --scan-open 会逐台真实打开设备，能顺带给出可用性与正确的 -d 类型，
     并对打不开的设备附 open_error（这些条目跳过，不进映射表）。
-    **不缓存失败**：空结果（smartctl 缺失/刚启动盘未就绪/权限等瞬时失败）
-    绝不进缓存——否则一次瞬时失败会把整个服务进程的映射永久污染成空，
-    后续全部退化成回退形态（"第一次好、后面坏"）。
-    空结果原地重试一次后仍空则直接返回，等下次调用再试。
+    **非空结果只缓存 _SCAN_TTL 秒**：设备表是"当场线索"，插拔换盘后
+    旧表立即失真，过期即重扫。**不缓存失败**：空结果（smartctl 缺失/
+    刚启动盘未就绪/权限等瞬时失败）绝不覆盖缓存——一次瞬时失败不能把
+    映射污染成空。空结果原地重试一次后仍空则直接返回，等下次调用再试。
     """
-    global _SCAN_CACHE
-    if _SCAN_CACHE is not None:
+    global _SCAN_CACHE, _SCAN_TS
+    now = time.monotonic()
+    # _SCAN_TS==0 是"外部注入"哨兵（测试直接 monkeypatch _SCAN_CACHE 时
+    # 不带时间戳），视为新鲜；生产路径写入缓存时必同时写 _SCAN_TS。
+    if _SCAN_CACHE is not None and (_SCAN_TS == 0.0
+                                    or (now - _SCAN_TS) <= _SCAN_TTL):
         return _SCAN_CACHE
     exe = smartctl_exec()
     entries: list[dict] = []
@@ -710,6 +722,7 @@ def scan_devices() -> "list[dict]":
             break
     if entries:
         _SCAN_CACHE = entries
+        _SCAN_TS = now
     return entries
 
 
@@ -767,6 +780,28 @@ def _fmt_capacity(n: "int | None") -> str:
         if n >= div:
             return f"{n / div:.1f}{unit}"
     return f"{n}B"
+
+
+def _expected_bus_class(interface: "str | None") -> str:
+    """采集目标的接口（probe 的 interface_type/busType，或 lsblk tran）→
+    总线类别："nvme" | "ata"（USB 桥/SATA/SCSI 背后都是 ATA 通路）| ""（未知）。"""
+    t = (interface or "").strip().lower()
+    if not t:
+        return ""
+    if "nvme" in t:
+        return "nvme"
+    return "ata"  # usb/sata/scsi/ata/raid…
+
+
+def _candidate_bus(*types: "str | None") -> str:
+    """扫描条目 type / -i 读到的 device_type → 总线类别。"""
+    for t in types:
+        if "nvme" in (t or "").lower():
+            return "nvme"
+    for t in types:
+        if (t or "").strip():
+            return "ata"  # sat/ata/scsi/usbjmicron/... 都走 ATA 通路
+    return ""
 
 
 def _score_identity_match(ident: "dict | None",
@@ -831,12 +866,19 @@ def _score_identity_match(ident: "dict | None",
 def resolve_smart_device(*, expected_serial: "str | None" = None,
                          expected_capacity_bytes: "int | None" = None,
                          expected_model: "str | None" = None,
+                         expected_interface: "str | None" = None,
                          disk_index: "int | None" = None,
                          letter: "str | None" = None
                          ) -> "tuple[list[dict], dict]":
     """按身份（序列号优先）定位设备：返回 (候选链, scan_info)。
 
     - CLDM_SMARTCTL_DEVICE 环境覆盖优先（mapped_by="env_override"）；
+    - **有可用盘符时盘符直读优先**（mapped_by="letter_direct"）：盘符与
+      物理盘一一对应，读到的型号/序列号就是目标盘的，不需要容量猜测；
+      扫描表候选只作兜底（盘符打不开/被读后校验否决时才尝试）；
+    - expected_interface（probe 的总线类型，如 USB/NVMe/SATA）：与候选的
+      总线类别做硬区分，nvme vs ata 互斥——总线不相容的候选直接剔除
+      （证明是另一台设备）；
     - 枚举 scan_devices() 全部条目，逐台 read_device_identity（同一次调用
       内按 device 缓存）并 _score_identity_match 打分，按分数降序排候选；
       有 expected_serial 时，读到不同序列号**且容量差 >20%**（或容量不可
@@ -844,7 +886,7 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
       （expected 是盒 ID 的正常场景，SMART 读到的是真盘序列号）；
     - 末尾追加 /dev/sd{disk_index} 回退候选（risk="unverified_index_mapping"）
       与盘符候选；
-    - scan_info["mapped_by"] ∈ serial_match | unique_capacity_match |
+    - scan_info["mapped_by"] ∈ letter_direct | serial_match | unique_capacity_match |
       capacity_match | weak_match | env_override | fallback；
       unique_capacity_match = top 分数唯一（≥70 容量吻合档）且明显高于第
       二名（至少低一档）→ 身份已验证（盒 ID 场景 / 读不到序列号靠容量+
@@ -868,34 +910,57 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
     entries = scan_devices()
     has_expected = bool(expected_serial or expected_capacity_bytes
                         or expected_model)
-    ident_cache: "dict[str, dict | None]" = {}
-    scored: "list[tuple[int, dict]]" = []
-    excluded = 0  # 读到不同序列号被剔除的条数
-    for e in entries:
-        dev = e["device"]
-        if dev not in ident_cache:
-            ident_cache[dev] = read_device_identity(dev, e.get("type") or "")
-        ident = ident_cache[dev]
-        score = _score_identity_match(ident, expected_serial,
-                                      expected_capacity_bytes,
-                                      expected_model)
-        # 读到**不同**序列号且容量也明显对不上（score==0）：证明是另一块
-        # 盘，不进候选链；容量吻合（score≥20，含 90 盒 ID 场景）或读不到
-        # 序列号（-i 失败/桥占位）保留候选，走弱匹配+歧义检测
-        if expected_serial and ident and (ident.get("serial") or "").strip() \
-                and score == 0:
-            excluded += 1
-            continue
-        entry: dict = {"device": dev, "type": e.get("type") or "",
-                       "source": "scan"}
-        if has_expected:
-            entry["identity_score"] = score
-            if ident and ident.get("serial"):
-                entry["identity_serial"] = ident["serial"]
-        if score == 0:
-            entry.setdefault("risk", "unverified_identity")
-        scored.append((score, entry))
-    scored.sort(key=lambda t: t[0], reverse=True)
+    # 总线硬区分（P0 修复）：目标走 USB 桥/SATA（ATA 通路）时，nvme 候选
+    # 是另一台设备（总线不相容 = 证明不是目标，与序列号不同同级），反之
+    # 亦然——否则 2TB USB 盒 vs 2TB 内置 NVMe 同容量并列会被猜着读错。
+    expected_bus = _expected_bus_class(expected_interface)
+
+    def _score_entries(es: "list[dict]") -> "tuple[list[tuple[int, dict]], int, dict]":
+        """对一张设备表逐台读身份打分；返回 (scored, excluded, ident_cache)。"""
+        ic: "dict[str, dict | None]" = {}
+        sc: "list[tuple[int, dict]]" = []
+        ex = 0  # 读到不同序列号/总线不相容被剔除的条数
+        for e in es:
+            dev = e["device"]
+            if dev not in ic:
+                ic[dev] = read_device_identity(dev, e.get("type") or "")
+            ident = ic[dev]
+            if expected_bus:
+                cand_bus = _candidate_bus(e.get("type"),
+                                          (ident or {}).get("device_type"))
+                if cand_bus and cand_bus != expected_bus:
+                    ex += 1
+                    continue
+            score = _score_identity_match(ident, expected_serial,
+                                          expected_capacity_bytes,
+                                          expected_model)
+            # 读到**不同**序列号且容量也明显对不上（score==0）：证明是另一块
+            # 盘，不进候选链；容量吻合（score≥20，含 90 盒 ID 场景）或读不到
+            # 序列号（-i 失败/桥占位）保留候选，走弱匹配+歧义检测
+            if expected_serial and ident and (ident.get("serial") or "").strip() \
+                    and score == 0:
+                ex += 1
+                continue
+            entry: dict = {"device": dev, "type": e.get("type") or "",
+                           "source": "scan"}
+            if has_expected:
+                entry["identity_score"] = score
+                if ident and ident.get("serial"):
+                    entry["identity_serial"] = ident["serial"]
+            if score == 0:
+                entry.setdefault("risk", "unverified_identity")
+            sc.append((score, entry))
+        sc.sort(key=lambda t: t[0], reverse=True)
+        return sc, ex, ic
+
+    scored, excluded, ident_cache = _score_entries(entries)
+    # 身份读取"全军覆没"且扫描表非空 → 设备表可能是换盘前的旧表（短 TTL
+    # 之外的插拔时序），强制刷新一次重扫再打分；仍无匹配就按既有语义收场。
+    if has_expected and not scored and entries:
+        reset_scan_cache()
+        entries = scan_devices()
+        if entries:
+            scored, excluded, ident_cache = _score_entries(entries)
 
     # 无期望值且给了盘号：保持旧行为——只取扫描表对应下标一条（超出范围
     # 则扫描表整条不取，仅剩回退形态）（下标映射本身未经验证，risk 由
@@ -917,10 +982,35 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
     unique_match = bool(scored) and top_s >= 70 and top_count == 1 \
         and (second_s is None or second_s <= top_s - 10)
 
+    # 并列不允许"猜着读"（P0 修复）：没有序列号精确命中、top 又是多台并列
+    # 时，绝不把扫描候选按顺序交给调用方读第一个——读到的多半是另一块盘。
+    # 处置：扫描候选整链收回（含 sd/letter 回退，回退读到的同样是"某台"），
+    # 只留歧义结论让调用方跳过读取（probe 保留探测值并给 warnings）。
+    exact_hit = any(e.get("identity_score") == 100 and e.get("identity_serial")
+                    for _s, e in scored)
+    ambiguous_tie = bool(has_expected and scored and top_s >= 70
+                         and top_count > 1 and not exact_hit)
+    if ambiguous_tie:
+        cands = []
+
+    # 盘符直读优先（有可用盘符时）：盘符与物理盘一一对应（Windows 保证），
+    # `smartctl -i -j C:` 读到的就是该卷所在盘的准确型号/序列号——识别唯一，
+    # 完全不需要容量猜测（另一台机器 2×三星 990EVOPlus 2TB + 多根铠侠 2TB，
+    # 同容量极多，容量绝不能当认同依据）。扫描表候选保留在链尾作兜底
+    # （盘符打不开/读取被否决时才轮到它们，仍受总线过滤+并列不猜约束）。
+    letter_cand: "dict | None" = None
+    if letter and has_expected:
+        lt = f"{letter.rstrip(':')}:"
+        letter_cand = {"device": lt, "type": "", "source": "letter"}
+        if all(c["device"] != lt for c in cands):
+            cands = [letter_cand] + cands
+
     # "已证明没有目标盘"：扫描表非空但每一条都因序列号不符被剔除。
     # 与"扫描表为空"（无法证明）不同——此时绝不再追加未验证的 sd/letter
     # 回退候选，否则可能对一块已证明不是目标盘的设备发起读取。
-    target_not_found = has_expected and excluded > 0 and not scored
+    # 有盘符时不判 target_not_found（盘符直读不依赖扫描表）。
+    target_not_found = has_expected and excluded > 0 and not scored \
+        and not letter_cand
 
     # 歧义检测（多台无法区分）
     ambiguity: "str | None" = None
@@ -950,8 +1040,9 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
                 "均无法读出序列号且型号/容量相同，无法确定哪块是目标盘；"
                 "建议拔掉其中一块再采，或用 --serial 显式区分")
 
-    # 回退候选：/dev/sd{disk_index}（下标映射未经验证）+ 盘符
-    if not target_not_found:
+    # 回退候选：/dev/sd{disk_index}（下标映射未经验证）+ 盘符。
+    # ambiguous_tie（并列无法区分）时同样不给——回退读到的同样是"某台"。
+    if not target_not_found and not ambiguous_tie:
         if isinstance(disk_index, int) and 0 <= disk_index < 26:
             sd = f"/dev/sd{chr(ord('a') + disk_index)}"
             if all(c["device"] != sd for c in cands):
@@ -966,9 +1057,12 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
             if all(c["device"] != lt for c in cands):
                 cands.append({"device": lt, "type": "", "source": "letter"})
 
+    # mapped_by 按打分结果（收回候选链之前）计算：并列收回链后它仍如实
+    # 描述"分辨率到达了哪一档"（capacity_match=并列不验证）。
     mapped_by = "fallback"
-    if cands and cands[0]["source"] == "scan":
-        sc = cands[0].get("identity_score")
+    _top_entry = scored[0][1] if scored else None
+    if _top_entry is not None and _top_entry.get("source") == "scan":
+        sc = _top_entry.get("identity_score")
         if sc == 100:
             mapped_by = "serial_match"
         elif isinstance(sc, int) and sc >= 70:
@@ -976,6 +1070,8 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
                          else "capacity_match")
         elif sc:
             mapped_by = "weak_match"
+    if letter_cand is not None:
+        mapped_by = "letter_direct"
     top_risk = cands[0].get("risk") if cands else None
     scan_info: dict = {
         "devices": entries,
@@ -984,7 +1080,9 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
                         **({"note": c["note"]} if c.get("note") else {}),
                         **({"risk": c["risk"]} if c.get("risk") else {}),
                         **({"identity_score": c["identity_score"]}
-                           if "identity_score" in c else {})}
+                           if "identity_score" in c else {}),
+                        **({"identity_serial": c["identity_serial"]}
+                           if "identity_serial" in c else {})}
                        for c in cands],
         "device_used": None,
         "mapped_from_scan": any(c["source"] == "scan" for c in cands),
@@ -992,11 +1090,23 @@ def resolve_smart_device(*, expected_serial: "str | None" = None,
     }
     if top_risk:
         scan_info["identity_risk"] = top_risk
+    if ambiguous_tie:
+        scan_info["identity_risk"] = "identity_ambiguity"
+        scan_info["identity_reason"] = (
+            "多台候选设备无法区分（容量/型号并列且读不到目标序列号），"
+            "已收回扫描表候选链、跳过其 SMART 读取，以免把别的盘参数记到本卷；"
+            "建议一次只插一块盘")
     if target_not_found:
         scan_info["identity_risk"] = "target_not_found"
         scan_info["identity_reason"] = (
             "扫描到的设备序列号均与目标盘不符（目标盘可能未接入或未换回"
             "原盒）；已跳过 SMART 读取，以免把别的盘参数记到本卷")
+    elif letter_cand is not None:
+        scan_info["identity_reason"] = (
+            f"已按盘符 {letter_cand['device']} 直读（盘符与物理盘一一对应，"
+            "身份最可靠，不依赖容量猜测）；扫描表候选仅作兜底")
+        if ambiguity:
+            scan_info["identity_reason"] += f"（注意：扫描表里{ambiguity}）"
     elif unique_match and expected_serial:
         top_ident = ident_cache.get(cands[0]["device"]) or {}
         tser = (top_ident.get("serial") or "").strip()
@@ -1234,12 +1344,22 @@ REASON_MESSAGES = {
     ),
     "not_found": "设备不存在或 smartctl 不可用",
     "timeout": "读取 SMART 超时（盘可能休眠中或无响应）",
+    "identity_mismatch": (
+        "读取到的设备与目标盘不相容（接口/容量对不上，疑似另一块盘），"
+        "已丢弃本次读取——绝不把别的盘参数记到本卷；"
+        "建议一次只接一块盘，或用 CLDM_SMARTCTL_DEVICE 直接指定设备串"
+    ),
     "other": "读取 SMART 失败（原因未知，详见 stderr 片段）",
 }
 
 
 def _classify_attempts(attempts: list[dict]) -> str:
     """按尝试记录归类失败原因（一次确定，不混合）。"""
+    # 读后校验发现身份不相容是最强信号：说明确确实实读到了"另一块盘"，
+    # 优先于一切（not_found/timeout 只是"没读到"，mismatch 是"读到了错的"）。
+    for a in attempts:
+        if a.get("error") == "identity_mismatch":
+            return "identity_mismatch"
     for a in attempts:
         if a.get("error") == "timeout":
             return "timeout"
@@ -1295,7 +1415,10 @@ def _messages_excerpt(proc: "subprocess.CompletedProcess | None",
 def read_smart_verbose(device: "str | None" = None, *,
                        suggested_type: "str | None" = None,
                        device_types: "list[str] | None" = None,
-                       devices: "list[dict] | None" = None) -> dict:
+                       devices: "list[dict] | None" = None,
+                       expect_interface: "str | None" = None,
+                       expect_capacity_bytes: "int | None" = None,
+                       expect_model: "str | None" = None) -> dict:
     """现场读取 SMART 并保留失败原因（诊断用；成功路径与 read_smart 等价）。
 
     - device：单设备串（与 suggested_type 搭配，向后兼容）；
@@ -1304,8 +1427,6 @@ def read_smart_verbose(device: "str | None" = None, *,
       形态（/dev/sdN、\\\\.\\PhysicalDriveN）都能试到；
     - ok / raw / device_type / exit_status：成功时与 read_smart 同义；
       另带 device（生效设备串）；
-    - reason：permission_denied / device_open / cmdline_error /
-      device_type_unknown / not_found / timeout / other；
     - message：reason 对应的人话；
     - raw_excerpt：成功为 stdout 片段（≤2KB），失败为最后一次 stderr 片段（≤2KB）；
     - attempts：失败尝试记录 [{device, device_type, argv, rc, exit_status,
@@ -1313,7 +1434,15 @@ def read_smart_verbose(device: "str | None" = None, *,
       直接承载；stdout_messages 为 -j 失败响应里 messages[].string 的人话）；
     - scan_info：{devices(扫描表), candidates(候选及来源), device_used,
       mapped_from_scan}——"映射结论"，供磁盘页展示。
-    device_types 可显式覆盖兜底链（测试用）；绝不抛异常。
+    - device_types 可显式覆盖兜底链（测试用）；
+    - expect_interface/expect_capacity_bytes/expect_model：目标盘已知身份
+      （probe 探测值）。**读后校验**（最后一道硬保险）：读到数据后用接口
+      总线/容量复核，不相容（USB 桥目标读到 nvme、容量差 >20%）→ 该次
+      读取整包丢弃，ok=False + reason="identity_mismatch" + 中文原因，
+      绝不把别的盘参数带给调用方；
+    - reason：permission_denied / device_open / cmdline_error /
+      device_type_unknown / not_found / timeout / identity_mismatch / other；
+    绝不抛异常。
     """
     cands: "list[dict]" = []
     if devices:
@@ -1354,14 +1483,66 @@ def read_smart_verbose(device: "str | None" = None, *,
     scan = _scan_info(cands)
     attempts: list[dict] = []
 
+    def _verify_read(raw: str, dt: str) -> "str | None":
+        """读后校验（最后一道硬保险）：读到身份后用接口总线/容量复核。
+        不相容返回中文原因（这次读取必须整包丢弃），相容/无法判断返回 None。
+        - 总线：目标走 USB 桥/SATA（ata 通路）时读到 nvme 设备 = 另一块盘，
+          反之亦然；
+        - 容量：双方都有且差 >20% = 另一块盘；
+        - 型号/序列号不参与否决（盒型号 vs 真盘型号是常态，由上游打分处理）。
+        """
+        expect_bus = _expected_bus_class(expect_interface)
+        try:
+            sj = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(sj, dict):
+            return None
+        dev = sj.get("device") if isinstance(sj.get("device"), dict) else {}
+        read_bus = _candidate_bus(dt, dev.get("type"))
+        if expect_bus and read_bus and read_bus != expect_bus:
+            return (f"读取到的设备总线不相容（目标 "
+                    f"{expect_interface or expect_bus}，读到 "
+                    f"{read_bus} 设备 {dev.get('name') or ''}）"
+                    "——疑似另一块盘，已丢弃本次读取")
+        try:
+            cap = int((sj.get("user_capacity") or {}).get("bytes"))
+        except (TypeError, ValueError):
+            cap = None
+        if cap and expect_capacity_bytes \
+                and abs(cap - expect_capacity_bytes) > 0.20 * max(
+                    cap, expect_capacity_bytes):
+            return (f"读取到的设备容量不相符（目标 "
+                    f"{_fmt_capacity(expect_capacity_bytes)}，读到 "
+                    f"{_fmt_capacity(cap)}）——疑似另一块盘，已丢弃本次读取")
+        return None
+
     def _try(dev: str, sug: "str | None") -> "dict | None":
-        """一台设备走完整类型兜底链；成功返回结果 dict，失败记 attempts。"""
+        """一台设备走完整类型兜底链；成功且过读后校验返回结果 dict，
+        失败/身份不相容记 attempts。"""
         types = device_types if device_types is not None \
             else _device_types(sug, windows=_is_windows_device(dev))
         for dt in types:
             cmd = _build_cmd(dev, dt)
             proc, err = _run_cmd_ex(cmd)
             if _usable(proc):
+                # 读后校验：不相容 → 本次读取整包丢弃（绝不返回给调用方），
+                # 换下一台设备（同设备换 -d 类型读到的还是同一块盘）
+                mismatch = _verify_read(proc.stdout, dt)
+                if mismatch:
+                    attempts.append({
+                        "device": dev,
+                        "device_type": dt or "default",
+                        "argv": " ".join(cmd),
+                        "rc": proc.returncode,
+                        "exit_status": proc.returncode,
+                        "error": "identity_mismatch",
+                        "ok": False,
+                        "stderr_excerpt": _excerpt(
+                            getattr(proc, "stderr", None) or "", 512),
+                        "stdout_messages": _excerpt(mismatch, 512),
+                    })
+                    break
                 scan["device_used"] = dev
                 return {
                     "ok": True,
