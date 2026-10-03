@@ -65,8 +65,9 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
   const [path, setPath] = useState(DEFAULT_PATH)
   const [serial, setSerial] = useState('')
   // “本机盘快选”枚举到的序列号：**只作提示、不自动填入**（枚举可能与实际盘不符，
-  // 自动填入会以最高优先级决定盘/卷身份，风险太大——见第八轮实测）
-  const [pickedSerialHint, setPickedSerialHint] = useState('')
+  // 自动填入会以最高优先级决定盘/卷身份，风险太大——见第八轮实测）。
+  // source 记录带出值的来源：smartctl=ATA 直读（可信）；system=系统枚举回退（未核实）；legacy=旧后端（无来源字段）
+  const [pickedSerialHint, setPickedSerialHint] = useState<{ serial: string; source: 'smartctl' | 'system' | 'legacy' } | null>(null)
   const [volumeId, setVolumeId] = useState('')
   const [nickname, setNickname] = useState('')
   const [excludeGlobsText, setExcludeGlobsText] = useState('')
@@ -268,9 +269,13 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
         {mode === 'form' && (
           <Form layout="vertical">
             <AttachedDiskQuickPick
-              onPick={(pickedPath, pickedSerial) => {
+              onPick={(pickedPath, pickedSerial, pickedSource) => {
                 setPath(pickedPath)
-                setPickedSerialHint(pickedSerial || '')
+                setPickedSerialHint(
+                  pickedSerial
+                    ? { serial: pickedSerial, source: pickedSource === 'smartctl' || pickedSource === 'system' ? pickedSource : 'legacy' }
+                    : null,
+                )
               }}
             />
 
@@ -319,7 +324,11 @@ export default function CollectDialog({ open, onClose }: CollectDialogProps) {
               help={serialBlocked ? '请填写盘体标签上的序列号后才能开始采集。' : undefined}
               extra={
                 pickedSerialHint
-                  ? `枚举到该盘序列号为 ${pickedSerialHint}（仅供参考，未自动填入——请与盘体标签核对后再决定是否手填）`
+                  ? pickedSerialHint.source === 'smartctl'
+                    ? `已带出 ATA 直读序列号 ${pickedSerialHint.serial}（真盘序列号，仅供参考，未自动填入——请与盘体标签核对后再决定是否手填）`
+                    : pickedSerialHint.source === 'system'
+                      ? `已带出系统枚举值 ${pickedSerialHint.serial}（未核实，未自动填入——请与盘体标签核对后再决定是否手填）`
+                      : `枚举到该盘序列号为 ${pickedSerialHint.serial}（仅供参考，未自动填入——请与盘体标签核对后再决定是否手填）`
                   : smartSerial
                     ? `已通过 ATA 直通读到真盘序列号 ${smartSerial}（与盘体标签一致，可直接采集）`
                     : needsManualSerial
@@ -874,7 +883,7 @@ function isTerminal(status: Task['status']): boolean {
  * 视觉层次：每块盘一个组头（粗体型号 + 容量 Tag 右对齐 + \\.\PhysicalDriveN 小字），
  * 卷行以加粗盘符开头，组间靠分组结构自然分隔——不靠缩进区分盘与卷。
  */
-function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: string) => void }) {
+function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: string, serialSource?: 'smartctl' | 'system') => void }) {
   const { data, isLoading } = useAttachedDisks(true)
 
   if (isLoading) {
@@ -899,20 +908,30 @@ function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: str
     )
   }
 
-  /** 序列号身份提示：serial_verified=false → 占位号；无 serial → 无序列号；其余仅在后端明确核对过时显示 */
+  /**
+   * 序列号主显与标注（ATA 直读优先）：
+   * - serial_source === "smartctl" → 主显 serial 即真盘序列号，中性小标记「真盘序列号」；
+   * - 否则 serial 是系统枚举回退 → 标「系统枚举 ID · 未核实」（警示色但不吓人）；
+   * - serial 为空且 serial_unverified_raw 有值 → 维持「盒子占位序列号」提示；
+   * - 两者都空 → 「无序列号」。
+   */
+  const isAtaSerial = (disk: AttachedDisk): boolean => disk.serial_source === 'smartctl'
+
   const serialHint = (disk: AttachedDisk): string | null => {
-    if (disk.serial_verified === false) return '盒子占位序列号'
-    if (!disk.serial) return '无序列号'
-    if (disk.serial_verified === true) return '序列号已核对'
-    return null
+    if (isAtaSerial(disk)) return '真盘序列号'
+    if (disk.serial) return '系统枚举 ID · 未核实'
+    if (disk.serial_unverified_raw) return '盒子占位序列号'
+    return '无序列号'
   }
 
-  // 搜索文本拼进每个卷选项：盘符、卷标、文件系统、型号、容量、设备名都能命中
+  // 搜索文本拼进每个卷选项：盘符、卷标、文件系统、型号、容量、设备名、序列号（含系统枚举值）都能命中
   const diskSearchText = (disk: AttachedDisk): string =>
     [
       disk.device,
       disk.model,
       disk.serial,
+      disk.system_serial,
+      disk.serial_unverified_raw,
       disk.size_bytes != null ? formatFileSize(disk.size_bytes) : '',
       ...disk.volumes.flatMap((v) => [v.path, v.label, v.filesystem]),
     ]
@@ -921,8 +940,12 @@ function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: str
       .toLowerCase()
 
   // 盘 → 已挂载卷的级联选项；整盘无挂载点的以禁用项呈现
+  const showSystemSerial = (disk: AttachedDisk): boolean =>
+    !!disk.system_serial && disk.system_serial !== disk.serial
+
   const options = data.items.map((disk: AttachedDisk) => {
     const hint = serialHint(disk)
+    const ata = isAtaSerial(disk)
     return {
       // 组头：不可选，仅作分组展示
       label: (
@@ -932,9 +955,17 @@ function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: str
               {disk.model || '未知型号'}
             </Text>
             {hint && (
-              <Text type="secondary" style={{ fontSize: 12, flexShrink: 0 }}>
-                {hint}
-              </Text>
+              ata ? (
+                // ATA 直读命中：中性小标记，表示这是真盘序列号
+                <Tag style={{ marginInlineEnd: 0, flexShrink: 0, fontSize: 12, lineHeight: '18px', paddingInline: 6 }}>
+                  真盘序列号
+                </Tag>
+              ) : (
+                // 系统枚举回退：警示色但不吓人
+                <Tag color="warning" style={{ marginInlineEnd: 0, flexShrink: 0, fontSize: 12, lineHeight: '18px', paddingInline: 6 }}>
+                  {hint}
+                </Tag>
+              )
             )}
             {disk.size_bytes != null && (
               <Tag style={{ marginInlineEnd: 0, flexShrink: 0, fontVariantNumeric: 'tabular-nums' }}>
@@ -946,6 +977,11 @@ function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: str
             {disk.device}
             {disk.serial ? ` · ${disk.serial}` : ''}
           </Text>
+          {showSystemSerial(disk) && (
+            <Text type="secondary" style={{ fontSize: 12, display: 'block' }} ellipsis>
+              系统枚举：<Text code style={{ fontSize: 11 }}>{disk.system_serial}</Text>（可能是盒子 ID）
+            </Text>
+          )}
         </div>
       ),
       title: disk.serial || undefined,
@@ -990,9 +1026,21 @@ function AttachedDiskQuickPick({ onPick }: { onPick: (path: string, serial?: str
         onChange={(value: unknown) => {
           if (!value) return
           const found = data.items
-            .flatMap((d) => d.volumes.map((v) => ({ key: `${d.device}\u0000${v.path}`, path: v.path, serial: d.serial || undefined })))
+            .flatMap((d) =>
+              d.volumes.map((v) => ({
+                key: `${d.device}\u0000${v.path}`,
+                path: v.path,
+                serial: d.serial || undefined,
+                // 带出的序列号来源：ATA 直读命中 → smartctl；其余（含旧后端）→ system 回退语义
+                serialSource: d.serial
+                  ? isAtaSerial(d)
+                    ? ('smartctl' as const)
+                    : ('system' as const)
+                  : undefined,
+              })),
+            )
             .find((o) => o.key === value)
-          if (found) onPick(found.path, found.serial)
+          if (found) onPick(found.path, found.serial, found.serialSource)
         }}
       />
     </Form.Item>

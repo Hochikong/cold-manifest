@@ -302,17 +302,32 @@ export function useDeleteSnapshot() {
   })
 }
 
+/**
+ * 删除磁盘/卷登记记录后需要失效的查询集合（useDeleteRegistry 也复用）。
+ * 不只是列表：快照行带 volume_nickname/disk_nickname 标签、全局搜索结果带盘/卷标签，
+ * 删掉登记记录后这些都可能变脏。
+ *
+ * 顺序敏感：先 await 列表/盘详情刷新——面板里的趋势图表、打开的抽屉会随新数据
+ * 卸载；volume-detail / volume-trends 只按 id 挂在抽屉与面板里，此时一律标脏
+ * 而不主动重取（refetchType 'none'），避免对已删除对象打出 404。
+ */
+export async function invalidateDiskVolumeQueries(qc: ReturnType<typeof useQueryClient>) {
+  await qc.invalidateQueries({ queryKey: ['disks'] })
+  await qc.invalidateQueries({ queryKey: ['disk'] })
+  await qc.invalidateQueries({ queryKey: ['volumes'] })
+  qc.invalidateQueries({ queryKey: ['volume-detail'], refetchType: 'none' })
+  qc.invalidateQueries({ queryKey: ['volume-trends'], refetchType: 'none' })
+  qc.invalidateQueries({ queryKey: ['snapshots'] })
+  qc.invalidateQueries({ queryKey: ['snapshot'] })
+  qc.invalidateQueries({ queryKey: ['global-search'] })
+}
+
 /** 删除磁盘登记记录（不做级联）；成功后磁盘/卷/快照相关缓存一致刷新。 */
 export function useDeleteDisk() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (disk_id: string) => deleteDisk(disk_id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['disks'] })
-      qc.invalidateQueries({ queryKey: ['disk'] })
-      qc.invalidateQueries({ queryKey: ['volumes'] })
-      qc.invalidateQueries({ queryKey: ['volume-detail'] })
-    },
+    onSuccess: () => invalidateDiskVolumeQueries(qc),
   })
 }
 
@@ -321,12 +336,7 @@ export function useDeleteVolume() {
   const qc = useQueryClient()
   return useMutation({
     mutationFn: (volume_id: string) => deleteVolume(volume_id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['volumes'] })
-      qc.invalidateQueries({ queryKey: ['volume-detail'] })
-      qc.invalidateQueries({ queryKey: ['disks'] })
-      qc.invalidateQueries({ queryKey: ['disk'] })
-    },
+    onSuccess: () => invalidateDiskVolumeQueries(qc),
   })
 }
 

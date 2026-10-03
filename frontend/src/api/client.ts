@@ -1051,10 +1051,17 @@ export interface AttachedVolume {
 export interface AttachedDisk {
   device: string
   model: string
+  /** 序列号主显值：优先 ATA 直读（smartctl），读不到时为系统枚举值 */
   serial: string
   size_bytes: number | null
-  /** fix-96：枚举序列号是否已与盘体核对；缺失（undefined）= 后端未提供该字段 */
+  /** serial 来源："smartctl"=ATA 直读命中；"wmi_verified"/"storage"=系统枚举回退；缺失=旧后端 */
+  serial_source?: string
+  /** true=ATA 直读（可信）；false=系统枚举回退（未核实）；缺失=旧后端 */
   serial_verified?: boolean
+  /** 系统枚举值：仅当它与 serial 不同时给出（可能是盒子 ID）；缺失=旧后端 */
+  system_serial?: string | null
+  /** 系统枚举到的未核对原始值（可能是盒子占位号）；既有语义保留 */
+  serial_unverified_raw?: string | null
   volumes: AttachedVolume[]
 }
 
