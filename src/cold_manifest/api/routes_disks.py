@@ -831,7 +831,9 @@ def collect_preflight(body: PreflightBody) -> dict:
     probe_serial = ""
     smart_serial = ""
     try:
-        _, disk = probe_path(body.path, smartctl=False)
+        # 与 collect_volume 完全同参：smartctl=True 才会填 physical_serial
+        # （ATA 直通真盘序列号）；关掉它 preflight 就少了 collect 有的一路取数。
+        _, disk = probe_path(body.path, smartctl=True)
     except ProbeError:
         disk = None  # 探测失败沿用现有错误路径，不新增报错
         # probe 未跑成时真盘序列号仍取上面 read_smart_verbose 的解析结果

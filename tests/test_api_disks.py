@@ -399,15 +399,19 @@ def test_preflight_usb_bridge_with_usable_ata_serial(
                     physical_serial="16NDT0O1T")
     seen: dict = {}
 
-    def fake_probe(path, *, manual_serial=None, smartctl=True):
+    def fake_probe(path, **kw):
+        # 不给 smartctl 默认值：preflight 若不显式传 smartctl=True，
+        # 这里记到 None，防漂移断言会失败。
         seen["path"] = path
-        seen["smartctl"] = smartctl
+        seen["smartctl"] = kw.get("smartctl")
         return (None, disk)
 
     monkeypatch.setattr("cold_manifest.probe.probe_path", fake_probe)
     body = client.post("/api/collect/preflight",
                        json={"path": str(target)}).json()
-    assert seen["smartctl"] is False
+    # 防漂移：preflight 必须与 collect_volume 同参取盘信息（smartctl=True），
+    # 否则 physical_serial 永远是空，会把正常盘误判成"需要手填序列号"。
+    assert seen["smartctl"] is True
     assert body["requires_manual_serial"] is False
     assert body["manual_serial_reason"] == ""
     # 两个序列号来源分开：probe_serial=系统枚举 ID，smart_serial=ATA 直通真盘序列号
@@ -494,6 +498,36 @@ def test_preflight_sata_no_manual_serial(client: TestClient, tmp_path: Path,
     assert body["serial_usable"] is True
     assert body["bridge_model"] is None
     assert body["interface_type"] == "SATA"
+
+
+@pytest.mark.parametrize("disk_serial, physical_serial", [
+    ("", ""),             # 双空
+    ("0", "0000000000"),  # 双占位
+])
+def test_preflight_no_serial_blocks_and_matches_collect(
+        client: TestClient, tmp_path: Path, monkeypatch,
+        disk_serial: str, physical_serial: str) -> None:
+    """不变量：requires_manual_serial 与 collect 是否会拒绝完全一致——
+    preflight 用同一个谓词、同一份数据；两边都拿不到序列号时仍然拦。"""
+    from cold_manifest.collect import requires_manual_serial
+
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(
+        monkeypatch,
+        raw='{"smart_status": {"passed": true}, "serial_number": "0000000000"}')
+    disk = DiskInfo(bridge_model="TOSHIBA EXTERNAL_USB USB Device",
+                    interface_type="USB", disk_serial=disk_serial,
+                    physical_serial=physical_serial)
+    monkeypatch.setattr(
+        "cold_manifest.probe.probe_path", lambda p, **kw: (None, disk))
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    # 不变量：preflight 判定 == collect 判据对同一 disk 的判定
+    assert body["requires_manual_serial"] == requires_manual_serial(disk)
+    assert body["requires_manual_serial"] is True
+    assert body["serial_usable"] is False
+    assert body["probe_serial"] in (None, disk_serial)
 
 
 def test_preflight_probe_failure_keeps_defaults(client: TestClient,
