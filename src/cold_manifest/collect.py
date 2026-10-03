@@ -23,7 +23,10 @@ from typing import Callable
 
 from . import __version__
 from .catalog import (connect_catalog, create_batch, ensure_disk, ensure_volume,
-                      register_snapshot, rmtree_ro, snapshot_path, validate_volume_id)
+                      find_disk_by_identity, find_probe_collision,
+                      find_volume_by_partition, preferred_disk_serial,
+                      register_snapshot, rmtree_ro, snapshot_path,
+                      validate_volume_id, _sanitize_serial)
 from .paths import normalize_path
 from .probe import DiskInfo, ProbeError, VolumeInfo, probe_path
 from .scanner import ScanCancelled, scan_tree
@@ -383,27 +386,51 @@ def _register_catalog(data_root: Path, snapshot_id: str, volume_id: str,
                       collected_at: str, warnings: list[str],
                       root_path: Path,
                       cross_filesystems: bool = False) -> str:
-    """catalog 注册：disk/volume/batch/snapshot + on_disk_copies。返回 batch_id。"""
+    """catalog 注册：disk/volume/batch/snapshot + on_disk_copies。返回 batch_id。
+
+    磁盘行按身份查找复用（catalog.find_disk_by_identity：物理序列号优先、
+    其次探测序列号，probe 撞车且物理序列号不同 → 不复用）：找得到沿用既有
+    disk_id（历史不变），找不到按"物理序列号优先"新建 —— 两块报出相同
+    探测序列号的盘（USB 盒常见）由此各自成行，不再共用一个盘/卷。
+    """
     serial = (disk.disk_serial or "").strip()
-    disk_id = serial or f"NOSERIAL_{volume_id}"
     cat = connect_catalog(data_root)
     try:
-        reg = ensure_disk(cat, disk_id,
-                          physical_model=disk.physical_model or None,
-                          physical_serial=disk.physical_serial or None,
-                          bridge_model=disk.bridge_model or None,
-                          capacity_bytes=disk.capacity_bytes,
-                          interface_type=disk.interface_type or None,
-                          identity_verified=(
-                              (1 if disk.identity_verified else 0)
-                              if getattr(disk, "identity_verified", None)
-                              is not None else None))
-        if reg["conflicts"]:
-            fields_seen = "、".join(c["field"] for c in reg["conflicts"])
+        physical = getattr(disk, "physical_serial", None) or None
+        existing_disk_id = find_disk_by_identity(cat, probe_serial=serial,
+                                                 physical_serial=physical)
+        collision_disk_id = None
+        if existing_disk_id is None:
+            # probe 撞车（两块盘报相同探测序列号）：本次盘按物理序列号另立新行，
+            # 冲突记录照旧写到既有盘行上（identity_verified=0 + 冲突历史）
+            collision_disk_id = find_probe_collision(
+                cat, probe_serial=serial, physical_serial=physical)
+        name_serial = preferred_disk_serial(physical, serial)
+        disk_id = existing_disk_id or name_serial or f"NOSERIAL_{volume_id}"
+
+        def _disk_fields() -> dict:
+            return dict(physical_model=disk.physical_model or None,
+                        physical_serial=physical,
+                        bridge_model=disk.bridge_model or None,
+                        capacity_bytes=disk.capacity_bytes,
+                        interface_type=disk.interface_type or None,
+                        identity_verified=(
+                            (1 if disk.identity_verified else 0)
+                            if getattr(disk, "identity_verified", None)
+                            is not None else None))
+
+        if collision_disk_id:
+            ensure_disk(cat, collision_disk_id, **_disk_fields())
+        reg = ensure_disk(cat, disk_id, **_disk_fields())
+        if reg["conflicts"] or collision_disk_id:
+            fields_seen = "、".join(
+                c["field"] for c in (reg["conflicts"] or
+                                     [{"field": "physical_serial"}]))
             warnings.append(
-                f"磁盘身份冲突：disk_id {disk_id} 已有记录与本次探测不一致"
-                f"（{fields_seen}）；两块盘可能报出相同序列号，"
-                f"建议为其中之一显式 --serial 区分")
+                f"磁盘身份冲突：disk_id {collision_disk_id or disk_id} 已有记录"
+                f"与本次探测不一致（{fields_seen}）；同 ID 但物理序列号不同，"
+                f"已按物理序列号区分（各自独立盘/卷行），"
+                f"若两块盘仍共用请显式 --serial 区分")
         ensure_volume(cat, volume_id, disk_id,
                       partition_index=vol.partition_index,
                       partition_uuid=vol.partition_uuid or None,
@@ -464,6 +491,32 @@ def _usable_serial(serial: "str | None") -> bool:
     """已上移为公共工具：见 catalog._usable_serial（保留别名供既有调用）。"""
     from .catalog import _usable_serial as _fn
     return _fn(serial)
+
+
+def _reuse_existing_volume_id(data_root: "str | Path", disk: DiskInfo,
+                              probe_serial: str,
+                              index: "int | None") -> "str | None":
+    """既有卷复用：该盘（按身份查）已有同分区号的卷 → 沿用其 volume_id。
+
+    找不到盘、或盘下无同分区号卷（新分区）→ None（由 caller 按命名规则新建）。
+    catalog 打不开等异常按 None 处理（后续注册阶段照常报错，不在此吞成硬失败）。
+    """
+    try:
+        cat = connect_catalog(data_root)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        disk_id = find_disk_by_identity(
+            cat, probe_serial=probe_serial,
+            physical_serial=getattr(disk, "physical_serial", None) or None)
+        if disk_id is None:
+            return None
+        return find_volume_by_partition(cat, disk_id=disk_id,
+                                        partition_index=index)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        cat.close()
 
 
 def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
@@ -547,8 +600,19 @@ def collect_volume(scan_root: "str | Path", *, data_root: "str | Path",
                     "（或用 --volume-id 手动命名该卷）")
         else:
             # 怪异序列号（空格/斜杠/Unicode 等）清洗为合法 volume_id 字符，再统一校验
-            serial = re.sub(r"[^A-Za-z0-9_.\-]", "_", serial)
-            volume_id = f"{serial}_P{index}"
+            serial = _sanitize_serial(serial)
+            # 优先复用既有盘/卷：同一块盘再采 → 沿用原 volume_id（历史稳定）；
+            # probe 撞车（两块盘报出相同探测序列号）且物理序列号可区分 → 不复用。
+            # 显式 --serial 时跳过复用（用户指定的命名优先）
+            if manual_serial is None:
+                volume_id = _reuse_existing_volume_id(data_root, disk, serial, index)
+            if volume_id is None:
+                # 新卷命名：显式 --serial 最高优先；其次物理序列号可用优先
+                # （probe 撞车时两块盘各自成卷），再次探测序列号
+                name_serial = (_sanitize_serial(manual_serial) if manual_serial
+                               else preferred_disk_serial(
+                                   getattr(disk, "physical_serial", None), serial))
+                volume_id = f"{name_serial}_P{index}"
     try:
         validate_volume_id(volume_id)
     except Exception as e:

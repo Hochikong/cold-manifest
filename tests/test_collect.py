@@ -335,6 +335,7 @@ def test_collect_weird_serial_sanitized(tmp_path: Path, monkeypatch) -> None:
     def probe(path, *, manual_serial=None, smartctl=True):
         vol, disk = p(path, manual_serial=manual_serial, smartctl=smartctl)
         disk.disk_serial = 'WD-40E: ZR/Z "x"'
+        disk.physical_serial = ""  # 无物理序列号 → 探测值清洗后命名
         disk.serial_source = "probe"
         return vol, disk
 

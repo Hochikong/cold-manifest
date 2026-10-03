@@ -50,11 +50,19 @@ def _usable_serial(serial: "str | None") -> bool:
     if not s:
         return False
     # 按 volume_id 的清洗口径检查（控制字符/空格等替换为 _ 后再判）：
-    # 首字符须为字母数字（validate_volume_id 同口径），且不能是全 0 占位
+    # 首字符须为字母数字（validate_volume_id 同口径）
     sanitized = re.sub(r"[^A-Za-z0-9_.\-]", "_", s)
     if not re.match(r"[A-Za-z0-9]", sanitized):
         return False
-    return any(c != "0" for c in sanitized)
+    # 已知占位形态（USB 桥常见，非真序列号）：
+    # ① 纯 0 串（000/0000000…）；② 0123456789ABCDEF（JMicron 等桥固件
+    #    的出厂占位，大小写不敏感——两块同款盒会报同一个值，直接撞车）；
+    # ③ 全同字符串（xxxxxxxx、AAAAAAAA…）。
+    if sanitized.upper() == "0123456789ABCDEF":
+        return False
+    if len(set(sanitized.upper())) == 1:
+        return False
+    return True
 
 
 _IDENTITY_HISTORY_MAX = 20
@@ -90,8 +98,9 @@ def _detect_identity_conflicts(existing: Any, incoming: dict) -> "list[dict]":
                           or incoming.get("bridge_model")})
     es = existing["physical_serial"]
     if not _usable_serial(es):
-        es = existing["disk_id"]  # disk_id 即登记时的 serial（可用时）
-    if not _usable_serial(es):
+        # 既有行物理序列号缺失/占位（旧版仅按 probe 登记）→ 本次回填真值，
+        # 不构成冲突（probe 撞车的两块盘不会走到同一行：find_disk_by_identity
+        # 已按物理序列号把它们分开）
         es = None
     iser = incoming.get("physical_serial")
     if not _usable_serial(iser):
@@ -156,6 +165,89 @@ def ensure_disk(conn: sqlite3.Connection, disk_id: str, **fields: Any) -> dict:
         [cols[k] for k in keys],
     )
     return {"inserted": existing is None, "conflicts": []}
+
+
+def _sanitize_serial(serial: "str | None") -> str:
+    """序列号清洗为合法 volume_id 字符集（控制字符/空格/斜杠等 → '_'）。"""
+    return re.sub(r"[^A-Za-z0-9_.\-]", "_", (serial or "").strip())
+
+
+def find_disk_by_identity(conn: sqlite3.Connection, *, probe_serial: "str | None",
+                          physical_serial: "str | None") -> "str | None":
+    """按身份查既有磁盘行，返回可复用的 disk_id（找不到返回 None）。
+
+    查找顺序：
+    ① 物理序列号可用时，按其比对 disks.disk_id（登记时的规范化 serial）
+       或 disks.physical_serial —— 命中即同一块盘，复用（历史不分裂）；
+    ② 再按探测序列号比对同两列 —— 命中时须防"probe 撞车"：候选行的
+       physical_serial 与本次物理序列号均可用且不同 → 是两块不同的盘
+       （USB 盒常见：桥固件报出相同序列号），**不**复用，由 caller 按
+       物理序列号另立新盘；候选行物理序列号缺失/一致 → 视为同一块盘复用。
+    """
+    phys = (physical_serial or "").strip()
+    if _usable_serial(phys):
+        phys_norm = _sanitize_serial(phys)
+        rows = conn.execute(
+            "SELECT disk_id FROM disks WHERE disk_id=? COLLATE NOCASE"
+            " OR disk_id=? COLLATE NOCASE OR physical_serial=? COLLATE NOCASE",
+            (phys, phys_norm, phys)).fetchall()
+        if rows:
+            return rows[0][0]
+    probe = (probe_serial or "").strip()
+    if not _usable_serial(probe):
+        return None
+    probe_norm = _sanitize_serial(probe)
+    rows = conn.execute(
+        "SELECT disk_id, physical_serial FROM disks WHERE disk_id=? COLLATE NOCASE"
+        " OR disk_id=? COLLATE NOCASE OR physical_serial=? COLLATE NOCASE",
+        (probe, probe_norm, probe)).fetchall()
+    for row in rows:
+        existing_phys = (row[1] or "").strip()
+        if (_usable_serial(existing_phys) and _usable_serial(phys)
+                and existing_phys.upper() != phys.upper()):
+            continue  # probe 撞车且物理序列号不同 → 不同盘，跳过
+        return row[0]
+    return None
+
+
+def find_probe_collision(conn: sqlite3.Connection, *, probe_serial: "str | None",
+                         physical_serial: "str | None") -> "str | None":
+    """probe 撞车检测：探测序列号命中、但既有行物理序列号与本次不同的盘。
+
+    返回撞车的既有 disk_id（用于把冲突记录照旧写到那块盘上），无撞车返回 None。
+    """
+    probe = (probe_serial or "").strip()
+    if not _usable_serial(probe):
+        return None
+    phys = (physical_serial or "").strip()
+    rows = conn.execute(
+        "SELECT disk_id, physical_serial FROM disks WHERE disk_id=? COLLATE NOCASE"
+        " OR disk_id=? COLLATE NOCASE OR physical_serial=? COLLATE NOCASE",
+        (probe, _sanitize_serial(probe), probe)).fetchall()
+    for row in rows:
+        existing_phys = (row[1] or "").strip()
+        if (_usable_serial(existing_phys) and _usable_serial(phys)
+                and existing_phys.upper() != phys.upper()):
+            return row[0]
+    return None
+
+
+def find_volume_by_partition(conn: sqlite3.Connection, *, disk_id: str,
+                             partition_index: "int | None") -> "str | None":
+    """查某盘下同分区号的既有卷，返回可复用的 volume_id（没有则 None）。"""
+    row = conn.execute(
+        "SELECT volume_id FROM volumes WHERE disk_id=? AND partition_index IS ?"
+        " ORDER BY volume_id LIMIT 1", (disk_id, partition_index)).fetchone()
+    return row[0] if row else None
+
+
+def preferred_disk_serial(physical_serial: "str | None",
+                          probe_serial: "str | None") -> str:
+    """新盘命名序列号：物理序列号可用优先，其次探测序列号；都不可用返回 ''。"""
+    for cand in ((physical_serial or "").strip(), (probe_serial or "").strip()):
+        if _usable_serial(cand):
+            return _sanitize_serial(cand)
+    return ""
 
 
 def ensure_volume(conn: sqlite3.Connection, volume_id: str, disk_id: str, **fields: Any) -> None:
