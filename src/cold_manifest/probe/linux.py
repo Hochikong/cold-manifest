@@ -261,12 +261,15 @@ def probe_path_linux(
             cands, si = resolve_smart_device(
                 expected_serial=probe_serial or None,
                 expected_capacity_bytes=disk_info.capacity_bytes,
-                expected_model=lsblk_model or None)
+                expected_model=lsblk_model or None,
+                expected_interface=str(disk_node.get("tran") or "").strip()
+                or None)
             amb = si.get("identity_ambiguity")
             mapped_by = si.get("mapped_by")
             # 身份已验证的三种口径：序列号精确匹配 / 环境覆盖 / 按容量唯一
             # 匹配（expected 是盒 ID、SMART 唯一读到真盘序列号且容量吻合）
             verified = mapped_by in ("serial_match", "env_override",
+                                     "letter_direct",
                                      "unique_capacity_match") and not amb
             disk_info.identity_ambiguity = amb
             disk_info.identity_verified = verified
@@ -292,7 +295,12 @@ def probe_path_linux(
                 rsi["identity_warnings"] = list(warnings)
                 disk_info.smart_scan_info = rsi
             else:
-                res = read_smart_verbose(devices=cands)
+                res = read_smart_verbose(
+                    devices=cands,
+                    expect_interface=str(disk_node.get("tran") or "").strip()
+                    or None,
+                    expect_capacity_bytes=disk_info.capacity_bytes,
+                    expect_model=lsblk_model or None)
                 disk_info.smart_attempts = res.get("attempts") or None
                 rsi = dict(res.get("scan_info") or {})
                 for k in ("mapped_by", "identity_risk", "identity_ambiguity",

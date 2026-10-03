@@ -298,6 +298,10 @@ def probe_path_win(
                 expected_serial=probe_serial or None,
                 expected_capacity_bytes=info.capacity_bytes,
                 expected_model=str(disk_raw.get("model") or "").strip() or None,
+                expected_interface=str(disk_raw.get("busType")
+                                       or disk_raw.get("interface")
+                                       or info.interface_type or "").strip()
+                or None,
                 disk_index=idx if isinstance(idx, int) else None,
                 letter=letter)
             amb = si.get("identity_ambiguity")
@@ -305,6 +309,7 @@ def probe_path_win(
             # 身份已验证的三种口径：序列号精确匹配 / 环境覆盖 / 按容量唯一
             # 匹配（expected 是盒 ID、SMART 唯一读到真盘序列号且容量吻合）
             verified = mapped_by in ("serial_match", "env_override",
+                                     "letter_direct",
                                      "unique_capacity_match") and not amb
             info.identity_ambiguity = amb
             info.identity_verified = verified
@@ -330,7 +335,15 @@ def probe_path_win(
                 rsi["identity_warnings"] = list(warnings)
                 info.smart_scan_info = rsi
             else:
-                res = read_smart_verbose(devices=cands)
+                res = read_smart_verbose(
+                    devices=cands,
+                    expect_interface=str(disk_raw.get("busType")
+                                         or disk_raw.get("interface")
+                                         or info.interface_type or "").strip()
+                    or None,
+                    expect_capacity_bytes=info.capacity_bytes,
+                    expect_model=str(disk_raw.get("model") or "").strip()
+                    or None)
                 info.smart_attempts = res.get("attempts") or None
                 rsi = dict(res.get("scan_info") or {})
                 for k in ("mapped_by", "identity_risk", "identity_ambiguity",
