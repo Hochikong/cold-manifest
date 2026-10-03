@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import json
+
 from cold_manifest.api import routes_disks as rd
 
 
@@ -51,17 +53,28 @@ def test_perfect_agreement_wmi_verified() -> None:
     assert it["volumes"][0]["label"] == "System"
 
 
-def test_storage_serial_wins() -> None:
-    """Get-Disk 自带序列号 → serial_source=storage，WMI serial 不覆盖。"""
+def test_storage_serial_fallback_when_wmi_unavailable() -> None:
+    """WMI 不可得/未通过 Index+Size 双匹配 → 回退 Get-Disk 自报（storage）。
+
+    Get-Disk 的序列号在部分 USB 桥上是盒子 ID 而非真盘序列号，所以它只是
+    回退位：只有 WMI 双匹配失败时才采用。"""
+    # WMI 缺失
     items = rd._join_attached(
-        [disk(1, serial="WD_ABC123", size=4000787030016)],
-        [],
-        [wmi(1, "WDC HDD", serial="WRONG_PLACEHOLDER", size=4000787030016)],
-    )
+        [disk(1, serial="WD_ABC123", size=4000787030016)], [], [])
     it = items[0]
     assert it["serial"] == "WD_ABC123"
     assert it["serial_source"] == "storage"
     assert it["serial_verified"] is True
+    # WMI Index 命中但 Size 不符 → 双匹配失败，同样回退 storage
+    items2 = rd._join_attached(
+        [disk(1, serial="WD_ABC123", size=4000787030016)],
+        [],
+        [wmi(1, "WDC HDD", serial="WRONG_PLACEHOLDER", size=999)],
+    )
+    it2 = items2[0]
+    assert it2["serial"] == "WD_ABC123"
+    assert it2["serial_source"] == "storage"
+    assert it2["serial_verified"] is True
 
 
 def test_mismatched_index_size_no_cross_wiring() -> None:
@@ -82,15 +95,16 @@ def test_mismatched_index_size_no_cross_wiring() -> None:
     )
     a = next(i for i in items if i["disk_number"] == 0)
     b = next(i for i in items if i["disk_number"] == 1)
-    # A 盘：Index=0 的 WMI 行 Size 相同 → 匹配上；但 Storage serial 优先且可信
-    assert a["serial"] == "SERIAL_OF_A"
-    assert a["serial_source"] == "storage"
+    # 两块盘的 WMI 行 Index+Size 双匹配都通过（同 Size 多盘时这正是歧义所在），
+    # 按新优先级 serial 取 WMI 值
+    assert a["serial"] == "B_PLACE"
+    assert a["serial_source"] == "wmi_verified"
     assert [v["path"] for v in a["volumes"]] == ["E:\\"]
-    # B 盘同理，绝不允许出现“A 盘序列号 + B 盘卷”的组合
-    assert b["serial"] == "SERIAL_OF_B"
+    # 卷始终按 Get-Disk.Number 关联，绝不允许出现“A 盘序列号 + B 盘卷”
+    assert b["serial"] == "A_REAL"
+    assert b["serial_source"] == "wmi_verified"
     assert [v["path"] for v in b["volumes"]] == ["F:\\"]
-    # Index+Size 双匹配的 WMI 型号（同 Size 多盘时型号可能仍歧义，但 serial
-    # 永远以 Storage 自报为准，这正是本修复要保证的不变量）
+    # 双匹配的 WMI 型号随行取用
     assert b["model"] == "Model A"
     # 反向情形：Storage 无 serial 且 Index 命中但 Size 不符 → serial 留空
     items2 = rd._join_attached(
@@ -183,11 +197,12 @@ def test_realistic_user_data_no_miswiring() -> None:
 
     c = by_num[0]
     assert c["serial"] == "0025_3844_51B1_4EFD."
-    assert c["serial_source"] == "storage"
+    assert c["serial_source"] == "wmi_verified"
     assert [v["path"] for v in c["volumes"]] == ["C:\\"]
 
     sg = by_num[1]
     assert sg["serial"] == "ZR30A1VK"
+    assert sg["serial_source"] == "wmi_verified"
     assert [v["path"] for v in sg["volumes"]] == ["X:\\"]
 
     usb = by_num[2]
@@ -274,7 +289,381 @@ def test_user_machine_parity_index_number_agree() -> None:
                 "\\\\.\\PhysicalDrive3"):
         assert by_dev[dev]["serial_verified"] is True
         assert by_dev[dev]["wmi_matched"] is True
-        assert by_dev[dev]["serial_source"] == "storage"
+        assert by_dev[dev]["serial_source"] == "wmi_verified"
+
+
+def test_toshiba_box_id_vs_real_serial() -> None:
+    """用户真实形态（4T 东芝移动盘）：Get-Disk.SerialNumber 报的是盒子 ID
+    （20260123004775F），真盘序列号 16NDT0O1T 只有 ATA 直通/WMI 能读到。
+
+    快选里必须优先展示真盘序列号：WMI Index+Size 双匹配通过 → 用 WMI 值。"""
+    size = 4000787030016
+    box_id, real = "20260123004775F", "16NDT0O1T"
+    d = disk(4, serial=box_id, name="TOSHIBA External USB", size=size, bus="USB")
+
+    # WMI 双匹配通过 → 真盘序列号胜出
+    items = rd._join_attached(
+        [d], [], [wmi(4, "TOSHIBA External USB 3.0", serial=real, size=size)])
+    it = items[0]
+    assert it["serial"] == real
+    assert it["serial_source"] == "wmi_verified"
+    assert it["serial_verified"] is True
+    assert it["wmi_matched"] is True
+
+    # WMI 缺失 → 回退存储层（此处只能是盒子 ID，但聊胜于无）
+    it2 = rd._join_attached([d], [], [])[0]
+    assert it2["serial"] == box_id
+    assert it2["serial_source"] == "storage"
+    assert it2["serial_verified"] is True
+
+    # WMI Index 命中但 Size 不符 → 双匹配失败，同样回退 storage
+    it3 = rd._join_attached(
+        [d], [], [wmi(4, "TOSHIBA External USB 3.0", serial=real, size=999)])[0]
+    assert it3["serial"] == box_id
+    assert it3["serial_source"] == "storage"
+
+    # 占位序列号（两侧都报 0123456789ABCDEF）→ serial 留空 + 原值进 raw
+    it4 = rd._join_attached(
+        [disk(5, serial="0123456789ABCDEF", size=1)],
+        [],
+        [wmi(5, "JMicron Generic", serial="0123456789ABCDEF", size=1)])[0]
+    assert it4["serial"] == ""
+    assert it4["serial_source"] == ""
+    assert it4["serial_verified"] is False
+    assert it4["serial_unverified_raw"] == "0123456789ABCDEF"
+
+
+def test_real_size_tolerance_same_disk() -> None:
+    """真机数值夹具：Get-Disk 与 Win32_DiskDrive 对同一块盘报的 Size 并不
+    相等（4T 东芝差 ~2.6MB；JMicron 盒差 ~2.6MB），容差匹配须通过；
+    且这两块 USB 盒在两个 API 里报的都是盒子 ID——序列号留系统枚举值时
+    由前端标注"系统枚举 ID，可能是盒子 ID"，后端只保证不冒充真盘序列号。"""
+    # 4T 东芝：Get-Disk 4000787027968 vs Win32 4000784417280
+    gd_4t, wmi_4t = 4000787027968, 4000784417280
+    assert rd._size_matches(gd_4t, wmi_4t)
+    items = rd._join_attached(
+        [disk(3, serial="20260123004775F", name="TOSHIBA External USB",
+              size=gd_4t, bus="USB")],
+        [],
+        [wmi(3, "TOSHIBA External USB 3.0", serial="20260123004775F",
+             size=wmi_4t)])
+    it = items[0]
+    # 两个 API 报的都是盒子 ID → WMI 双匹配通过但值相同，仍是盒子 ID；
+    # wmi_matched=True（对号），可识别性交由前端标注
+    assert it["serial"] == "20260123004775F"
+    assert it["serial_source"] == "wmi_verified"
+    assert it["wmi_matched"] is True
+    assert it["size_bytes"] == gd_4t
+
+    # JMicron 盒：2000398934016 vs 2000396321280，两侧都是占位号
+    gd_jms, wmi_jms = 2000398934016, 2000396321280
+    assert rd._size_matches(gd_jms, wmi_jms)
+    it2 = rd._join_attached(
+        [disk(2, serial="0123456789ABCDEF", name="JMicron Generic",
+              size=gd_jms, bus="USB")],
+        [],
+        [wmi(2, "JMicron Generic", serial="0123456789ABCDEF", size=wmi_jms)])[0]
+    assert it2["serial"] == ""
+    assert it2["serial_verified"] is False
+    assert it2["serial_unverified_raw"] == "0123456789ABCDEF"
+    assert it2["wmi_matched"] is True
+
+    # 容差之外仍拒绝：不同容量（>1% 且 >16MB）不得匹配
+    assert not rd._size_matches(4000787027968, 500107862016)
+    assert not rd._size_matches(8001563222016, 4000787027968)
+    # 恰好超绝对上限（16MB+1）也不行
+    assert not rd._size_matches(2000398934016, 2000398934016 + 16 * 1024 * 1024 + 1)
+
+
+def test_smartctl_letter_first_real_fixtures(monkeypatch) -> None:
+    """真机夹具：smartctl 直接吃盘符——`smartctl -i -j C:` 返回精确型号 +
+    真序列号（与 /dev/sdX 一致）。快选取数盘符优先，scan-open 映射只是
+    无盘符/打不开时的退路；容量只用于排除不符。"""
+    reads: "list[tuple]" = []
+
+    def fake_read(device, dtype, expect_size):
+        reads.append((device, dtype, expect_size))
+        if device == "C:" and dtype == "":
+            return {"serial": "YMB51T0RA2534100PL", "model": "YMTC",
+                    "device": "C:", "device_type": ""}
+        if device == "E:" and dtype == "":
+            return {"serial": "BTKA23811GZ2512A", "model": "INTEL SSD",
+                    "device": "E:", "device_type": ""}
+        return None  # -d sat 对盘符不适用等情形 → 链内下一类型/下一盘符
+
+    monkeypatch.setattr(rd, "_smartctl_read_identity", fake_read)
+    monkeypatch.setattr(rd, "_smartctl_scan_entries",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("盘符可读就不该碰 scan-open")))
+    items = rd._join_attached(
+        [disk(0, serial="20260123004775F", name="Host SSD", size=250059350016),
+         disk(4, serial="BOXID000000", name="INTEL USB", size=500107862016,
+              bus="USB")],
+        [part(0, "C", 1, 1), part(4, "E", 1, 1)],
+        [])
+    rd._smartctl_attach_serials(items, [])
+    by_num = {i["disk_number"]: i for i in items}
+
+    c = by_num[0]
+    assert c["serial"] == "YMB51T0RA2534100PL"
+    assert c["serial_source"] == "smartctl"
+    assert c["serial_verified"] is True
+    assert c["system_serial"] == "20260123004775F"
+
+    e = by_num[4]
+    assert e["serial"] == "BTKA23811GZ2512A"
+    assert e["serial_source"] == "smartctl"
+    assert e["serial_verified"] is True
+
+    # 首选就是裸盘符 -i -j C:（类型兜底链在裸盘符失败后才启用）
+    assert reads[0] == ("C:", "", 250059350016)
+    assert any(r[0] == "E:" and r[1] == "" for r in reads)
+
+
+def test_smartctl_letter_fallback_to_scan(monkeypatch) -> None:
+    """盘符打不开 → 退回 scan-open 映射 + 容量复核；scan 也无果 → 回退
+    系统值 + verified=False + 警告一次。"""
+    scan_called: "list" = []
+
+    def fake_read(device, dtype, expect_size):
+        if device == "/dev/pd2":
+            return {"serial": "X0DG6A2GS", "model": "JMicron",
+                    "device": "/dev/pd2", "device_type": "usbjmicron"}
+        return None  # 盘符 X: 等一律打不开
+
+    monkeypatch.setattr(rd, "_smartctl_read_identity", fake_read)
+
+    def fake_scan():
+        scan_called.append(1)
+        return [{"name": "/dev/pd2", "type": "usbjmicron"}]
+
+    monkeypatch.setattr(rd, "_smartctl_scan_entries", fake_scan)
+    items = rd._join_attached(
+        [disk(2, serial="0123456789ABCDEF", name="JMicron Generic",
+              size=2000398934016, bus="USB")],
+        [part(2, "X", 1, 1)], [])
+    warns: list = []
+    rd._smartctl_attach_serials(items, warns)
+    # 盘符 X: 打不开 → scan 映射读到 ATA 值
+    assert scan_called
+    assert items[0]["serial"] == "X0DG6A2GS"
+    assert items[0]["serial_source"] == "smartctl"
+    assert items[0]["serial_verified"] is True
+    assert items[0]["system_serial"] == ""  # 系统侧是占位号，无系统值可留
+    assert items[0]["serial_unverified_raw"] == ""  # 无 WMI 行，raw 本就为空
+    assert warns == []
+
+    # scan 也无果（映射不上）→ 回退系统值 + verified=False + 警告
+    monkeypatch.setattr(rd, "_smartctl_scan_entries", lambda: [])
+    items2 = rd._join_attached(
+        [disk(2, serial="0123456789ABCDEF", name="JMicron Generic",
+              size=2000398934016, bus="USB")],
+        [part(2, "X", 1, 1)], [])
+    warns2: list = []
+    rd._smartctl_attach_serials(items2, warns2)
+    # 占位号在 _join_attached 已判空：serial 留空 + verified=False + 警告
+    assert items2[0]["serial"] == ""
+    assert items2[0]["serial_verified"] is False
+    assert warns2 and "smartctl 不可用" in warns2[0]
+
+
+def test_smartctl_attach_real_fixtures(monkeypatch) -> None:
+    """快选层 ATA 真序列号夹具（用户三块盘）：
+    4T 东芝 → 16NDT0O1T；JMicron 盒 → X0DG6A2GS；WD → 23024Q800919。
+
+    serial 优先 ATA 值（smartctl/verified=True），系统枚举值（盒子 ID）
+    挪进 system_serial；_join_attached 的中间值经 _smartctl_attach_serials
+    就地增强。"""
+    scan = [{"name": "/dev/pd1", "type": "sat"},
+            {"name": "/dev/pd2", "type": "usbjmicron"},
+            {"name": "/dev/pd3", "type": "sat"}]
+    monkeypatch.setattr(rd, "_smartctl_scan_entries", lambda: scan)
+    idents = {
+        1: {"serial": "23024Q800919", "model": "WD Blue SN570",
+            "device": "/dev/pd1", "device_type": "sat"},
+        2: {"serial": "X0DG6A2GS", "model": "JMicron Generic",
+            "device": "/dev/pd2", "device_type": "usbjmicron"},
+        3: {"serial": "16NDT0O1T", "model": "TOSHIBA External USB 3.0",
+            "device": "/dev/pd3", "device_type": "sat"},
+    }
+
+    def fake_read(device, dtype, expect_size):
+        for num, ident in idents.items():
+            if device.endswith(f"pd{num}"):
+                return ident
+        return None
+
+    monkeypatch.setattr(rd, "_smartctl_read_identity", fake_read)
+    size = 4000787030016
+    items = rd._join_attached(
+        [disk(1, serial="1C42AA1WSL1", name="WD Blue SN570", size=250059350016),
+         disk(2, serial="0123456789ABCDEF", name="JMicron Generic",
+              size=2000398934016, bus="USB"),
+         disk(3, serial="20260123004775F", name="TOSHIBA External USB",
+              size=size, bus="USB")],
+        [],
+        [wmi(3, "TOSHIBA External USB 3.0", serial="20260123004775F",
+             size=4000784417280)])
+    rd._smartctl_attach_serials(items, [])
+    by_num = {i["disk_number"]: i for i in items}
+
+    wd = by_num[1]
+    assert wd["serial"] == "23024Q800919"
+    assert wd["serial_source"] == "smartctl"
+    assert wd["serial_verified"] is True
+    assert wd["system_serial"] == "1C42AA1WSL1"
+    assert wd["model"] == "WD Blue SN570"
+
+    jms = by_num[2]
+    assert jms["serial"] == "X0DG6A2GS"
+    assert jms["serial_source"] == "smartctl"
+    assert jms["serial_verified"] is True
+    # 占位号被 ATA 值顶掉，不再留档
+    assert jms["serial_unverified_raw"] == ""
+
+    tosh = by_num[3]
+    assert tosh["serial"] == "16NDT0O1T"
+    assert tosh["serial_source"] == "smartctl"
+    assert tosh["serial_verified"] is True
+    assert tosh["system_serial"] == "20260123004775F"  # 盒子 ID 留档给前端标注
+    assert tosh["wmi_matched"] is True  # 容差复核仍成立
+
+
+def test_smartctl_attach_fallbacks(monkeypatch) -> None:
+    """无 smartctl / 非管理员 / 容量对不上 → 回退系统枚举值且 verified=False。"""
+    size = 4000787030016
+    base_items = lambda: rd._join_attached(  # noqa: E731
+        [disk(3, serial="20260123004775F", name="TOSHIBA", size=size,
+              bus="USB")],
+        [],
+        [wmi(3, "TOSHIBA External USB 3.0", serial="20260123004775F",
+             size=size)])
+
+    # ① smartctl 缺失/扫描失败 → 警告 + 全部 verified=False
+    monkeypatch.setattr(rd, "_smartctl_scan_entries", lambda: [])
+    items = base_items()
+    warns: list = []
+    rd._smartctl_attach_serials(items, warns)
+    assert items[0]["serial"] == "20260123004775F"
+    assert items[0]["serial_source"] == "wmi_verified"
+    assert items[0]["serial_verified"] is False
+    assert items[0]["system_serial"] == ""
+    assert warns and "smartctl 不可用" in warns[0]
+
+    # ② 读失败（非管理员/设备打不开，read 返回 None）→ 同样回退
+    monkeypatch.setattr(rd, "_smartctl_scan_entries",
+                        lambda: [{"name": "/dev/pd3", "type": "sat"}])
+    monkeypatch.setattr(rd, "_smartctl_read_identity", lambda *a: None)
+    items2 = base_items()
+    rd._smartctl_attach_serials(items2, [])
+    assert items2[0]["serial"] == "20260123004775F"
+    assert items2[0]["serial_verified"] is False
+
+    # ③ 容量复核不过（scan 下标撞上别的盘）→ read 内部已挡，这里验证映射兜底
+    assert rd._smartctl_device_for({"disk_number": 1}, scan := [
+        {"name": "/dev/sdz", "type": "sat"}]) is None  # 下标越界且无 pd 名
+
+
+def test_smartctl_read_identity_unit(monkeypatch) -> None:
+    """_smartctl_read_identity：-i -j 解析 / exit_status 位判 / 容量复核。"""
+    import json as _json
+    import subprocess
+
+    class P:
+        def __init__(self, payload, rc=0):
+            self.stdout = (_json.dumps(payload).encode("utf-8")
+                           if isinstance(payload, dict) else payload)
+            self.stderr = b""
+            self.returncode = rc
+
+    def run_ok(cmd, **k):
+        assert cmd[:1] == ["smartctl"] and cmd[-2:] == ["-i", "-j"]
+        assert "-d" in cmd and "sat" in cmd
+        return P({"serial_number": "16NDT0O1T",
+                  "model_name": "TOSHIBA External USB 3.0",
+                  "user_capacity": {"bytes": 4000784417280}})
+
+    monkeypatch.setattr(subprocess, "run", run_ok)
+    ident = rd._smartctl_read_identity("/dev/pd3", "sat", 4000787027968)
+    assert ident is not None
+    assert ident["serial"] == "16NDT0O1T"
+    assert ident["model"] == "TOSHIBA External USB 3.0"
+    # 容差复核：真机数值（差 ~2.6MB）通过，异盘容量被拒
+    assert rd._smartctl_read_identity("/dev/pd3", "sat", 500107862016) is None
+
+    # bit1 设备打不开（非管理员）→ None
+    monkeypatch.setattr(subprocess, "run",
+                        lambda cmd, **k: P({}, rc=2))
+    assert rd._smartctl_read_identity("/dev/pd3", "sat", 1) is None
+    # bit4（健康告警位）不算致命
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **k: P({
+        "serial_number": "Z9Y8X7W6", "user_capacity": {"bytes": 10}}, rc=8))
+    assert rd._smartctl_read_identity("/dev/pd3", "sat", 10) is not None
+    # ATA 序列号是占位号 → 视为没读到
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **k: P({
+        "serial_number": "0123456789ABCDEF",
+        "user_capacity": {"bytes": 10}}))
+    assert rd._smartctl_read_identity("/dev/pd3", "sat", 10) is None
+
+
+def test_smartctl_device_mapping() -> None:
+    """scan-open 下标 + /dev/pdN 名字直配，每盘只出一个候选。"""
+    entries = [{"name": "/dev/sda", "type": "sat"},
+               {"name": "/dev/pd1", "type": "sat"},
+               {"name": "/dev/sdc", "type": "usbjmicron"}]
+    # pdN 名字直配优先
+    assert rd._smartctl_device_for({"disk_number": 1}, entries) == entries[1]
+    # 无 pd 名 → 下标兜底（盘号 0 → 第 0 条）
+    assert rd._smartctl_device_for({"disk_number": 0}, entries) == entries[0]
+    assert rd._smartctl_device_for({"disk_number": 2}, entries) == entries[2]
+    # 越界且无 pdN → 无候选（回退系统值）
+    assert rd._smartctl_device_for({"disk_number": 9}, entries) is None
+    assert rd._smartctl_device_for({"disk_number": None}, entries) is None
+
+
+def test_drive_letter_never_cached_or_persisted(monkeypatch) -> None:
+    """盘符约束：①盘符只作当场读身份，同一盘符换盘后必须读到新盘的
+    序列号（无跨请求"盘符→序列号"缓存）；②盘符绝不进任何身份字段
+    （身份锚点只有序列号，响应项里不含盘符）。"""
+    # 无任何模块级缓存结构（__cached__ 是 import 机制产物，忽略）
+    assert not [n for n in vars(rd)
+                if "cache" in n.lower() and n != "__cached__"]
+    current = {"serial": "YMB51T0RA2534100PL"}  # C: 当场读到谁就是谁
+
+    def fake_read(device, dtype, expect_size):
+        if device == "C:":
+            return {"serial": current["serial"], "model": "YMTC",
+                    "device": device, "device_type": dtype}
+        return None
+
+    monkeypatch.setattr(rd, "_smartctl_read_identity", fake_read)
+    monkeypatch.setattr(rd, "_smartctl_scan_entries", lambda: [])
+
+    def one_request() -> dict:
+        items = rd._join_attached(
+            [disk(0, serial="SYS0", name="Host", size=1)],
+            [part(0, "C", 1, 1)], [])
+        warns: list = []
+        rd._smartctl_attach_serials(items, warns)
+        return items[0]
+
+    first = one_request()
+    assert first["serial"] == "YMB51T0RA2534100PL"
+
+    # 同一盘符 C: 背后换了盘 → 下一次现场读必须拿到新序列号
+    current["serial"] = "BTKA23811GZ2512A"
+    second = one_request()
+    assert second["serial"] == "BTKA23811GZ2512A"
+    assert second["system_serial"] == "SYS0"
+
+    # 盘符不得出现在任何身份字段（身份锚点只有序列号）
+    for it in (first, second):
+        blob = json.dumps({k: v for k, v in it.items() if k != "volumes"})
+        assert "C:" not in blob
+        for k in ("serial", "system_serial", "serial_unverified_raw"):
+            assert not str(it[k]).endswith(":")
+            assert it[k] != "C:"
+        assert it["device"] == "\\\\.\\PhysicalDrive0"  # 设备串不含盘符
 
 
 def test_attached_win_joins_and_degrades(monkeypatch) -> None:
@@ -309,3 +698,40 @@ def test_attached_win_joins_and_degrades(monkeypatch) -> None:
     assert body["available"] is False
     assert "Get-Disk: boom" in body["reason"]
     assert body["items"] == []
+
+
+def test_smartctl_calls_use_resolved_executable(monkeypatch) -> None:
+    """回归：盘符直读与扫描都必须用 `smart.smartctl_exec()` 解析出的可执行文件。
+
+    真机踩过：两处都曾写死 `["smartctl", ...]`——Windows 上 smartctl 通常不在
+    PATH（用户按完整路径调用），于是 ATA 直读整条静默失败，快选退回系统枚举值
+    （盒子 ID），"盘符直读真序列号"形同虚设。
+    """
+    import json as _json
+
+    from cold_manifest import smart
+    from cold_manifest.api import routes_disks as rd
+
+    monkeypatch.setattr(smart, "smartctl_exec", lambda: "/opt/fake/smartctl")
+    seen: "list[list[str]]" = []
+
+    class _P:
+        def __init__(self, payload):
+            self.returncode = 0
+            self.stdout = _json.dumps(payload).encode()
+            self.stderr = b""
+
+    def _run(cmd, **kw):
+        seen.append(list(cmd))
+        if "-i" in cmd:
+            return _P({"serial_number": "X0DG6A2GS",
+                       "model_name": "TOSHIBA HDWD120",
+                       "user_capacity": {"bytes": 2000398934016}})
+        return _P({"devices": [{"name": "/dev/sdc", "type": "sat"}]})
+
+    monkeypatch.setattr("subprocess.run", _run)
+
+    ident = rd._smartctl_read_identity("E:", "", 2000398934016)
+    assert ident and ident["serial"] == "X0DG6A2GS"
+    rd._smartctl_scan_entries()
+    assert seen and all(c[0] == "/opt/fake/smartctl" for c in seen), seen

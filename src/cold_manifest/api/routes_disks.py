@@ -259,16 +259,27 @@ def _is_placeholder_serial(s: str) -> bool:
     return False
 
 
+def _size_matches(a: int, b: int) -> bool:
+    """同盘尺寸容差匹配：同一块盘两个 API 报的 Size 并不相等
+    （4T: Get-Disk 4000787027968 vs Win32 4000784417280，差 ~2.6MB），
+    相对差 ≤1% 且绝对差 ≤16MB 才认是同一块盘（取更严者）。"""
+    diff = abs(a - b)
+    return diff <= 16 * 1024 * 1024 and diff <= max(a, b) * 0.01
+
+
 def _join_attached(disks: Any, parts: Any, wmi: Any,
                    logical_disks: Any = None) -> "list[dict]":
     """三源关联（可单测）：以 Get-Disk.Number 为唯一主键。
 
     - 卷：Get-Partition.DiskNumber == Number（同一 Storage 体系，可信）；
-    - Win32_DiskDrive：必须 **Index 与 Size 同时匹配** 才认是同一块盘，
-      匹配不上绝不使用 WMI 的 model/serial（Index 单独相等不够——那正是
-      本 bug 的根源）；WMI 缺失/匹配不上 → 退化 Storage-only。
-    - 序列号可信性：serial_source ∈ storage（Get-Disk 自报，天然对号）|
-      wmi_verified（Storage 无序列号、WMI Index+Size 双匹配后取 WMI 值）|
+    - Win32_DiskDrive：必须 **Index 严格相等且 Size 容差匹配** 才认是同一块
+      盘（真机证据：同盘两 API 报的 Size 差 ~2.6MB，Size 须用
+      _size_matches 容差而非严格相等）；匹配不上绝不使用 WMI 的 model/serial
+      （Index 单独相等不够——那正是本 bug 的根源）；WMI 缺失/匹配不上 →
+      退化 Storage-only。
+    - 序列号可信性：serial_source ∈ wmi_verified（WMI Index+Size 双匹配，优先
+      —— Get-Disk 的序列号在部分 USB 桥上是盒子 ID 而非真盘序列号）|
+      storage（WMI 不可得/未匹配，Get-Disk 自报）|
       ""；serial_verified 相应 true/false。拿不到可信序列号时 serial 留空，
       WMI 原始值放 serial_unverified_raw 仅供诊断（可能是别的盘的）。
     """
@@ -303,16 +314,20 @@ def _join_attached(disks: Any, parts: Any, wmi: Any,
                 continue
             wmi_index_hit = wmi_index_hit or w
             wsize = _to_int(w.get("Size"))
-            if size and wsize and size == wsize:
+            if size and wsize and _size_matches(size, wsize):
                 wrow = w
                 break
-        serial = _clean_serial(d.get("SerialNumber"))
-        serial_source, serial_verified = ("storage", True) if serial else ("", False)
+        # 序列号优先级：WMI（Index+Size 双匹配通过）优先于存储层（Get-Disk）。
+        # Get-Disk.SerialNumber 在部分 USB 桥上可能是盒子 ID 而非真盘序列号
+        # （CrystalDiskInfo/ATA 直通读到的是后者），因此双匹配可信的 WMI 值
+        # 优先；WMI 不可得/未通过双匹配再回退 Get-Disk 自报值。
+        serial = _clean_serial((wrow or {}).get("SerialNumber"))
+        if serial:
+            serial_source, serial_verified = "wmi_verified", True
+        else:
+            serial = _clean_serial(d.get("SerialNumber"))
+            serial_source, serial_verified = ("storage", True) if serial else ("", False)
         serial_unverified_raw = ""
-        if not serial and wrow is not None:
-            wserial = _clean_serial(wrow.get("SerialNumber"))
-            if wserial:
-                serial, serial_source, serial_verified = wserial, "wmi_verified", True
         if not serial:
             raw = str((wmi_index_hit or {}).get("SerialNumber") or "").strip()
             if raw:
@@ -326,6 +341,7 @@ def _join_attached(disks: Any, parts: Any, wmi: Any,
             "serial_source": serial_source,
             "serial_verified": serial_verified,
             "serial_unverified_raw": serial_unverified_raw,
+            "system_serial": "",
             "wmi_matched": wrow is not None,
             "size_bytes": size,
             "bus_type": str(d.get("BusType") or ""),
@@ -334,6 +350,178 @@ def _join_attached(disks: Any, parts: Any, wmi: Any,
             "volumes": vols,
         })
     return items
+
+
+def _smartctl_scan_entries() -> "list[dict]":
+    """smartctl --scan-open -j 一次（回退 --scan -j）。
+
+    返回 devices 条目列表（name/type/…）；smartctl 缺失/失败 → []。
+    空结果不缓存失败的形态（每次调用现扫，量级 ≤20 盘可接受）。"""
+    import subprocess
+
+    from ..probe.windows import _decode
+    from ..smart import smartctl_exec
+
+    exe = smartctl_exec()
+    if not exe:
+        return []
+    for args in (["--scan-open", "-j"], ["--scan", "-j"]):
+        try:
+            proc = subprocess.run([exe, *args],
+                                  capture_output=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if not proc.stdout.strip():
+            continue
+        try:
+            data = json.loads(_decode(proc.stdout))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        devs = [d for d in _as_list(data.get("devices"))
+                if str(d.get("name") or "").strip()]
+        if devs:
+            return devs
+    return []
+
+
+def _smartctl_device_for(item: dict, entries: "list[dict]") -> "dict | None":
+    """每盘映射 smartctl 设备：scan-open 下标优先（下标 == 盘号），其次
+    /dev/pdN 名字直配（Windows PhysicalDriveN）。每盘只挑一个候选。"""
+    num = item.get("disk_number")
+    if num is None:
+        return None
+    for e in entries:
+        if str(e.get("name") or "").rstrip("/").endswith(f"pd{num}"):
+            return e
+    if 0 <= num < len(entries):
+        return entries[num]
+    return None
+
+
+def _smartctl_read_identity(device: str, dtype: str,
+                            expect_size: int) -> "dict | None":
+    """smartctl <dev> [-d <type>] -i -j 读一次：取 ATA 真序列号/型号。
+
+    容量容差复核（同盘两个 API 报的 Size 本就不等，用 _size_matches），
+    容量不符 → 不是这块盘，返回 None。exit_status 低 2 位有致命错误
+    （命令行错/打不开设备，如非管理员）→ None。"""
+    import subprocess
+
+    from ..probe.windows import _decode
+    from ..smart import smartctl_exec
+
+    exe = smartctl_exec()
+    if not exe:
+        return None
+    cmd = [exe, device]
+    t = str(dtype or "").strip()
+    if t and t != "auto":
+        cmd += ["-d", t]
+    cmd += ["-i", "-j"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode & 0x3:  # bit0 命令行错 / bit1 设备打不开
+        return None
+    try:
+        data = json.loads(_decode(proc.stdout))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    serial = _clean_serial(data.get("serial_number"))
+    if not serial:
+        return None
+    cap = data.get("user_capacity") or {}
+    cap_bytes = cap.get("bytes") if isinstance(cap, dict) else None
+    if expect_size and cap_bytes:
+        try:
+            if not _size_matches(int(expect_size), int(cap_bytes)):
+                return None
+        except (TypeError, ValueError):
+            return None
+    model = str(data.get("model_name") or data.get("model_family")
+                or "").strip()
+    return {"serial": serial, "model": model,
+            "device": device, "device_type": t}
+
+
+def _smartctl_attach_serials(items: "list[dict]",
+                             warnings: "list[str]") -> None:
+    """就地增强：每盘优先用**卷盘符**直接 smartctl -i -j <letter>: 读一次
+    （真机验证：smartctl 接受盘符，返回精确型号 + ATA 真序列号，与
+    /dev/sdX 读数一致），每盘一个盘符内走类型兜底链（"" → sat）。
+
+    盘符打不开/没有盘符/读数不符 → 退回 scan-open 映射 + 容量复核。
+    容量只用于**排除明显不符**，绝不作为认同依据（认同靠盘符/下标）。
+
+    - serial 优先 ATA 值（serial_source="smartctl"、serial_verified=True），
+      否则保留系统枚举值（Get-Disk/WMI——USB 盒上可能是盒子 ID），
+      但 serial_verified=False（非 ATA 直通都算未验证）；
+    - system_serial：serial 与系统值不同时保留系统值（前端标注
+      "系统枚举 ID，可能是盒子 ID"）；
+    - smartctl 全线不可得 → 整体回退，警告一次，不加噪声。"""
+
+    def _apply(it: dict, ident: "dict | None") -> bool:
+        if ident is None:
+            if it.get("serial"):
+                it["serial_verified"] = False
+            return False
+        sys_serial = str(it.get("serial") or "")
+        ata = ident["serial"]
+        it["serial"] = ata
+        it["serial_source"] = "smartctl"
+        it["serial_verified"] = True
+        it["system_serial"] = "" if sys_serial == ata else sys_serial
+        if ident.get("model"):
+            it["model"] = ident["model"]
+        if it.get("serial_unverified_raw") == ata:
+            it["serial_unverified_raw"] = ""
+        return True
+
+    def _letter_reads(it: dict) -> "dict | None":
+        size = int(it.get("size_bytes") or 0)
+        for v in it.get("volumes") or []:
+            letter = str(v.get("drive_letter") or "").strip()
+            if not letter:
+                continue
+            dev = f"{letter}:"
+            for dtype in ("", "sat"):  # 类型兜底链：裸盘符 → -d sat
+                try:
+                    ident = _smartctl_read_identity(dev, dtype, size)
+                except Exception:  # noqa: BLE001
+                    ident = None
+                if ident is not None:
+                    return ident
+        return None
+
+    def _scan_read(it: dict, entries: "list[dict]") -> "dict | None":
+        entry = _smartctl_device_for(it, entries)
+        if entry is None:
+            return None
+        try:
+            return _smartctl_read_identity(
+                str(entry.get("name")), str(entry.get("type") or ""),
+                int(it.get("size_bytes") or 0))
+        except Exception:  # noqa: BLE001
+            return None
+
+    try:
+        entries = _smartctl_scan_entries()
+    except Exception:  # noqa: BLE001 — 枚举绝不能拖垮快选
+        entries = []
+    got_any = False
+    for it in items:
+        if _apply(it, _letter_reads(it)):
+            got_any = True
+            continue
+        if entries and _apply(it, _scan_read(it, entries)):
+            got_any = True
+    if not got_any:
+        for it in items:
+            if it.get("serial"):
+                it["serial_verified"] = False
+        warnings.append("smartctl 不可用（未安装或无管理员权限），"
+                        "序列号为系统枚举值，可能是盒子 ID")
 
 
 def _attached_win() -> dict:
@@ -357,6 +545,7 @@ def _attached_win() -> dict:
                 "warnings": warnings}
     items = _join_attached(disks, data.get("partitions"), data.get("wmi"),
                            data.get("logicalDisks"))
+    _smartctl_attach_serials(items, warnings)
     return {"available": True, "items": items, "count": len(items),
             "warnings": warnings}
 

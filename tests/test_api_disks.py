@@ -530,6 +530,76 @@ def test_preflight_no_serial_blocks_and_matches_collect(
     assert body["probe_serial"] in (None, disk_serial)
 
 
+# ------------------------------------------------- Windows 口径（用户硬规则）
+
+def _win(monkeypatch) -> None:
+    monkeypatch.setattr("cold_manifest.collect._is_windows", lambda: True)
+
+
+def test_preflight_windows_enum_serial_blocks_and_matches_collect(
+        client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    """Windows：只有系统枚举值（serial_source=probe）→ 拦，且与 collect 判据一致；
+    枚举值仍展示（probe_serial），serial_usable 仅表示"看起来可用"，不参与判定。"""
+    from cold_manifest.collect import requires_manual_serial
+
+    _win(monkeypatch)
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(monkeypatch)
+    disk = DiskInfo(bridge_model="JMicron Generic SCSI Device",
+                    interface_type="USB", disk_serial="16NDT0O1T",
+                    serial_source="probe", physical_serial="")
+    monkeypatch.setattr(
+        "cold_manifest.probe.probe_path", lambda p, **kw: (None, disk))
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert body["requires_manual_serial"] == requires_manual_serial(disk)
+    assert body["requires_manual_serial"] is True
+    assert body["manual_serial_reason"]        # 人话提示非空
+    assert body["probe_serial"] == "16NDT0O1T"  # 枚举值仍展示
+    assert body["serial_usable"] is True        # 仅展示口径，不影响判定
+
+
+def test_preflight_windows_smartctl_serial_passes(
+        client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    """Windows：serial_source=smartctl（已验证真序列号）→ 放行。"""
+    from cold_manifest.collect import requires_manual_serial
+
+    _win(monkeypatch)
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(monkeypatch)
+    disk = DiskInfo(bridge_model="Toshiba USB Bridge", interface_type="USB",
+                    disk_serial="16NDT0O1T", serial_source="smartctl",
+                    physical_serial="16NDT0O1T")
+    monkeypatch.setattr(
+        "cold_manifest.probe.probe_path", lambda p, **kw: (None, disk))
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert body["requires_manual_serial"] == requires_manual_serial(disk)
+    assert body["requires_manual_serial"] is False
+    assert body["manual_serial_reason"] == ""
+
+
+def test_preflight_windows_manual_serial_passes(
+        client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    """Windows：手填值（serial_source=manual）→ 放行。"""
+    from cold_manifest.collect import requires_manual_serial
+
+    _win(monkeypatch)
+    target = tmp_path / "disk"
+    target.mkdir()
+    _patch_preflight_sm(monkeypatch)
+    disk = DiskInfo(interface_type="USB", disk_serial="MYDISK123",
+                    serial_source="manual")
+    monkeypatch.setattr(
+        "cold_manifest.probe.probe_path", lambda p, **kw: (None, disk))
+    body = client.post("/api/collect/preflight",
+                       json={"path": str(target)}).json()
+    assert body["requires_manual_serial"] == requires_manual_serial(disk)
+    assert body["requires_manual_serial"] is False
+
+
 def test_preflight_probe_failure_keeps_defaults(client: TestClient,
                                                 tmp_path: Path,
                                                 monkeypatch) -> None:
