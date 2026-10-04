@@ -42,7 +42,12 @@ cp -r frontend/dist "$STAGE/frontend/dist"
 cp packaging/windows/*.cmd "$STAGE/packaging/windows/"
 mkdir -p "$STAGE/packaging/linux"
 cp packaging/linux/*.sh "$STAGE/packaging/linux/"
-cp "docs/Windows-运行说明.md" "docs/Linux-运行说明.md" "docs/Windows-真机复验清单.md" "$STAGE/docs/"
+cp docs/*.md "$STAGE/docs/"
+# 包内 README 引用的界面截图（docs/images/），一并进包，保证链接可用
+if [ -d docs/images ]; then
+  mkdir -p "$STAGE/docs/images"
+  cp docs/images/*.png "$STAGE/docs/images/" 2>/dev/null || true
+fi
 # 清掉开发产物，包内只留干净源码
 find "$STAGE/src" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 rm -rf "$STAGE/src/cold_manifest.egg-info" 2>/dev/null || true

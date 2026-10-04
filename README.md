@@ -1,100 +1,141 @@
-# cold-manifest
+# 冷备清单 cold-manifest
 
-异地冷备磁盘的文件元数据采集与比对工具：扫描冷备盘 → 生成快照 → 浏览/搜索 → 对比两次快照找出新增/变化/丢失（不负责实际数据同步）。CLI 命令名 `cldm`。
+**给冷备份硬盘做「清单 + 比对」的工具**：扫描一次冷备盘，之后随时回答——*这块盘里有什么？比上次多了什么、少了什么、改了什么？*
 
-**当前状态：P0–P3 已完成，P4 用户反馈项已落地**（采集 + 盘上备份 + 按需哈希 + 查重 + diff 口径/证据 + 全局搜索 + Windows 兼容收尾）。规划见 `docs/升级方案-v0.3.md` 与 `docs/UX-架构-v0.3.md`；Windows 注意事项见 `docs/Windows-兼容性排查.md` 与 `docs/Windows-运行说明.md`；开发环境见 `docs/开发环境与测试.md`。
+它**不搬数据**：全程只读你的盘，产出一份可长期保存的清单和可读的差异报告。CLI 命令名 `cldm`。
 
-## 功能一览
+![快照总览](docs/images/overview.png)
 
-- **采集**：单遍 scandir，多分区整盘批次，SSE 进度/取消，断点续采（`--resume`），数据根写锁，采集后自动备份 snapshot.db 到盘上（`_coldmanifest/`）。
-- **浏览/搜索**：目录树懒加载、统计画像（直方图/扩展名 Top/treemap）、单快照前缀/全文搜索（FTS5）、**跨快照全局搜索**（顶栏 `Ctrl/Cmd+K`）。
-- **对比**：后台物化 diff（8 类变更、目录级汇总、证据等级），口径开关（大小写/时间/尺寸/一致项），Windows 大小写改名提示，路径前缀过滤，HTML 报告 + CSV 导出。
-- **按需哈希**：默认关闭；full/sampled 两档、候选指纹、单组精验，`(size, mtime, path)` 缓存；查重三档（文件名/指纹/内容）。
-- **副本校验**：`verify-copy` 抽样/全量校验盘上副本。
-- **导入/登记**：v1 三件套导入；外部 snapshot.db 就地登记（`import-db`）。
-- **磁盘健康**：采集时自动读取 SMART（温度/通电小时/坏道计数，拿得到才写），设备名自动映射（`smartctl --scan` 的 `/dev/sdN` 对应哪块物理盘，程序自动推断，USB 桥盘也能读到真型号）；磁盘页健康卡可「现在读取 SMART」现场诊断（失败给原因：权限/设备打不开/设备类型/超时，并列出每次尝试的设备串与报错）。**机械盘（SATA/ATA）另有完整 SMART 属性表与关键指标**：磁盘页展示 20+ 项 ATA 属性表（可折叠，异常行高亮）与关键指标瓦片（通电次数/负载循环/重分配扇区/待映射扇区/UDMA CRC/读错误率/寻道错误率/起转重试/断电缩回/气流温度/磁头飞行小时等，缺项显示 `—`），外加「技术信息」分组（转速/尺寸/接口速率/SATA·ATA 版本/TRIM 支持等）；「重分配扇区」「UDMA CRC」也进趋势图。设备定位与类型自动判定由 `smartctl --scan-open` 权威给出（`\\.\PhysicalDriveN` 这类 smartctl 不认可的设备名不会使用），管理员权限不足时启动脚本会给出提示与一键提权。**磁盘身份校验**：设备定位按序列号认盘（扫描表逐台读身份打分，盒 ID + 容量/型号能唯一定位也算通过 `unique_capacity_match`，盘号下标只作回退；未通过时给中文原因），SMART 序列号只有身份校验通过才覆盖探测值，注册层检测两块盘被静默合并成一行的身份冲突，`identity-check` 可对既有数据做"串盘"体检（含跨盘序列号别名检查）。**硬盘盒（USB 桥）序列号闸（按可用性判定）**：很多 USB 盒会透传真盘序列号（ATA 直通，与盘体标签一致）；不可靠的是 Windows 系统枚举层（Get-Disk）报的 ID（可能是盒子/桥 ID 或占位号），不能单独作身份依据。**只有既拿不到真盘序列号、也没有可用的系统枚举序列号时**，前端依赖检查才返回 `requires_manual_serial` 禁用「开始采集」，后端提交 400、CLI 退出码 2（含 `--all-partitions` 批次）；能读到可用序列号 → 直接采集，不要求手填。磁盘页身份卡支持**重新校验**（现场重读，三态结果）、**手动确认/撤销**、真盘序列号更正（`disk_serial` 仅零快照盘可改）。**SSD 盘另有专属指标**：剩余寿命百分比、累计写入/读取量（TB）、备用空间、介质错误、异常断电、通电次数、控制器忙时、多温度探头，磁盘页有专门展示区并进趋势图（「寿命剩余 %」「累计写入量」）。
-- **昵称**：给磁盘/分区起速记名（`cldm nickname` 或 `PATCH /api/disks/{id}`、`PATCH /api/volumes/{id}`），比对历史里直接显示昵称而不是一长串 ID。
-- **删除管理**：磁盘/卷删除（**不级联**——名下还有快照或对比时直接拒绝并列出清单，干净了才删）；对比结果删除（删物化库 + 登记行，不影响两侧快照）。
-- **运维**：快照删除（含盘上副本；被对比引用时需勾选强制）、快照库完整性自查（`integrity-check`，区分"假损坏"与真损坏）、catalog 重建（预演 + 执行）、FTS/统计补建。
-- **Web UI**：7 个路由页（总览/快照/对比/磁盘/任务/搜索/设置）；星标置顶、按卷筛选、哈希面板、HTML 报告分节、右键菜单（对比明细按行类别跳对应侧快照）、服务端排序、卷详情抽屉、设置页数据修复卡片、表格列宽可拖拽（按表记忆，表头右键重置）、统一分页控件（行数切换 20/50/100/200 + 上一页/下一页，覆盖对比明细/历史、快照浏览/搜索、全局搜索、重复文件、跳过项、任务；**分页状态可记忆**——每页行数按表存浏览器本地、当前页写进网址 `?page=`，刷新/直接打开链接能自动回到原页）；磁盘页详情面板宽度与表格列宽解耦（拖宽列不会把面板卡片拉长，表格横向滚动时面板保持可见）。
+---
 
-## 真机 UAT 教训速览（2026-10）
+## 它解决什么问题
 
-真机 UAT 证实：**Windows 系统枚举（Get-Disk/WMI）对 USB 盒上报的序列号可能是盒子/桥 ID 或占位号，不可作磁盘身份**；唯一可信的是 smartctl ATA 直通的真盘序列号（可直接用盘符 `smartctl -i -j C:` 读取）。因此：Windows 上读不到 smartctl 已验证的真序列号必须**手填**盘体序列号才能采集；容量只用于排除明显不符、绝不作认同依据（同容量盘并列会读错盘，已加三层防线）；盘符与序列号永不持久绑定。完整案例（现象→根因→解法→提交号）见 `docs/升级方案-v0.3.md`「真机 UAT 问题与解决方案」一节。另：SMART 数值按**语义**展示——希捷属性 240 取真实小时数（`3 (138 89 0)` → 3 h），厂商私有编码的 1/7/195 显示归一化健康值而非原始大数（`52206fb`/`eb80634`）。
+- **冷备盘的"黑箱感"**：盘在柜子里放了一年，谁也说不清里面到底有什么、和另一块盘什么关系。cold-manifest 把每块盘的目录结构、文件清单、大小与时间记录下来，随时可查。
+- **换机、换盘、多盘的核对**：同一块盘在 A 机器采过一次、搬到 B 机器再采一次，或者一块盘拆成两块——两次快照一比，**新增 / 变化 / 丢失**一目了然，还能按目录下钻。
+- **"我以为备份了"**：比对结果带**证据等级**——有哈希佐证、只有大小+时间、还是完全未知，心里有数；重复文件报告能直接告诉你哪些文件白占了几十 GB。
 
-## CLI（`cldm`）
+适合：个人/小团队的多块冷备盘、移动硬盘、USB 硬盘盒；也适合把旧盘数据搬到新盘后做一次验收。
 
-```
-serve             启动 Web 服务（默认 0.0.0.0:8765）
-collect           采集快照（--resume --cross-filesystems --all-partitions --exclude-glob ...；
-                  盘拿不到可用序列号（真盘与系统枚举都没有）时才要求 --serial，否则 rc=2）
-import-legacy     导入 v1 三件套 CSV
-import-db         就地登记外部 snapshot.db（--copy 才拷入数据根）
-diff              对比两快照（--hash --case-insensitive --ignore-mtime --ignore-size --show-identical）
-export            导出 CSV / v1 同构三件套 zip
-report            快照自包含 HTML 报告
-hash              按需哈希（--policy full|sampled --candidates --group --limit --root）
-duplicates        重复文件报告（--mode content|name|fingerprint）
-verify-copy       校验盘上副本（--sample --full）
-build-fts         补建 FTS 全文索引
-build-stats       补建统计预计算
-delete            删除快照（--on-disk keep|delete --force）
-task-delete       删除任务记录（仅终态任务；只删登记行，不影响快照/对比数据）
-nickname          设置/清除磁盘或分区昵称（nickname disk|volume <id> [名字]）
-integrity-check   快照库完整性自查（只读 PRAGMA quick_check；退出码 0 正常 / 1 损坏）
-identity-check    磁盘身份体检（只读查既有数据"串盘"迹象；退出码 0 无高危 / 1 有高危 / 2 错误）
-rebuild-catalog   重建 catalog（--dry-run 预演）
-```
+---
 
-## 开发环境（WSL2）
+## 功能亮点
 
-Python venv 由 uv 管理：`.venv-wsl/`（Python 3.12）。
+### 采集：快、稳、可续
+
+- 单遍 `scandir` 扫描，**3 万文件 / 200GB 的盘约 2 秒**（对比旧工具 v1 约为其 74% 耗时）；
+- 多分区整盘批次采集（`--all-partitions`），一块盘一条任务组，进度实时推送（SSE）、随时取消；
+- **断点续采**（`--resume`）：跑到一半断电/中断，重扫只补没走完的目录；
+- 数据根写锁：同一数据根同时只有一个写者，不会写坏；
+- 采集完成后，每个快照的库会自动备份一份到**对应磁盘上**的 `_coldmanifest/` 目录——盘还在，清单就在。
+
+### 浏览与搜索
+
+- 目录树懒加载（百万级目录流畅翻），统计画像（大小分布直方图、扩展名 Top、顶层目录排行、最大文件）；
+- 单快照搜索：前缀匹配 / **FTS5 全文**（300 万条目建索引约 4.7 秒，查询比 `LIKE` 快约 50 倍）；
+- **跨快照全局搜索**：顶栏 `Ctrl/Cmd+K`，在所有快照里搜「这个文件名在哪块盘上」；没有全文索引的快照会如实标注"本次为前缀匹配"。
+
+### 对比：新增、变化、丢失
+
+- 后台物化 diff，8 类变更 + 目录级汇总，10M×2 条目规模下约 52 秒；
+- **证据等级**：`哈希级`（逐字节验证）/ `大小+时间` / `未知`，随对比结果与报告一起给出；
+- 口径开关：大小写不敏感、忽略时间、忽略大小、显示未变化项——每种组合独立物化，可复现；
+- 路径前缀过滤；结果支持 keyset 分页；
+- **自包含 HTML 报告**（单文件、无 JS 依赖，可直接发给人）+ CSV 导出。
+
+### 重复文件与按需哈希
+
+- 查重三档：**按内容（严谨）/ 按指纹（较快）/ 按文件名（秒级零读盘）**，每档标注置信度，缺哈希时页面引导一键补算；
+- 浪费空间统计 + 每组取样路径；300 万条目的库查重约 **1.15 秒**；
+- 哈希默认**关闭**、按需启用：`full`（整文件 SHA-256）/ `sampled`（首尾+中段采样），跨快照缓存复用，支持"只对候选文件算"和"只精验某一组"。
+
+### 磁盘健康与身份（SMART）
+
+- 采集时自动读取，磁盘页也可「现在读取 SMART」现场诊断；失败给**可读原因**（权限/设备打不开/类型不识别/超时）与每次尝试的原始输出；
+- **机械盘**：20+ 项 ATA 属性表（可折叠、异常行高亮）+ 13 项关键指标瓦片（通电时间/重分配/待映射/UDMA CRC/读错误率/磁头飞行小时…）+ 技术信息（转速/接口速率/SATA-ATA 版本/TRIM）；
+- **固态盘**：剩余寿命、累计写入/读取量、备用空间、介质错误、异常断电、控制器忙时、多温度探头，并进趋势图；
+- 数值按**语义**展示：希捷属性 240 显示真实小时数，厂商私有编码（1/7/195）显示归一化健康值而不是原始大数；
+- **磁盘身份按真序列号锚定**（ATA 直通读取，盘符直读优先）：USB 硬盘盒上报的"系统枚举 ID"只作标注、绝不当身份；同型号同容量的盘并列时宁可不读也不猜；读不到真序列号则要求手填；
+- `identity-check` 可对既有数据做"串盘"体检（同快照矛盾 / 跨快照漂移 / 跨盘序列号别名）。
+
+### 管理
+
+- 磁盘/分区**两级昵称**（比对历史里显示"移动硬盘A · 分区1"而不是长串 ID）；
+- 快照星标置顶、备注、按卷筛选、趋势图；
+- 删除管理：磁盘/卷删除**不级联**（名下还有快照或对比时拒绝并列出清单）；快照删除可选是否连盘上副本；对比结果可单独删除；
+- 任务中心：SSE 进度、取消、删除终态记录；
+- 界面细节：表格列宽可拖拽（按表记忆）、统一分页（行数 20/50/100/200 + 上下页，**页数写进网址**，刷新还在原页）、右键菜单快捷跳转、服务端排序。
+
+---
+
+## 界面预览
+
+| | |
+|---|---|
+| ![采集对话框](docs/images/collect-dialog.png) | ![磁盘详情与 SMART](docs/images/disk-detail-smart.png) |
+| 采集：磁盘快选，直接显示 ATA 真序列号 | 磁盘详情：身份卡、SMART 关键指标、趋势 |
+| ![对比汇总](docs/images/diff-summary.png) | ![重复文件](docs/images/duplicates.png) |
+| 对比：差异汇总 + 证据等级 + 明细 | 重复文件：三档置信度 + 浪费空间 |
+| ![全局搜索](docs/images/search.png) | ![总览](docs/images/overview.png) |
+| 全局搜索：跨快照按文件名找盘 | 总览：卷与快照一览 |
+
+---
+
+## 快速开始
+
+**Windows（免安装）**：解压 `cold-manifest-win.zip` → 双击 `packaging\windows\start.cmd`（建议"以管理员身份运行"，USB 盘的 SMART 读取需要管理员）→ 浏览器打开 `http://localhost:8765`。命令行用 `packaging\windows\cldm.cmd`。
+
+**Linux**：`packaging/linux/setup.sh` → `start.sh`（端口用 `CLDM_PORT` 覆盖）。
+
+**从源码跑**（开发环境为 WSL2 + Python 3.12 + uv）：
 
 ```bash
-# 安装依赖（含 dev）
 ~/.local/bin/uv pip install -e ".[dev]" --python .venv-wsl/bin/python
-
-# 启动 Web 服务（默认 0.0.0.0:8765）
-.venv-wsl/bin/cldm serve
-
-# 启动前端（另开终端；Windows 浏览器访问 http://localhost:5173）
-cd frontend && npm run dev
-
-# 运行测试
-.venv-wsl/bin/python -m pytest -q
+.venv-wsl/bin/cldm serve                 # 后端（默认 0.0.0.0:8765）
+cd frontend && npm run dev               # 前端（另开终端，http://localhost:5173）
+.venv-wsl/bin/python -m pytest -q        # 测试
 ```
 
-> 同一 data_root 同时只允许一个写者（采集/清扫），并发会提示"data_root 被占用"；中断的大卷采集可用 `cldm collect --resume` 断点续采。
+数据根约定：`catalog.db` 与各快照库都在 `CLDM_DATA_ROOT`（默认 `./data`）下；盘上副本写在各卷根的 `_coldmanifest/`。**拷贝数据根 = 迁移/换机**（停服务后整目录拷走即可，路径无所谓）。
 
-## 分发与平台
+常用命令速查：`cldm collect / diff / hash / duplicates / verify-copy / report / export / delete / nickname / integrity-check / identity-check / rebuild-catalog`（完整清单与参数见 `docs/升级方案-v0.3.md` 附录 A；`cldm --help` 亦可）。
 
-zip 包解压即用（Windows：`start.cmd` / `cldm.cmd`，已处理 UTF-8 控制台；Linux：启动三件套）。数据根约定：catalog.db 与各快照库都在 `CLDM_DATA_ROOT`（默认 `./data`）下；盘上副本写在各卷根的 `_coldmanifest/`。Windows 注意事项（exFAT/FAT32、长路径、保留名、USB 桥 SMART 等）见 `docs/Windows-兼容性排查.md`。
+---
 
-## 查询 API（只读面摘录）
+## 可靠性与真机验证
 
-`cldm serve` 之外也可直接 `CLDM_DATA_ROOT=<数据根> uvicorn cold_manifest.server:app`。快照库以 `mode=ro` 只读打开并做 LRU 连接池（上限 16）；写库任务（哈希/补建索引/补建统计）写前、写后都会逐出池内该快照的连接，避免读到半新半旧页。端点统一前缀 `/api`（全量清单见 `docs/升级方案-v0.3.md` 附录 A，OpenAPI 见 `/docs`）：
+这一版的功能不是只在测试里跑过：磁盘身份、SMART、USB 硬盘盒、多盘并列等场景都用**真实硬件**（希捷/东芝/西数/三星/致钛等盘的实机数据）反复验过，并修掉了几个真机才暴露的问题——例如"系统枚举把硬盘盒 ID 当序列号""两块同容量盘并列读错盘""希捷打包编码被当成小时数"。完整案例（现象 → 根因 → 解法 → 提交号）见 [`docs/升级方案-v0.3.md`](docs/升级方案-v0.3.md) 的「真机 UAT 问题与解决方案」一节；真机复测点见 [`docs/Windows-真机复验清单.md`](docs/Windows-真机复验清单.md)。
 
-```
-GET  /api/snapshots                        # 快照列表（预计算统计 + pinned）
-GET  /api/snapshots/{sid}                  # 详情（meta + 统计 + 盘上副本）
-GET  /api/snapshots/{sid}/entries          # 浏览（keyset 游标，type/ext/size/mtime 筛选与排序）
-GET  /api/snapshots/{sid}/search           # 单快照搜索（prefix | fulltext）
-GET  /api/search                           # 跨快照全局搜索（顶栏 Ctrl/Cmd+K）
-POST /api/diffs                            # 发起对比（口径开关；结果物化后分页查询）
-GET  /api/diffs?limit=&cursor=             # 对比历史（keyset 游标，limit 1..200 默认 50，含昵称标签 labels）
-GET  /api/snapshots/{sid}/duplicates       # 查重三档
-POST /api/snapshots/{sid}/hash             # 按需哈希任务
-POST /api/tasks/{id}/cancel                # 取消任务
-DELETE /api/tasks/{id}                     # 删除任务记录（仅终态任务，只删登记行不影响数据）
-GET  /api/identity-audit                   # 磁盘身份体检（只读，串盘追溯：同快照序列号矛盾/跨快照漂移/回退占比/跨盘别名）
-POST /api/collect/preflight                # 采集前依赖检查（含 requires_manual_serial/manual_serial_reason/probe_serial/bridge_model/interface_type）
-PATCH /api/disks/{disk_id}                 # 磁盘昵称 + 身份编辑（identity_verified / physical_serial；
-                                           #  disk_serial 仅零快照盘可改，有快照 → 400）
-POST /api/disks/{disk_id}/identity/recheck # 现场重新校验盘身份（verdict: verified|unverified|not_attached）
-PATCH /api/volumes/{volume_id}             # 分区昵称（同上）
-POST /api/disks/{disk_id}/smart/read       # 现场读一次 SMART（诊断，不写历史）
-```
+平台注意事项（exFAT/FAT32 上的 WAL 回退、长路径、Windows 保留文件名、UTF-8 控制台、USB 桥 SMART 等）见 [`docs/Windows-兼容性排查.md`](docs/Windows-兼容性排查.md)。
 
-约定：列表/搜索一律 keyset 游标分页（`limit` ≤ 500，响应 `{items, next_cursor, has_more}`，不返回总数）；`*_ns` 时间戳序列化为字符串防 JS 精度丢失，`*_bytes` 为数字；未知 snapshot_id → 404，参数非法 → 400。
+---
 
-样本 B（2,981,921 文件，原生盘数据根）实测：entries 首页 ~2ms（翻页 ~11ms/页）、tree/du <5ms、stats ~1.4s（覆盖索引聚合）、前缀搜索 ~1ms 热 / 32ms 冷。
+## 项目规模与技术栈
+
+| | |
+|---|---|
+| 实现代码 | **25,255 行**（Python 后端 13,376 + React 前端 11,847 + 脚本/打包 886） |
+| 测试代码 | **13,496 行**，55 个文件，**750+ 用例全绿**（另有 10M 级压测报告） |
+| 后端 | Python 3.12 · FastAPI · SQLite（内容表 + FTS5 全文 + 物化 diff）· 单遍扫描 · SSE |
+| 前端 | React 19 · TypeScript · Vite · Ant Design 6 · ECharts · React Query |
+| 分发 | Windows 免安装 zip（含离线依赖）· Linux 启动脚本 · CLI(`cldm`) 与 Web UI 同源 |
+
+---
+
+## 定位与边界
+
+- **只读盘、只有清单**：不做数据同步、不做加密和去重写回——你的数据原样不动；
+- 定位为**单机 / 内网工具**：无账号与鉴权体系，请勿直接暴露到公网；
+- 冷备 ≠ 备份策略本身：它帮你**看清**备份内容与变化，不替代多副本、异地保存。
+
+---
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| [`docs/升级方案-v0.3.md`](docs/升级方案-v0.3.md) | 需求与实现现状、API/CLI 全量清单、路线图、**真机 UAT 问题与解决方案** |
+| [`docs/UX-架构-v0.3.md`](docs/UX-架构-v0.3.md) | 页面结构、交互约定、组件清单 |
+| [`docs/Windows-运行说明.md`](docs/Windows-运行说明.md) / [`docs/Linux-运行说明.md`](docs/Linux-运行说明.md) | 平台运行手册（含常用命令） |
+| [`docs/Windows-真机复验清单.md`](docs/Windows-真机复验清单.md) | 每轮真机复测点与回传模板 |
+| [`docs/Windows-兼容性排查.md`](docs/Windows-兼容性排查.md) | Windows/exFAT/USB 桥等兼容性问题与结论 |
+| [`docs/压测-10M.md`](docs/压测-10M.md) | 1000 万条目级性能报告 |
